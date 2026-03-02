@@ -40,6 +40,13 @@ try:
 except ImportError:
     _HAS_STOP_WORDS_LIB = False
 
+# Name parser for title/honorific detection in NPC fuzzy matching
+try:
+    from nameparser.config import CONSTANTS as _NAMEPARSER_CONSTANTS
+    _HAS_NAMEPARSER = True
+except ImportError:
+    _HAS_NAMEPARSER = False
+
 # ===============================================================
 # CONFIGURATION
 # ===============================================================
@@ -70,77 +77,330 @@ DIRECTOR_INTERVAL = 3              # Call director every N scenes (when no trigg
 MEMORY_RECENCY_DECAY = 0.92        # Exponential decay factor for memory recency
 DIRECTOR_MODEL = BRAIN_MODEL       # Director uses same model as Brain (Haiku)
 
+# --- NPC name matching: title/honorific filter ---
+# Uses nameparser library (619 English titles) + German/French/Spanish/RPG additions.
+# Prevents false positive fuzzy matches like "Mrs. Chen" ↔ "Mrs. Kowalski".
+_NAME_TITLES_EXTRA = frozenset({
+    # --- German titles & honorifics (not in nameparser) ---
+    "herr", "frau", "fräulein", "doktor", "hauptmann", "leutnant",
+    "feldwebel", "meister", "schwester", "bruder", "onkel", "tante",
+    "oma", "opa", "alter", "alte", "junger", "junge", "der", "die", "das",
+    # French
+    "monsieur", "madame", "mademoiselle",
+    # Spanish
+    "señor", "señora", "señorita", "don", "doña",
+    # Generic descriptors that aren't identity-bearing
+    "neighbor", "nachbar", "nachbarin", "stranger", "fremder", "fremde",
+    "kunde", "kundin", "customer",
+    # --- English RPG titles (Fantasy / Sci-Fi / Medieval, not in nameparser) ---
+    # Magic users
+    "wizard", "sorcerer", "sorceress", "mage", "warlock", "witch",
+    "archmage", "enchantress", "enchanter", "necromancer", "conjurer",
+    "alchemist", "spellcaster", "hierophant", "thaumaturge", "illusionist",
+    # Classes / Archetypes
+    "paladin", "cleric", "rogue", "assassin", "berserker",
+    "barbarian", "gladiator", "champion", "sentinel", "guardian",
+    "inquisitor", "templar", "crusader", "zealot",
+    # Nobility / Feudal
+    "duke", "duchess", "squire", "knight", "liege", "regent",
+    "viceroy", "viscountess", "castellan", "seneschal", "steward",
+    "chamberlain", "herald", "page", "grandmaster",
+    # Spiritual / Mystical
+    "shaman", "oracle", "prophet", "seer", "sage", "elder",
+    "dragonlord", "mystic", "augur", "diviner",
+    # Medieval — Common folk / Trades
+    "peasant", "serf", "yeoman", "blacksmith", "fletcher",
+    "armorer", "tanner", "reeve", "constable", "nun",
+    # Sci-Fi — Military & Exotic
+    "ensign", "marshal", "overseer", "commissioner", "agent",
+    "technician", "operative", "warlord",
+    "android", "cyborg", "clone", "emissary", "arbiter",
+    "overlord", "archon", "praetor", "legate", "centurion",
+    "tribune", "consul", "proconsul",
+    # Eastern / Other cultural
+    "shogun", "samurai", "daimyo", "ronin", "khan",
+    "caliph", "emir", "shah", "pasha", "satrap",
+    # Generic RPG descriptors used as titles
+    "outcast", "exile", "vagrant", "pilgrim", "wanderer",
+    "mercenary", "corsair", "privateer", "buccaneer",
+    "taskmaster", "guildmaster", "headmaster",
+    # --- German RPG titles (Fantasy / Sci-Fi / Mittelalter) ---
+    # Adel & Feudalsystem
+    "herzog", "herzogin", "graf", "gräfin", "fürst", "fürstin",
+    "markgraf", "markgräfin", "landgraf", "ritter", "knappe",
+    "edler", "edle", "junker", "vogt", "lehnsherr",
+    "kronprinz", "kronprinzessin", "thronfolger", "regent", "regentin",
+    "burgherr", "burgherrin", "kastellan",
+    # Militär
+    "marschall", "feldherr", "söldner", "söldnerin", "krieger", "kriegerin",
+    "gardist", "gardistin", "wache", "wachmann", "rittmeister",
+    "bannerherr", "bannerträger", "schildknappe",
+    "landsknecht", "hauptfeldwebel", "stabsfeldwebel", "oberst",
+    "kommandant", "kommandantin", "admiral", "admiralin",
+    # Magie & Mystik
+    "hexe", "hexer", "hexenmeister", "hexenmeisterin",
+    "zauberer", "zauberin", "magier", "magierin",
+    "nekromant", "nekromantin", "alchemist", "alchemistin",
+    "druide", "druidin", "schamane", "schamanin",
+    "beschwörer", "beschwörerin", "seher", "seherin",
+    "orakel", "prophet", "prophetin", "mystiker", "mystikerin",
+    "erzmagier", "erzmagierin", "thaumaturg",
+    # Geistlichkeit
+    "abt", "äbtissin", "prior", "priorin", "kaplan",
+    "erzbischof", "diakon", "diakonin", "nonne", "mönch",
+    "hohepriester", "hohepriesterin", "inquisitor", "inquisitorin",
+    "templar", "kreuzritter", "ordensmeister",
+    # Handwerk & Volk
+    "bauer", "bäuerin", "schmied", "schmiedin", "gerber",
+    "müller", "müllerin", "fischer", "jäger", "jägerin",
+    "schäfer", "schäferin", "köhler", "krämer",
+    # Sci-Fi deutsch
+    "techniker", "technikerin", "ingenieur", "ingenieurin",
+    "kanzler", "kanzlerin", "kommissar", "kommissarin",
+    "inspektor", "inspektorin",
+    # Östlich/exotisch (im deutschen RPG-Kontext)
+    "kalif", "wesir", "sultanin", "pascha", "schah",
+    # RPG-Generisch
+    "meuchler", "meuchlerin", "waldläufer", "waldläuferin",
+    "paladin", "paladinin", "barbar", "barbarin",
+    "wächter", "wächterin", "hüter", "hüterin",
+    "vagabund", "vagabundin", "pilger", "pilgerin",
+    "gildenmeister", "gildenmeisterin", "grossmeister",
+})
+if _HAS_NAMEPARSER:
+    # nameparser provides 619 titles: mr, mrs, dr, detective, officer, captain,
+    # colonel, sergeant, professor, reverend, king, queen, duke, baron, etc.
+    _NAME_TITLES = frozenset(_NAMEPARSER_CONSTANTS.titles) | _NAME_TITLES_EXTRA
+else:
+    # Fallback: compact manual list covering the most common cases
+    _NAME_TITLES = frozenset({
+        "mr", "mr.", "mrs", "mrs.", "ms", "ms.", "dr", "dr.", "sir", "lady",
+        "lord", "miss", "captain", "cpt", "lieutenant", "lt", "sergeant", "sgt",
+        "officer", "detective", "professor", "prof", "father", "sister", "brother",
+        "uncle", "aunt", "grandma", "grandpa", "old", "young", "the",
+        "king", "queen", "prince", "princess", "duke", "duchess", "baron", "baroness",
+        "count", "countess", "viscount", "marquis", "earl",
+        "colonel", "commander", "general", "admiral", "major", "corporal", "private",
+        "judge", "sheriff", "mayor", "governor", "senator", "chancellor",
+        "priest", "priestess", "bishop", "cardinal", "reverend", "pastor",
+        "rabbi", "imam", "monk", "abbot", "abbess",
+        "ambassador", "consul", "envoy", "delegate",
+    }) | _NAME_TITLES_EXTRA
+
 # --- Importance scoring: emotional_weight → importance (1-10) ---
+# Comprehensive taxonomy based on GoEmotions (Google, 27 categories),
+# Plutchik's Wheel of Emotions (8 primaries × 3 intensities + dyads),
+# and RPG-specific emotional states narrators commonly produce.
+# Scale: 2=baseline, 3=mild, 4=moderate, 5=significant, 6=strong,
+#        7=intense, 8=peak, 9=devastating, 10=character-defining
 IMPORTANCE_MAP = {
-    # Low importance (routine interactions)
+    # === TIER 2: Baseline / Low engagement ===
     "neutral": 2, "polite": 2, "casual": 2, "indifferent": 2,
-    "formal": 2, "calm": 2, "bored": 2,
-    # Medium importance (notable reactions)
+    "formal": 2, "calm": 2,
+    "acceptance": 2,       # Plutchik: mild trust
+    "serenity": 2,         # Plutchik: mild joy
+    "pensiveness": 2,      # Plutchik: mild sadness
+    "distraction": 2,      # Plutchik: mild surprise
+    "stoic": 2,            # RPG: controlled non-reaction
+    "calculating": 2,      # RPG: cold assessment
+    # === TIER 3: Mild engagement ===
     "amused": 3, "curious": 3, "interested": 3, "pleased": 3,
+    "amusement": 3,        # GoEmotions
+    "approval": 3,         # GoEmotions
+    "curiosity": 3,        # GoEmotions / Plutchik secondary
+    "interest": 3,         # Plutchik: mild anticipation
+    "realization": 3,      # GoEmotions: cognitive shift
+    "surprise": 3,         # GoEmotions / Plutchik primary
+    "relief": 3,           # GoEmotions: tension release
+    "anticipation": 3,     # Plutchik primary
+    "trust": 3,            # Plutchik primary: baseline trust
+    "bored": 3,            # Plutchik: mild disgust
+    "reluctant": 3,        # RPG: mild resistance
+    "sentimental": 3,      # RPG: soft nostalgia
+    "nostalgic": 3,        # RPG: looking back
+    "merciful": 3,         # RPG: compassionate restraint
+    # === TIER 4: Moderate tension / involvement ===
     "annoyed": 4, "wary": 4, "uneasy": 4, "concerned": 4,
     "frustrated": 4, "confused": 4, "nervous": 4,
-    # High importance (significant emotional reactions)
+    "annoyance": 4,        # GoEmotions / Plutchik: mild anger
+    "caring": 4,           # GoEmotions: emotional investment
+    "confusion": 4,        # GoEmotions: disorientation
+    "disapproval": 4,      # GoEmotions / Plutchik dyad
+    "embarrassment": 4,    # GoEmotions: social discomfort
+    "nervousness": 4,      # GoEmotions: anxiety-lite
+    "optimism": 4,         # GoEmotions / Plutchik dyad
+    "apprehension": 4,     # Plutchik: mild fear
+    "boredom": 4,          # Plutchik: mild disgust (can escalate)
+    "vigilance": 4,        # Plutchik: intense anticipation
+    "resolute": 4,         # RPG: firm but controlled
+    "bitter": 4,           # RPG: lingering resentment
+    "disdainful": 4,       # RPG: looking down
+    "pleading": 4,         # RPG: asking, not yet desperate
+    # === TIER 5: Significant emotional moment ===
     "grateful": 5, "impressed": 5, "suspicious": 5, "angry": 5,
     "disappointed": 5, "protective": 5, "trusting": 5,
     "hopeful": 5, "jealous": 5, "guilty": 5,
-    # Very high importance (relationship-defining moments)
+    "admiration": 5,       # GoEmotions / Plutchik: strong trust
+    "anger": 5,            # GoEmotions / Plutchik primary
+    "desire": 5,           # GoEmotions: strong wanting
+    "disappointment": 5,   # GoEmotions: unmet expectations
+    "disgust": 5,          # GoEmotions / Plutchik primary
+    "excitement": 5,       # GoEmotions: heightened arousal
+    "fear": 5,             # GoEmotions / Plutchik primary
+    "gratitude": 5,        # GoEmotions: deep thankfulness
+    "joy": 5,              # GoEmotions / Plutchik primary
+    "love": 5,             # GoEmotions / Plutchik dyad
+    "pride": 5,            # GoEmotions / Plutchik secondary
+    "remorse": 5,          # GoEmotions / Plutchik dyad
+    "sadness": 5,          # GoEmotions / Plutchik primary
+    "contempt": 5,         # Plutchik dyad: disgust+anger
+    "envy": 5,             # Plutchik secondary: sadness+anger
+    "hope": 5,             # Plutchik secondary: anticipation+trust
+    "submission": 5,       # Plutchik dyad: trust+fear
+    "awe": 5,              # Plutchik dyad: fear+surprise
+    "shame": 5,            # Plutchik tertiary: fear+disgust
+    "determined": 5,       # RPG: strong resolve
+    "urgent": 5,           # RPG: time pressure, high stakes demand
+    "sympathetic": 5,      # RPG: emotional connection
+    "longing": 5,          # RPG: deep desire
+    "yearning": 5,         # RPG: intense wanting
+    "reverent": 5,         # RPG: deep respect
+    "resigned": 5,         # RPG: accepted defeat
+    "mournful": 5,         # RPG: active grieving
+    "remorseful": 5,       # RPG: deep regret
+    # === TIER 6: Strong personal stake / internal conflict ===
+    "defiant": 6, "loyal": 6, "conflicted": 6,
+    "anxiety": 6,          # Plutchik: anticipation+fear, persistent
+    "desperate": 6,        # RPG: high urgency, critical moments
+    "hostile": 6,          # RPG: active aggression
+    "humiliated": 6,       # RPG: deep shame + social component
+    "menacing": 6,         # RPG: threatening presence
+    "obsessed": 6,         # RPG: consuming fixation
+    "paranoid": 6,         # RPG: fear+suspicion combo
+    "vengeful": 6,         # RPG: seeking retribution
+    "contemptuous": 6,     # RPG: active disdain
+    "dominance": 6,        # Plutchik secondary: anger+trust
+    "fatalism": 6,         # Plutchik secondary: resigned to fate
+    "empowered": 6,        # RPG: surge of capability
+    # === TIER 7: Intense / potentially transformative ===
     "awed": 7, "devoted": 7, "terrified": 7, "furious": 7,
     "heartbroken": 7, "inspired": 7, "grief": 7,
-    "defiant": 6, "loyal": 6, "conflicted": 6,
-    # Critical importance (life-changing events)
-    "betrayed": 9, "transformed": 10, "devastated": 9, "euphoric": 8,
-    "sworn": 8, "sacrificial": 10, "reborn": 10,
+    "amazement": 7,        # Plutchik: intense surprise
+    "delight": 7,          # Plutchik secondary: surprise+joy
+    "loathing": 7,         # Plutchik: intense disgust
+    "rage": 7,             # Plutchik: intense anger
+    "terror": 7,           # Plutchik: intense fear
+    "horrified": 7,        # RPG: witnessing something terrible
+    "panicked": 7,         # RPG: loss of control through fear
+    "tormented": 7,        # RPG: sustained suffering
+    "triumphant": 7,       # RPG: peak victory moment
+    "wrathful": 7,         # RPG: righteous/divine anger
+    "bloodthirsty": 7,     # RPG: violent intent
+    "ruthless": 7,         # RPG: cold extreme action
+    "broken": 7,           # RPG: spirit crushed
+    # === TIER 8: Peak emotional moments ===
+    "euphoric": 8, "sworn": 8,
+    "ecstasy": 8,          # Plutchik: intense joy
+    "ecstatic": 8,         # variant of ecstasy
+    "aggressiveness": 8,   # Plutchik dyad: anger+anticipation
+    # === TIER 9-10: Life-altering / character-defining ===
+    "betrayed": 9, "devastated": 9,
+    "transformed": 10, "sacrificial": 10, "reborn": 10,
 }
 
 # DE → EN mapping for emotional_weight normalization (covers common Narrator outputs)
 _EMOTION_DE_EN = {
     # Fear/anxiety family
-    "angst": "terrified", "furcht": "terrified", "panik": "terrified",
+    "angst": "terrified", "furcht": "fear", "panik": "panicked",
     "ängstlich": "nervous", "verängstigt": "terrified", "unheimlich": "uneasy",
     "besorgt": "concerned", "beunruhigt": "concerned", "beunruhigend": "uneasy",
     "nervös": "nervous", "ominös": "uneasy", "bedrohung": "suspicious",
-    "bedrohlich": "suspicious",
+    "bedrohlich": "menacing", "paranoia": "paranoid",
     # Anger family
-    "wut": "furious", "zorn": "furious", "wütend": "angry",
+    "wut": "rage", "zorn": "furious", "wütend": "angry",
+    "rasend": "rage", "zornig": "wrathful", "gereizt": "annoyed",
+    "verärgert": "annoyed", "genervt": "annoyed", "frustriert": "frustrated",
+    "feindlich": "hostile", "feindselig": "hostile",
+    "rachsüchtig": "vengeful", "verachtung": "contempt",
+    "verächtlich": "contemptuous", "abscheu": "loathing",
+    "ekel": "disgust", "angewidert": "disgust",
     # Sadness/despair family
-    "verzweiflung": "devastated", "verzweifelt": "devastated",
-    "trauer": "grief", "schuld": "guilty", "schuldgefühl": "guilty",
-    "scham": "guilty", "resignation": "conflicted", "resigniert": "conflicted",
+    "verzweiflung": "devastated", "verzweifelt": "desperate",
+    "trauer": "grief", "traurig": "sadness", "traurigkeit": "sadness",
+    "schuld": "guilty", "schuldgefühl": "guilty",
+    "scham": "shame", "beschämt": "shame",
+    "resignation": "resigned", "resigniert": "resigned",
+    "melancholie": "pensiveness", "melancholisch": "pensiveness",
+    "gebrochen": "broken", "erschüttert": "devastated",
+    "wehmut": "nostalgic", "wehmütig": "nostalgic",
+    "sehnsucht": "longing", "sehnsüchtig": "yearning",
+    "kummer": "mournful", "betrübt": "mournful",
+    "reue": "remorse", "reuig": "remorseful",
+    "demütigung": "humiliated", "gedemütigt": "humiliated",
     # Trust/loyalty family
-    "vertrauen": "trusting", "loyalität": "loyal", "loyal": "loyal",
+    "vertrauen": "trust", "loyalität": "loyal", "loyal": "loyal",
     "pflicht": "loyal", "hingabe": "devoted",
+    "bewunderung": "admiration", "respekt": "admiration",
+    "ehrfurcht": "awe", "ehrfürchtig": "reverent",
+    "liebe": "love", "zuneigung": "caring",
+    "mitgefühl": "sympathetic", "mitleid": "sympathetic",
+    "stolz": "pride",
     # Betrayal/conflict family
     "verrat": "betrayed", "misstrauen": "suspicious", "konflikt": "conflicted",
-    # Hope/relief family
-    "hoffnung": "hopeful", "erleichterung": "grateful",
-    "dankbar": "grateful", "dankbarkeit": "grateful",
-    # Respect/awe family
-    "respekt": "impressed", "ehrfurcht": "awed", "bewunderung": "awed",
+    "argwöhnisch": "suspicious", "argwohn": "suspicious",
+    # Hope/relief/joy family
+    "hoffnung": "hope", "hoffnungsvoll": "hopeful",
+    "erleichterung": "relief", "erleichtert": "relief",
+    "dankbar": "grateful", "dankbarkeit": "gratitude",
+    "freude": "joy", "fröhlich": "joy", "glück": "joy",
+    "begeistert": "excitement", "begeisterung": "excitement",
+    "euphorisch": "euphoric", "euphorie": "euphoric",
+    "triumph": "triumphant", "siegreich": "triumphant",
+    "überrascht": "surprise", "überraschung": "surprise",
+    "erstaunt": "amazement", "fasziniert": "amazement",
+    "entzücken": "delight", "entzückt": "delight",
     # Protective/determined family
-    "entschlossenheit": "defiant", "entschlossen": "defiant",
+    "entschlossenheit": "determined", "entschlossen": "determined",
     "beschützerisch": "protective", "schützend": "protective",
+    "trotzig": "defiant", "trotz": "defiant",
+    "widerstand": "defiant", "unbeugsam": "defiant",
+    "gnadenlos": "ruthless", "erbarmungslos": "ruthless",
+    "barmherzig": "merciful", "gnädig": "merciful",
+    "ermächtigt": "empowered",
     # Shock/confusion family
-    "schock": "terrified", "erschüttert": "terrified",
-    "verwirrung": "confused", "verwirrt": "confused",
+    "schock": "terrified", "schockiert": "horrified",
+    "entsetzt": "horrified", "entsetzen": "terror",
+    "verwirrung": "confusion", "verwirrt": "confused",
     "desorientierung": "confused",
     # Detachment family
     "gleichgültigkeit": "indifferent", "kälte": "indifferent",
     "kalt": "indifferent", "neutral": "neutral",
+    "apathisch": "indifferent", "teilnahmslos": "indifferent",
+    "gelassen": "calm", "gelassenheit": "serenity",
+    "stoisch": "stoic",
+    "gelangweilt": "bored", "langeweile": "boredom",
     # Intensity markers (map to their emotional core)
-    "verzweifelte": "devastated", "existenzielle": "terrified",
+    "verzweifelte": "desperate", "existenzielle": "terrified",
     "tiefe": "devoted", "wachsende": "concerned",
-    "dringend": "concerned", "dringlich": "concerned",
-    "tragisch": "grief", "bitter": "disappointed",
+    "dringend": "urgent", "dringlich": "urgent",
+    "tragisch": "grief", "bitter": "bitter",
+    "neidisch": "envy", "neid": "envy",
+    "eifersucht": "jealous", "eifersüchtig": "jealous",
+    "besessen": "obsessed", "besessenheit": "obsessed",
+    "gequält": "tormented", "qual": "tormented",
+    "flehend": "pleading", "flehentlich": "pleading",
+    "drohend": "menacing", "bedrohend": "menacing",
+    "blutdurstig": "bloodthirsty", "blutrünstig": "bloodthirsty",
+    "unterwürfig": "submission", "unterworfen": "submission",
     # English words that appear but aren't in IMPORTANCE_MAP directly
-    "desperation": "devastated", "dread": "terrified", "horror": "terrified",
-    "triumph": "euphoric", "duty": "loyal", "shame": "guilty",
-    "guilt": "guilty", "loyalty": "loyal", "resigned": "conflicted",
-    "realization": "conflicted", "recognition": "impressed",
-    "solidarity": "loyal", "respect": "impressed", "doubt": "suspicious",
-    "hunger": "defiant", "victory": "euphoric", "redemption": "devoted",
+    "desperation": "desperate", "dread": "terror", "horror": "horrified",
+    "duty": "loyal",
+    "guilt": "guilty", "loyalty": "loyal",
+    "solidarity": "loyal", "respect": "admiration", "doubt": "suspicious",
+    "hunger": "desire", "victory": "triumphant", "redemption": "devoted",
     "rupture": "betrayed", "reckoning": "conflicted",
-    "protective": "protective", "defiance": "defiant",
-    "panic": "terrified", "determination": "defiant",
+    "defiance": "defiant",
+    "panic": "panicked", "determination": "determined",
 }
 
 # Keywords that boost importance when found in event text
@@ -296,14 +556,20 @@ def _find_npc(game, npc_ref: str) -> Optional[dict]:
                 return n
     # 4. Substring fallback — ref is part of name or name is part of ref
     #    (handles "Krahe" matching "Hauptmann Krahe" and vice versa)
-    if len(ref_lower) >= 4:  # Minimum length to avoid false positives (e.g. "Li" matching "Elisa")
+    #    v0.9.29: raised from 4→5 chars, title-only references rejected
+    if len(ref_lower) >= 5:
+        # Reject if the ref is ONLY titles/honorifics (e.g. "Mrs." alone)
+        ref_words = set(ref_lower.split())
+        if ref_words and ref_words <= _NAME_TITLES:
+            return None
+
         best_match = None
         best_score = 0
         for n in game.npcs:
             name_lower = n.get("name", "").lower().strip()
             if ref_lower in name_lower or name_lower in ref_lower:
-                score = min(len(ref_lower), len(name_lower))  # Longer overlap = better
-                if score > best_score:
+                score = min(len(ref_lower), len(name_lower))
+                if score >= 5 and score > best_score:
                     best_score = score
                     best_match = n
                 continue
@@ -312,7 +578,7 @@ def _find_npc(game, npc_ref: str) -> Optional[dict]:
                 alias_lower = alias.lower().strip()
                 if ref_lower in alias_lower or alias_lower in ref_lower:
                     score = min(len(ref_lower), len(alias_lower))
-                    if score > best_score:
+                    if score >= 5 and score > best_score:
                         best_score = score
                         best_match = n
         if best_match:
@@ -335,12 +601,20 @@ def _next_npc_id(game) -> tuple[str, int]:
 def _fuzzy_match_existing_npc(game, new_name: str) -> Optional[dict]:
     """Check if a 'new' NPC name fuzzy-matches an existing NPC.
     Handles identity reveals like 'Unbekannter Söldner' → 'Hauptmann Krahe'.
-    Returns the matching NPC dict or None."""
+    Returns the matching NPC dict or None.
+
+    v0.9.29 safety rules:
+    - Titles/honorifics (Mr., Mrs., Dr., Herr, Frau, Detective...) never count
+      as match evidence — filtered via _NAME_TITLES (nameparser + DE/FR/ES)
+    - Single shared word must be ≥5 chars (prevents surname-only false positives)
+    - Substring matching requires the shorter string to be ≥5 chars
+    """
     if not new_name or len(new_name.strip()) < 3:
         return None
     new_lower = new_name.lower().strip()
-    # Extract individual words for word-overlap matching
-    new_words = set(new_lower.split())
+    # Extract words, filtering out titles/honorifics
+    new_words_raw = set(new_lower.split())
+    new_words = {w for w in new_words_raw if w.rstrip(".") not in _NAME_TITLES}
 
     best_match = None
     best_score = 0
@@ -352,39 +626,60 @@ def _fuzzy_match_existing_npc(game, new_name: str) -> Optional[dict]:
             continue
 
         # 1. Substring check: "Krahe" ⊂ "Hauptmann Krahe" or vice versa
+        #    Require the SHORTER string to be ≥5 chars to avoid title-only matches
         if new_lower in name_lower or name_lower in new_lower:
-            score = min(len(new_lower), len(name_lower))
-            if score >= 3 and score > best_score:
-                best_score = score
+            shorter_len = min(len(new_lower), len(name_lower))
+            if shorter_len >= 5 and shorter_len > best_score:
+                best_score = shorter_len
                 best_match = n
             continue
 
-        # 2. Check aliases for substring match
+        # 2. Check aliases for substring match (same ≥5 rule)
         for alias in n.get("aliases", []):
             alias_lower = alias.lower().strip()
             if alias_lower == new_lower:
-                return n  # Exact alias match — definite
+                return n  # Exact alias match — always definite
             if new_lower in alias_lower or alias_lower in new_lower:
-                score = min(len(new_lower), len(alias_lower))
-                if score >= 3 and score > best_score:
-                    best_score = score
+                shorter_len = min(len(new_lower), len(alias_lower))
+                if shorter_len >= 5 and shorter_len > best_score:
+                    best_score = shorter_len
                     best_match = n
 
         # 3. Significant word overlap (e.g. "Krahe" appears in "Hauptmann Krahe")
-        name_words = set(name_lower.split())
+        #    Filter titles from BOTH sides before comparing
+        name_words = {w for w in name_lower.split() if w.rstrip(".") not in _NAME_TITLES}
         alias_words = set()
         for alias in n.get("aliases", []):
-            alias_words.update(alias.lower().strip().split())
+            alias_words.update(
+                w for w in alias.lower().strip().split()
+                if w.rstrip(".") not in _NAME_TITLES
+            )
         all_words = name_words | alias_words
+
         overlap = new_words & all_words
-        # Require at least one significant word (3+ chars) to overlap
-        significant_overlap = [w for w in overlap if len(w) >= 3]
+        # Each overlapping word must be ≥5 chars ("Chen"=4 → rejected)
+        significant_overlap = [w for w in overlap if len(w) >= 5]
+
         if significant_overlap:
+            # If only 1 word overlaps, verify it's substantial relative to names
+            if len(significant_overlap) == 1:
+                word = significant_overlap[0]
+                name_ratio = len(word) / max(len(name_lower), 1)
+                new_ratio = len(word) / max(len(new_lower), 1)
+                if max(name_ratio, new_ratio) < 0.4:
+                    # Single short word in two long names — too risky
+                    log(f"[NPC] Fuzzy match REJECTED: '{new_name}' ~ '{n['name']}' "
+                        f"(single overlap '{word}' too small relative to names)")
+                    continue
+
             score = sum(len(w) for w in significant_overlap)
             if score > best_score:
                 best_score = score
                 best_match = n
 
+    if best_match:
+        log(f"[NPC] Fuzzy match accepted: '{new_name}' → '{best_match['name']}' "
+            f"(score={best_score})")
     return best_match
 
 
@@ -402,6 +697,102 @@ def _merge_npc_identity(existing: dict, new_name: str, new_desc: str = ""):
     if existing.get("status") == "background":
         _reactivate_npc(existing, reason=f"identity revealed as {new_name}")
     log(f"[NPC] Identity merged: '{old_name}' → '{new_name}' (aliases: {existing['aliases']})")
+
+
+def _description_match_existing_npc(game, new_desc: str, new_name_lower: str) -> Optional[dict]:
+    """Check if a new NPC's description closely matches an existing NPC's description.
+    This catches identity reveals where names share zero words but the character
+    is clearly the same (e.g. "Sächsischer NVA-Kommandant" → "Hauptmann Rolf Ziegler"
+    when both descriptions mention "NVA-Kommandant" + "Blockade" + "grau...").
+
+    Returns the matching NPC dict or None. Only matches active/background NPCs."""
+    if not new_desc or len(new_desc) < 10:
+        return None
+
+    # Extract significant words from new description (≥4 chars, no stopwords)
+    stopwords = _get_keyword_stopwords()
+    new_words = {
+        w.strip(".,;:!?\"'()-").lower()
+        for w in new_desc.split()
+        if len(w.strip(".,;:!?\"'()-")) >= 4
+    }
+    new_words -= stopwords
+    if len(new_words) < 2:
+        return None
+
+    best_match = None
+    best_score = 0
+
+    for n in game.npcs:
+        if n.get("status") not in ("active", "background"):
+            continue
+        # Don't match against the NPC being created (same name)
+        if n.get("name", "").lower().strip() == new_name_lower:
+            continue
+
+        existing_desc = n.get("description", "")
+        if not existing_desc:
+            continue
+
+        # Extract significant words from existing description
+        existing_words = {
+            w.strip(".,;:!?\"'()-").lower()
+            for w in existing_desc.split()
+            if len(w.strip(".,;:!?\"'()-")) >= 4
+        }
+        existing_words -= stopwords
+
+        # Calculate overlap: exact match + substring matching
+        exact_overlap = new_words & existing_words
+        # Substring matches: if word A contains word B (or vice versa), count as partial
+        # This catches typos like "Ostblockade" ~ "Ostbloc-Blockade" and
+        # compound words like "NVA-Kommandant" matching across descriptions
+        substring_matches = set()
+        for nw in new_words - exact_overlap:
+            for ew in existing_words - exact_overlap:
+                # Check if one is a substring of the other (min 5 chars)
+                if len(nw) >= 5 and len(ew) >= 5:
+                    if nw in ew or ew in nw:
+                        substring_matches.add(nw)
+                        break
+                    # Also check hyphen-split parts (e.g. "NVA-Kommandant")
+                    nw_parts = set(p for p in nw.split("-") if len(p) >= 4)
+                    ew_parts = set(p for p in ew.split("-") if len(p) >= 4)
+                    if nw_parts & ew_parts:
+                        substring_matches.add(nw)
+                        break
+
+        # Weighted overlap: exact=1.0, substring=0.5
+        # Bonus: long compound terms (≥10 chars) count extra (very distinctive)
+        long_exact = sum(1 for w in exact_overlap if len(w) >= 10)
+        effective_overlap = len(exact_overlap) + long_exact * 0.5 + len(substring_matches) * 0.5
+        total_matches = exact_overlap | substring_matches
+
+        if effective_overlap < 1.5:  # Need at least 1 exact + 1 substring, or 1 long compound
+            continue
+
+        # Require meaningful overlap:
+        # - ≥25% of shorter set with effective≥1.5, OR
+        # - Any long compound match (≥10 chars) with effective≥1.5
+        #   (a 10+ char compound like "NVA-Kommandant" is distinctive enough alone)
+        min_set_size = min(len(new_words), len(existing_words))
+        overlap_ratio = effective_overlap / max(min_set_size, 1)
+        has_long_match = any(len(w) >= 10 for w in exact_overlap)
+
+        meets_threshold = (
+            (overlap_ratio >= 0.25 and effective_overlap >= 1.5)
+            or (has_long_match and effective_overlap >= 1.5)
+        )
+
+        if meets_threshold and effective_overlap > best_score:
+            best_score = effective_overlap
+            best_match = n
+            log(f"[NPC] Description match candidate: new='{new_desc[:50]}' ~ "
+                f"existing='{n['name']}' desc='{existing_desc[:50]}' "
+                f"(exact={exact_overlap}, substr={substring_matches}, "
+                f"effective={effective_overlap:.1f}, ratio={overlap_ratio:.1%})")
+
+    return best_match
 
 
 def _process_npc_renames(game, json_text: str):
@@ -429,6 +820,71 @@ def _process_npc_renames(game, json_text: str):
             _merge_npc_identity(npc, new_name, r.get("description", ""))
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         log(f"[NPC] Failed to process NPC renames: {e}", level="warning")
+
+
+def _process_npc_details(game, json_text: str):
+    """Process NPC detail updates from narrator <npc_details> tag.
+    Captures invented surnames, description changes, or other facts the narrator
+    established for known NPCs (e.g. giving Randy the surname 'Cho',
+    or updating Karla from 'pilot' to 'mechanic' after narrative reveal).
+
+    Format: [{"npc_id": "npc_3", "full_name": "Randy Cho"}]
+    or:     [{"npc_id": "npc_3", "full_name": "Randy Cho", "details": "24, lives in Apt 4B"}]
+    or:     [{"npc_id": "npc_3", "description": "New description replacing old one"}]
+    """
+    try:
+        details = json.loads(json_text.strip())
+        if not isinstance(details, list):
+            return
+        for d in details:
+            if not isinstance(d, dict):
+                continue
+            npc = _find_npc(game, d.get("npc_id", ""))
+            if not npc:
+                log(f"[NPC] npc_details: could not find NPC '{d.get('npc_id', '')}'",
+                    level="warning")
+                continue
+
+            # Update full name if provided and different
+            new_name = d.get("full_name", "").strip()
+            if new_name and new_name != npc["name"]:
+                old_name = npc["name"]
+                # Only update if the new name is an EXTENSION of the old name
+                # (e.g. "Randy" → "Randy Cho"), not a completely different name
+                old_lower = old_name.lower().strip()
+                new_lower = new_name.lower().strip()
+                if old_lower in new_lower or new_lower in old_lower:
+                    npc.setdefault("aliases", [])
+                    if old_name and old_name not in npc["aliases"]:
+                        npc["aliases"].append(old_name)
+                    npc["name"] = new_name
+                    log(f"[NPC] Details update: '{old_name}' → '{new_name}' "
+                        f"(surname established)")
+                else:
+                    log(f"[NPC] npc_details: name '{new_name}' too different from "
+                        f"'{old_name}' — use <npc_rename> instead", level="warning")
+
+            # Replace description if provided (for significant narrative changes,
+            # e.g. "combat pilot" → "retired mechanic" after character reveal)
+            new_desc = d.get("description", "").strip()
+            if new_desc:
+                old_desc = npc.get("description", "")
+                npc["description"] = new_desc
+                log(f"[NPC] Description updated for {npc['name']}: "
+                    f"'{old_desc[:50]}' → '{new_desc[:50]}'")
+
+            # Append additional details (legacy format, non-breaking)
+            extra = d.get("details", "").strip()
+            if extra and extra not in (npc.get("description") or ""):
+                existing = npc.get("description", "")
+                if existing:
+                    npc["description"] = f"{existing}. {extra}"
+                else:
+                    npc["description"] = extra
+                log(f"[NPC] Details enriched for {npc['name']}: {extra[:80]}")
+
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        log(f"[NPC] Failed to process npc_details: {e}", level="warning")
 
 
 def _process_new_npcs(game, json_text: str):
@@ -467,6 +923,20 @@ def _process_new_npcs(game, json_text: str):
                 existing_names.add(name_lower)
                 continue
 
+            # Description-based dedup: if fuzzy name match failed, check if the
+            # new NPC's description closely matches an existing NPC's description.
+            # Catches cases like "Sächsischer NVA-Kommandant" → "Hauptmann Rolf Ziegler"
+            # where names share zero words but descriptions overlap heavily.
+            new_desc = nd.get("description", "")
+            if new_desc and len(new_desc) >= 10:
+                desc_hit = _description_match_existing_npc(game, new_desc, name_lower)
+                if desc_hit:
+                    log(f"[NPC] Description-based dedup: '{nd['name']}' matches "
+                        f"'{desc_hit['name']}' — treating as identity reveal")
+                    _merge_npc_identity(desc_hit, nd["name"], new_desc)
+                    existing_names.add(name_lower)
+                    continue
+
             # Assign ID
             npc_id, _ = _next_npc_id(game)
 
@@ -494,6 +964,28 @@ def _process_new_npcs(game, json_text: str):
             game.npcs.append(npc)
             existing_names.add(name_lower)
             log(f"[NPC] New mid-game NPC: {npc['name']} ({npc_id}, {npc['disposition']})")
+
+            # Safety net: create seed memory so NPC is never hollow
+            # (narrator may forget <memory_updates> for new NPCs)
+            seed_event = nd.get("description", "") or f"{npc['name']} appeared"
+            seed_emotion = _normalize_disposition(nd.get("disposition", "neutral"))
+            # Map dispositions to plausible emotional_weights
+            _disp_to_emotion = {
+                "hostile": "hostile", "distrustful": "suspicious",
+                "neutral": "neutral", "friendly": "curious", "loyal": "trusting",
+            }
+            seed_emotion = _disp_to_emotion.get(seed_emotion, "neutral")
+            seed_imp, seed_debug = score_importance(seed_emotion, seed_event, debug=True)
+            # Ensure at least importance 3 for a first appearance
+            seed_imp = max(seed_imp, 3)
+            npc["memory"].append({
+                "scene": game.scene_count,
+                "event": seed_event,
+                "emotional_weight": seed_emotion,
+                "importance": seed_imp,
+                "type": "observation",
+                "_score_debug": f"auto-seed from new_npcs | {seed_debug}",
+            })
 
         # Check if active NPC count exceeds soft limit
         _retire_distant_npcs(game)
@@ -763,6 +1255,43 @@ else:
         "will", "can", "may", "been", "were", "into", "than", "then",
     })
 
+# RPG-context stopwords: common verbs and generic words that create
+# false-positive NPC keyword matches. Added regardless of library availability.
+_RPG_KEYWORD_STOPWORDS = frozenset({
+    # German common verbs
+    "halten", "lassen", "laufen", "überleben", "machen", "gehen", "kommen",
+    "sagen", "wissen", "sehen", "finden", "stehen", "bleiben", "nehmen",
+    "geben", "helfen", "sprechen", "bringen", "denken", "kennen", "wollen",
+    "müssen", "sollen", "dürfen", "werden", "haben", "möchte", "versuchen",
+    "suchen", "brauchen", "glauben", "meinen", "zeigen", "führen", "leben",
+    "arbeiten", "warten", "spielen", "liegen", "setzen", "ziehen",
+    # German generic nouns/adjectives (often capitalized → leak from descriptions)
+    "etwas", "jemand", "andere", "ersten", "letzte", "kleine", "große",
+    "immer", "wieder", "vielleicht", "eigentlich", "bereits", "zusammen",
+    "ehemalige", "ehemaliger", "ehemaliges", "ehemaligen",
+    "erfahrene", "erfahrener", "erfahrenes", "erfahrenen",
+    "derzeit", "aktuell", "aktuelle", "sichtlich", "pragmatisch",
+    "effizient", "effizienter", "jetzt", "schnell", "langsam",
+    # German generic RPG nouns (too common for unique NPC activation)
+    "stimme", "uniform", "waffe", "waffen", "soldat", "soldaten",
+    "gruppe", "trupp", "feind", "feinde", "verbündete", "anführer",
+    "kämpfer", "krieger", "bewohner", "bevölkerung", "wohngebiete",
+    "bedrohung", "gefahr", "angriff", "verteidigung", "blockade",
+    "zugang", "stützpunkt", "station", "position", "sektor",
+    "einsatz", "auftrag", "mission", "befehl", "kommando",
+    "funkgerät", "sensoren", "systeme", "signal", "signale",
+    # English common verbs
+    "wants", "needs", "tries", "keeps", "makes", "takes", "gives",
+    "holds", "knows", "finds", "seems", "looks", "feels", "comes",
+    "goes", "says", "tells", "shows", "lives", "works", "helps",
+    "stays", "leaves", "moves", "turns", "brings", "seeks", "wants",
+    "believe", "think", "should", "would", "could", "might", "still",
+    # English generic
+    "about", "there", "their", "those", "these", "other", "which",
+    "never", "always", "something", "someone", "everything", "nothing",
+})
+_BASE_KEYWORD_STOPWORDS = _BASE_KEYWORD_STOPWORDS | _RPG_KEYWORD_STOPWORDS
+
 def _get_keyword_stopwords(narration_lang: str = "") -> frozenset:
     """Get combined stopwords for NPC keyword filtering.
     Always includes DE+EN base. If narration_lang is provided (e.g. 'French'),
@@ -778,46 +1307,52 @@ def _get_keyword_stopwords(narration_lang: str = "") -> frozenset:
 
 def _auto_generate_keywords(npc: dict, narration_lang: str = "") -> list[str]:
     """Auto-generate activation keywords for an NPC from their data.
-    Includes name parts, aliases, description keywords, and agenda keywords.
+    
+    Strategy (informed by envy-ai/ai_rpg research):
+    - PRIMARY: Name parts + full name + aliases (player references NPCs by name)
+    - SECONDARY: Capitalized proper nouns from description (role titles, places)
+    - EXCLUDED: Agenda text (generic verbs/goals cause false-positive activation)
+    
     narration_lang: English name (e.g. 'French') for language-aware stopword filtering."""
     stopwords = _get_keyword_stopwords(narration_lang)
     keywords = set()
 
-    # Name parts (split compound names)
+    # Name parts (split compound names) — PRIMARY activation signal
     name = npc.get("name", "")
     for part in name.split():
-        low = part.lower()
-        if len(low) >= 3 and low not in stopwords:
+        low = part.lower().strip(".,;:!?\"'()-")
+        if len(low) >= 3 and low not in stopwords and low.rstrip(".") not in _NAME_TITLES:
             keywords.add(low)
     keywords.add(name.lower())
 
-    # Aliases
+    # Aliases — equally important as name
     for alias in npc.get("aliases", []):
         keywords.add(alias.lower())
         for part in alias.split():
-            low = part.lower()
-            if len(low) >= 3 and low not in stopwords:
+            low = part.lower().strip(".,;:!?\"'()-")
+            if len(low) >= 3 and low not in stopwords and low.rstrip(".") not in _NAME_TITLES:
                 keywords.add(low)
 
-    # Key nouns from description (simple extraction: capitalize words, role words)
+    # Description: ONLY extract words that were capitalized in original text
+    # (proper nouns, role titles like "Kommandant", place names)
+    # Skip generic adjectives and verbs even if capitalized (German nouns)
     desc = npc.get("description", "")
     if desc:
-        # Extract likely-important words (capitalized, role-like, location-like)
         for word in desc.split():
-            clean = word.strip(".,;:!?\"'()-").lower()
-            if (len(clean) >= 4 and clean not in stopwords
-                    and (clean[0].isupper() if word[0:1].isupper() else False)):
-                keywords.add(clean)
+            if not word[0:1].isupper():
+                continue  # Skip lowercase words entirely
+            clean = word.strip(".,;:!?\"'()-—–")
+            low = clean.lower()
+            if (len(low) >= 4 and low not in stopwords
+                    and low.rstrip(".") not in _NAME_TITLES
+                    and low not in keywords):  # Avoid duplicating name parts
+                keywords.add(low)
 
-    # Agenda keywords
-    agenda = npc.get("agenda", "")
-    if agenda:
-        for word in agenda.split():
-            clean = word.strip(".,;:!?\"'()-").lower()
-            if len(clean) >= 5 and clean not in stopwords:
-                keywords.add(clean)
+    # Agenda is deliberately EXCLUDED — generic goal verbs ("eindämmen",
+    # "bekämpfen", "überleben") cause false-positive NPC activation.
+    # NPCs are activated by name reference, not by thematic overlap.
 
-    return list(keywords)[:20]  # Cap at 20 keywords
+    return list(keywords)[:8]  # Cap at 8 (was 20; fewer = less noise)
 
 
 def _ensure_npc_memory_fields(npc: dict):
@@ -826,9 +1361,9 @@ def _ensure_npc_memory_fields(npc: dict):
     npc.setdefault("keywords", [])
     npc.setdefault("importance_accumulator", 0)
     npc.setdefault("last_reflection_scene", 0)
-    # Auto-generate keywords if missing
-    if not npc["keywords"]:
-        npc["keywords"] = _auto_generate_keywords(npc)
+    # Always regenerate keywords from NPC data (keywords are derived, not curated;
+    # ensures algorithm improvements apply to existing savegames)
+    npc["keywords"] = _auto_generate_keywords(npc)
     # Migrate existing memories: add importance and type if missing
     for m in npc["memory"]:
         if isinstance(m, dict):
@@ -1578,6 +2113,8 @@ def call_brain(client: anthropic.Anthropic, game: GameState, player_message: str
 
     lang_rules = (f"- If the player's action implies moving to a NEW location, "
                   f"set location_change to a short location name in {_brain_lang}. null if staying.\n"
+                  f"- ALSO check the scene context (ctx): if it describes the character being at a DIFFERENT "
+                  f"location than the current loc, set location_change to match the actual location.\n"
                   f"- player_intent and location_change MUST be in {_brain_lang}")
 
     system = """<role>RPG engine parser. Convert player input to a game move as JSON.</role>
@@ -1911,38 +2448,123 @@ location:{game.current_location}
 situation:{game.current_scene_context}
 npcs:{npc_text}{campaign_ctx}{backstory_text}"""
 
-    try:
-        response = _api_create_with_retry(
-            client, max_retries=2,
-            model=BRAIN_MODEL, max_tokens=1000, system=system,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        text = response.content[0].text
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
+    # Story Architect uses NARRATOR_MODEL (Sonnet) — called once per game/chapter,
+    # cost is negligible (~$0.01), but quality of the blueprint shapes the entire story.
+    # Haiku struggles with this complex nested JSON + foreign language requirement.
+    for attempt in range(2):  # Up to 2 attempts
+        try:
+            response = _api_create_with_retry(
+                client, max_retries=2,
+                model=NARRATOR_MODEL, max_tokens=1200, system=system,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            text = response.content[0].text
+            match = re.search(r'\{[\s\S]*\}', text)
+            if not match:
+                log(f"[Story] Architect attempt {attempt+1}: no JSON found in response. "
+                    f"Raw text (first 300 chars): {text[:300]}", level="warning")
+                continue  # Retry
+
             raw_json = match.group()
             try:
                 blueprint = json.loads(raw_json)
             except json.JSONDecodeError:
-                blueprint = json.loads(_repair_json(raw_json))
-            # Validate minimal structure
-            if blueprint.get("acts") and blueprint.get("central_conflict"):
-                blueprint["revealed"] = []  # Track which revelations have fired
-                blueprint["structure_type"] = structure_type
-                return blueprint
-    except (json.JSONDecodeError, Exception):
-        pass
+                try:
+                    blueprint = json.loads(_repair_json(raw_json))
+                except (json.JSONDecodeError, Exception) as repair_err:
+                    log(f"[Story] Architect attempt {attempt+1}: JSON parse+repair both failed. "
+                        f"Error: {repair_err}. Raw JSON (first 400 chars): {raw_json[:400]}",
+                        level="warning")
+                    continue  # Retry
 
-    # Fallback: minimal blueprint (English — language-neutral fallback)
+            # Validate minimal structure
+            missing = []
+            if not blueprint.get("acts"):
+                missing.append("acts")
+            if not blueprint.get("central_conflict"):
+                missing.append("central_conflict")
+            if missing:
+                log(f"[Story] Architect attempt {attempt+1}: JSON valid but missing required fields: "
+                    f"{missing}. Keys present: {list(blueprint.keys())}. "
+                    f"central_conflict={blueprint.get('central_conflict', '(missing)')!r}",
+                    level="warning")
+                continue  # Retry
+
+            blueprint["revealed"] = []  # Track which revelations have fired
+            blueprint["structure_type"] = structure_type
+            log(f"[Story] Architect succeeded (attempt {attempt+1}): "
+                f"conflict={blueprint['central_conflict'][:80]}, "
+                f"acts={len(blueprint['acts'])}, "
+                f"revelations={len(blueprint.get('revelations', []))}")
+            return blueprint
+
+        except Exception as e:
+            log(f"[Story] Architect attempt {attempt+1} exception: {type(e).__name__}: {e}",
+                level="warning")
+            if attempt == 0:
+                continue  # Retry once on exception
+            # Second attempt also failed — fall through to fallback
+
+    log(f"[Story] Architect failed after 2 attempts, using context-aware fallback", level="warning")
+
+    # Fallback: minimal context-aware blueprint in narration language.
+    # Uses actual game info instead of generic English placeholder text.
+    _loc_short = (game.current_location or "").split(",")[0].strip()[:40]  # Shorten long locations
+    _genre_short = (game.setting_genre or "").split(",")[0].strip()[:30]
+
+    # Language-aware fallback text
+    _fb_texts = {
+        "German": {
+            "conflict": f"{game.player_name} steht vor einer unbekannten Bedrohung{' in ' + _loc_short if _loc_short else ''}.",
+            "antagonist": f"Feindliche Kräfte{' in der ' + _genre_short + '-Welt' if _genre_short else ''}",
+            "3act": [
+                {"phase": "setup", "title": "Erste Schatten", "goal": "Die Bedrohung erkennen und Verbündete finden",
+                 "scene_range": [1, 6], "mood": "mysterious"},
+                {"phase": "confrontation", "title": "Eskalation", "goal": "Der Bedrohung direkt begegnen",
+                 "scene_range": [7, 13], "mood": "tense"},
+                {"phase": "climax", "title": "Die Entscheidung", "goal": "Das Schicksal entscheiden",
+                 "scene_range": [14, 20], "mood": "desperate"},
+            ],
+            "3act_endings": [
+                {"type": "triumph", "description": "Sieg über die Bedrohung."},
+                {"type": "bittersweet", "description": "Sieg, aber zu einem hohen Preis."},
+                {"type": "tragedy", "description": "Untergang trotz des Kampfes."},
+            ],
+            "kish": [
+                {"phase": "ki_introduction", "title": "Der Alltag", "goal": "Die Welt und ihre Menschen kennenlernen",
+                 "scene_range": [1, 5], "mood": "contemplative"},
+                {"phase": "sho_development", "title": "Vertiefung", "goal": "Beziehungen und Muster vertiefen",
+                 "scene_range": [6, 10], "mood": "intimate"},
+                {"phase": "ten_twist", "title": "Die Wendung", "goal": "Eine unerwartete Perspektive verändert alles",
+                 "scene_range": [11, 15], "mood": "surprising"},
+                {"phase": "ketsu_resolution", "title": "Versöhnung", "goal": "Das Neue mit dem Alten vereinen",
+                 "scene_range": [16, 20], "mood": "reflective"},
+            ],
+            "kish_endings": [
+                {"type": "harmony", "description": "Frieden und Verständnis."},
+                {"type": "bittersweet", "description": "Erkenntnis um einen Preis."},
+                {"type": "melancholy", "description": "Schöne Traurigkeit."},
+            ],
+        },
+    }
+    # Use German if available, otherwise English (neutral fallback)
+    fb = _fb_texts.get(lang, None)
+    if not fb:
+        _conflict = f"A growing threat challenges {game.player_name}{' in ' + _loc_short if _loc_short else ''}."
+        _antag = f"Opposing forces{' within the ' + _genre_short + ' world' if _genre_short else ''}"
+    else:
+        _conflict = fb["conflict"]
+        _antag = fb["antagonist"]
+
     if structure_type == "kishotenketsu":
         return {
-            "central_conflict": "A hidden secret waits to be discovered.",
-            "antagonist_force": "The truth beneath the surface",
+            "central_conflict": _conflict,
+            "antagonist_force": _antag,
             "structure_type": "kishotenketsu",
-            "acts": [
-                {"phase": "ki_introduction", "title": "Daily Life", "goal": "Get to know the world and its people",
+            "acts": fb["kish"] if fb else [
+                {"phase": "ki_introduction", "title": "Daily Life", "goal": "Get to know the world",
                  "scene_range": [1, 5], "mood": "contemplative"},
-                {"phase": "sho_development", "title": "Deepening", "goal": "Deepen relationships and patterns",
+                {"phase": "sho_development", "title": "Deepening", "goal": "Deepen relationships",
                  "scene_range": [6, 10], "mood": "intimate"},
                 {"phase": "ten_twist", "title": "The Twist", "goal": "An unexpected perspective changes everything",
                  "scene_range": [11, 15], "mood": "surprising"},
@@ -1950,7 +2572,7 @@ npcs:{npc_text}{campaign_ctx}{backstory_text}"""
                  "scene_range": [16, 20], "mood": "reflective"},
             ],
             "revelations": [],
-            "possible_endings": [
+            "possible_endings": fb["kish_endings"] if fb else [
                 {"type": "harmony", "description": "Peace and understanding."},
                 {"type": "bittersweet", "description": "Insight at a cost."},
                 {"type": "melancholy", "description": "Beautiful sadness."},
@@ -1959,20 +2581,20 @@ npcs:{npc_text}{campaign_ctx}{backstory_text}"""
         }
     else:
         return {
-            "central_conflict": "An unknown threat grows in the shadows.",
-            "antagonist_force": "Dark forces",
+            "central_conflict": _conflict,
+            "antagonist_force": _antag,
             "structure_type": "3act",
-            "acts": [
-                {"phase": "setup", "title": "First Shadows", "goal": "Find clues about the threat",
+            "acts": fb["3act"] if fb else [
+                {"phase": "setup", "title": "First Shadows", "goal": "Discover the threat and find allies",
                  "scene_range": [1, 6], "mood": "mysterious"},
-                {"phase": "confrontation", "title": "Into Darkness", "goal": "Confront the threat",
+                {"phase": "confrontation", "title": "Escalation", "goal": "Confront the threat directly",
                  "scene_range": [7, 13], "mood": "tense"},
                 {"phase": "climax", "title": "The Decision", "goal": "Decide the fate",
                  "scene_range": [14, 20], "mood": "desperate"},
             ],
             "revelations": [],
-            "possible_endings": [
-                {"type": "triumph", "description": "Victory over darkness."},
+            "possible_endings": fb["3act_endings"] if fb else [
+                {"type": "triumph", "description": "Victory over the threat."},
                 {"type": "bittersweet", "description": "Victory at a high cost."},
                 {"type": "tragedy", "description": "Downfall despite the struggle."},
             ],
@@ -2150,6 +2772,7 @@ def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) 
 - NPCs act per their disposition and memories
 - NEW NPCs: When a new NAMED character appears who is NOT in <npcs_present>, include them in <new_npcs> metadata. Only named, story-relevant characters {E['dash']} not unnamed crowd or background figures.
 - NPC IDENTITY REVEAL: When a character already listed in <npcs_present> is revealed to have a DIFFERENT true name (unmasking, introduction by full name, alias reveal), use <npc_rename> metadata INSTEAD of <new_npcs>. This prevents duplicate NPCs. Example: a mysterious stranger reveals themselves as a known captain.
+- NPC SURNAME ESTABLISHMENT: When you INVENT a surname or other new biographical fact for a known NPC who only has a first name (e.g. police use their full name for the first time), add a <npc_details> block so the system remembers. Do NOT use <npc_rename> for this {E['dash']} rename is for identity REVEALS (spy's true name), details is for filling in GAPS (a surname never established).
 - BACKSTORY CANON: If <backstory> is present, treat it as ESTABLISHED HISTORY. People mentioned there (family, friends, rivals) are ALREADY KNOWN to the player character {E['dash']} if they appear, they recognize the player and vice versa. NEVER introduce a backstory character as a stranger or reinterpret established relationships. Backstory events ALREADY HAPPENED {E['dash']} reference them as shared memory, not new plot.
 - Describe only sensory impressions, never player thoughts
 - End scenes OPEN {E['dash']} no option lists, no suggested actions
@@ -2219,8 +2842,11 @@ def call_narrator(client: anthropic.Anthropic, prompt: str,
     if '<game_data>' in raw: tags_found.append('game_data')
     if '<npc_rename>' in raw: tags_found.append('npc_rename')
     if '<new_npcs>' in raw: tags_found.append('new_npcs')
+    if '<npc_details>' in raw: tags_found.append('npc_details')
     if '<memory_updates>' in raw: tags_found.append('memory_updates')
     if '<scene_context>' in raw: tags_found.append('scene_context')
+    if '<location_update>' in raw: tags_found.append('location_update')
+    if '<time_update>' in raw: tags_found.append('time_update')
     if tags_found:
         log(f"[Narrator] Metadata tags found: {', '.join(tags_found)}")
     else:
@@ -2234,7 +2860,8 @@ def _salvage_truncated_narration(raw: str) -> str:
     # Split into prose and metadata parts
     # Find the last complete metadata tag boundary
     metadata_tags = ['<game_data>', '<npc_rename>', '<new_npcs>',
-                     '<memory_updates>', '<scene_context>']
+                     '<npc_details>', '<memory_updates>', '<scene_context>',
+                     '<location_update>', '<time_update>']
     # Check for incomplete metadata at the end (tag opened but not closed)
     for tag in metadata_tags:
         close_tag = tag.replace('<', '</')
@@ -2406,10 +3033,11 @@ def build_director_prompt(game: GameState, latest_narration: str,
             f'progress="{act["progress"]}" conflict="{bp.get("central_conflict", "")}"/>'
         )
 
-    # Active NPC overview
+    # Active NPC overview (include descriptions so Director stays consistent with narrative)
     npc_overview = "\n".join(
         f'- {n["name"]}({n.get("id","")}) {n["disposition"]} B{n.get("bond",0)} '
         f'status={n.get("status","active")}'
+        f'{" | " + n["description"][:80] if n.get("description") else ""}'
         for n in game.npcs
         if n.get("status") in ("active", "background")
     ) or "(none)"
@@ -2947,14 +3575,21 @@ def build_dialog_prompt(game: GameState, brain: dict, player_words: str = "",
 <task>2-3 paragraphs. After narration append invisible metadata:
 - If ANY named character appears who is NOT listed in <known_npcs>, add a <new_npcs> block
 - If a known NPC is revealed to have a DIFFERENT true name (unmasking, alias reveal), add a <npc_rename> block INSTEAD of <new_npcs>
+- If you INVENTED a surname or other new biographical fact for a known NPC, add a <npc_details> block
+- If a known NPC's role or situation CHANGED significantly from their <npcs_present> description, update via <npc_details> with a new "description"
 - Always add <memory_updates> for NPCs involved in this scene
 - Always add <scene_context>
+- If the character MOVED to a different location in this scene, add <location_update> with the new location name
+- If significant time passed in this scene (minutes+), add <time_update> with the current time phase
 - If <director_guidance> is present, follow its narrative direction while maintaining your creative voice
 </task>
 <npc_rename>[{{"npc_id":"id_or_name","new_name":"revealed true name"}}]</npc_rename>
 <new_npcs>[{{"name":"","description":"1 sentence in {lang}","disposition":"neutral|friendly|distrustful|hostile|loyal"}}]</new_npcs>
+<npc_details>[{{"npc_id":"id_or_name","full_name":"opt. full name","description":"opt. updated 1-sentence role/situation in {lang}"}}]</npc_details>
 <memory_updates>[{{"npc_id":"id_or_name","event":"what happened (in {lang})","emotional_weight":"ONE English word: neutral|curious|wary|angry|grateful|suspicious|terrified|loyal|conflicted|betrayed|devastated|euphoric"}}]</memory_updates>
-<scene_context>updated context</scene_context>"""
+<scene_context>updated context</scene_context>
+<location_update>new location name (only if moved)</location_update>
+<time_update>early_morning|morning|midday|afternoon|evening|late_evening|night|deep_night</time_update>"""
 
 
 def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
@@ -3044,14 +3679,21 @@ def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
 <task>2-4 paragraphs. After narration append invisible metadata:
 - If ANY named character appears who is NOT listed in <known_npcs>, add a <new_npcs> block
 - If a known NPC is revealed to have a DIFFERENT true name (unmasking, alias reveal), add a <npc_rename> block INSTEAD of <new_npcs>
+- If you INVENTED a surname or other new biographical fact for a known NPC, add a <npc_details> block
+- If a known NPC's role or situation CHANGED significantly from their <npcs_present> description, update via <npc_details> with a new "description"
 - Always add <memory_updates> for NPCs involved in this scene
 - Always add <scene_context>
+- If the character MOVED to a different location in this scene, add <location_update> with the new location name
+- If significant time passed in this scene (minutes+), add <time_update> with the current time phase
 - If <director_guidance> is present, follow its narrative direction while maintaining your creative voice
 </task>
 <npc_rename>[{{"npc_id":"id_or_name","new_name":"revealed true name"}}]</npc_rename>
 <new_npcs>[{{"name":"","description":"1 sentence in {lang}","disposition":"neutral|friendly|distrustful|hostile|loyal"}}]</new_npcs>
+<npc_details>[{{"npc_id":"id_or_name","full_name":"opt. full name","description":"opt. updated 1-sentence role/situation in {lang}"}}]</npc_details>
 <memory_updates>[{{"npc_id":"id_or_name","event":"what happened (in {lang})","emotional_weight":"ONE English word: neutral|curious|wary|angry|grateful|suspicious|terrified|loyal|conflicted|betrayed|devastated|euphoric"}}]</memory_updates>
-<scene_context>updated context</scene_context>"""
+<scene_context>updated context</scene_context>
+<location_update>new location name (only if moved)</location_update>
+<time_update>early_morning|morning|midday|afternoon|evening|late_evening|night|deep_night</time_update>"""
 
 
 # ===============================================================
@@ -3090,6 +3732,15 @@ def _process_game_data(game: GameState, data: dict, force_npcs: bool = True):
                 m if isinstance(m, dict) else {"scene": 0, "event": str(m), "emotional_weight": "neutral"}
                 for m in nd["memory"]
             ]
+            # Score opening scene memories for importance (diagnostic consistency)
+            for m in nd["memory"]:
+                if isinstance(m, dict) and "importance" not in m:
+                    ew = m.get("emotional_weight", "neutral")
+                    ev = m.get("event", "")
+                    imp, dbg = score_importance(ew, ev, debug=True)
+                    m["importance"] = imp
+                    m["type"] = m.get("type", "observation")
+                    m["_score_debug"] = f"opening game_data | {dbg}"
             # Auto-generate keywords if missing
             if not nd["keywords"]:
                 nd["keywords"] = _auto_generate_keywords(nd)
@@ -3171,6 +3822,13 @@ def parse_narrator_response(game: GameState, raw: str) -> str:
         _process_new_npcs(game, new_npc_match.group(1))
         narration = re.sub(r'<new_npcs>[\s\S]*?</new_npcs>', '', narration).strip()
 
+    # --- 1.8) Tagged npc_details (narrator established new facts about known NPCs) ---
+    details_match = re.search(r'<npc_details>([\s\S]*?)</npc_details>', narration)
+    if details_match:
+        log(f"[Parser] Step 1.8: Found <npc_details> tag: {details_match.group(1)[:200]}")
+        _process_npc_details(game, details_match.group(1))
+        narration = re.sub(r'<npc_details>[\s\S]*?</npc_details>', '', narration).strip()
+
     # --- 2) Tagged memory_updates ---
     mem = re.search(r'<memory_updates>([\s\S]*?)</memory_updates>', narration)
     if mem:
@@ -3183,6 +3841,24 @@ def parse_narrator_response(game: GameState, raw: str) -> str:
     if ctx:
         game.current_scene_context = ctx.group(1).strip()
         narration = re.sub(r'<scene_context>[\s\S]*?</scene_context>', '', narration).strip()
+
+    # --- 3.1) Tagged location_update (narrator detected character movement) ---
+    loc_upd = re.search(r'<location_update>([\s\S]*?)</location_update>', narration)
+    if loc_upd:
+        new_loc = loc_upd.group(1).strip()
+        if new_loc and new_loc.lower() not in ("none", "null", "same", ""):
+            log(f"[Parser] Step 3.1: Narrator location_update → '{new_loc}'")
+            update_location(game, new_loc)
+        narration = re.sub(r'<location_update>[\s\S]*?</location_update>', '', narration).strip()
+
+    # --- 3.2) Tagged time_update (narrator detected time passage) ---
+    time_upd = re.search(r'<time_update>([\s\S]*?)</time_update>', narration)
+    if time_upd:
+        new_time = time_upd.group(1).strip().lower().replace(" ", "_")
+        if new_time in TIME_PHASES:
+            log(f"[Parser] Step 3.2: Narrator time_update → '{new_time}'")
+            game.time_of_day = new_time
+        narration = re.sub(r'<time_update>[\s\S]*?</time_update>', '', narration).strip()
 
     # --- 4) Strip ALL remaining XML tags with content ---
     narration = re.sub(r'<[^>]+>[\s\S]*?</[^>]+>', '', narration).strip()
@@ -3265,7 +3941,7 @@ def parse_narrator_response(game: GameState, raw: str) -> str:
 
     # Catch any remaining standalone bracket labels (including [scene_context] without content)
     narration = re.sub(
-        r'^\[(?:memory[_\s-]*updates?|scene[_\s-]*context|new[_\s-]*npcs?|npc[_\s-]*renames?|location)\][ \t]*.*$',
+        r'^\[(?:memory[_\s-]*updates?|scene[_\s-]*context|new[_\s-]*npcs?|npc[_\s-]*renames?|npc[_\s-]*details?|location)\][ \t]*.*$',
         '', narration, flags=re.IGNORECASE | re.MULTILINE).strip()
 
     # --- 5) Strip markdown code fences (``` blocks) ---
@@ -3284,6 +3960,9 @@ def parse_narrator_response(game: GameState, raw: str) -> str:
         elif '"npc_id"' in code_content and '"new_name"' in code_content:
             # npc_rename data in code fence
             _process_npc_renames(game, code_content)
+        elif '"npc_id"' in code_content and '"full_name"' in code_content:
+            # npc_details data in code fence (surname establishment)
+            _process_npc_details(game, code_content)
         elif '"npc_id"' in code_content:
             _apply_memory_updates(game, code_content)
         elif '"disposition"' in code_content and '"name"' in code_content and '"npc_id"' not in code_content:
@@ -3525,10 +4204,29 @@ def _apply_memory_updates(game: GameState, json_text: str):
             npc = _find_npc(game, u["npc_id"])
 
             # Fuzzy fallback: try word-overlap matching before creating a stub
+            # v0.9.29: additional first-name mismatch guard
             if not npc and u["npc_id"] and u["npc_id"] not in ("world", "player", ""):
-                npc = _fuzzy_match_existing_npc(game, u["npc_id"])
-                if npc:
-                    log(f"[NPC] memory_update fuzzy-matched '{u['npc_id']}' → '{npc['name']}'")
+                fuzzy_candidate = _fuzzy_match_existing_npc(game, u["npc_id"])
+                if fuzzy_candidate:
+                    # Safety: if both names have 2+ words, verify first names aren't
+                    # completely different (prevents "Marissa Chen" → "Mrs. Chen")
+                    ref_parts = u["npc_id"].strip().split()
+                    match_parts = fuzzy_candidate["name"].strip().split()
+                    if len(ref_parts) >= 2 and len(match_parts) >= 2:
+                        ref_first = ref_parts[0].lower().strip(".")
+                        match_first = match_parts[0].lower().strip(".")
+                        if (ref_first not in _NAME_TITLES
+                                and match_first not in _NAME_TITLES
+                                and ref_first != match_first
+                                and ref_first not in match_first
+                                and match_first not in ref_first):
+                            log(f"[NPC] memory_update fuzzy REJECTED: '{u['npc_id']}' ~ "
+                                f"'{fuzzy_candidate['name']}' (first-name mismatch: "
+                                f"'{ref_first}' vs '{match_first}')")
+                            fuzzy_candidate = None
+                    if fuzzy_candidate:
+                        npc = fuzzy_candidate
+                        log(f"[NPC] memory_update fuzzy-matched '{u['npc_id']}' → '{npc['name']}'")
 
             # Auto-create NPC stub if not found (safety net when <new_npcs> was omitted)
             if not npc and u["npc_id"] and u["npc_id"] not in ("world", "player", ""):

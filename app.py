@@ -1650,7 +1650,7 @@ def _render_confirm():
 # ===============================================================
 
 async def process_player_input(text: str, chat_container, sidebar_container=None,
-                               sidebar_refresh=None) -> None:
+                               sidebar_refresh=None, is_retry: bool = False) -> None:
     s=S();game=s.get("game")
     if not game or not text.strip(): return
     # Double-send guard: prevent concurrent processing
@@ -1660,9 +1660,11 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
     s["processing"] = True
     turn_gen = s.get("_turn_gen", 0)  # Capture generation to detect save-switch during processing
     config=get_engine_config();username=s["current_user"]
-    s["messages"].append({"role":"user","content":text})
-    with chat_container:
-        with ui.column().classes("chat-msg user w-full"): ui.markdown(text)
+    # On retry, the message is already in s["messages"] and rendered — don't duplicate
+    if not is_retry:
+        s["messages"].append({"role":"user","content":text})
+        with chat_container:
+            with ui.column().classes("chat-msg user w-full"): ui.markdown(text)
     try:
         with chat_container: spinner=ui.spinner("dots", size="lg")
         # Scroll down so player sees their message + spinner
@@ -1754,7 +1756,25 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
     except Exception as e:
         try: spinner.delete()
         except Exception: pass
-        ui.notify(t("game.error", L(), error=e), type="negative")
+        # Show inline retry button in chat instead of just a toast notification
+        _retry_text = text  # capture for closure
+        _retry_cc = chat_container
+        _retry_sr = sidebar_refresh
+        with chat_container:
+            retry_row = ui.row().classes("w-full items-center gap-2 py-1 px-3").style(
+                "background: rgba(255,80,80,0.1); border: 1px solid rgba(255,80,80,0.3); "
+                "border-radius: 8px; margin: 0.25rem 0"
+            )
+            with retry_row:
+                err_short = str(e)[:120]
+                ui.label(f"{E['warn']} {err_short}").classes("text-xs text-red-300 flex-grow").style("word-break: break-word")
+                async def _do_retry(rr=retry_row, rt=_retry_text, rc=_retry_cc, rs=_retry_sr):
+                    try: rr.delete()
+                    except Exception: pass
+                    await process_player_input(rt, rc, sidebar_refresh=rs, is_retry=True)
+                ui.button(icon="refresh", on_click=_do_retry).props("flat dense round").classes(
+                    "text-red-300 hover:text-white"
+                ).style("min-width: 40px; min-height: 40px").tooltip(t("game.retry_tooltip", L()))
     finally:
         # Only reset processing if this is still the active generation
         # (prevents stale task's finally from clearing a newer task's flag)

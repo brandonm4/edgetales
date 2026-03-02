@@ -6,7 +6,7 @@
 [![NiceGUI](https://img.shields.io/badge/UI-NiceGUI-4CAF50?logo=vuedotjs&logoColor=white)](https://nicegui.io)
 [![Claude AI](https://img.shields.io/badge/AI-Claude%20Haiku%20%2B%20Sonnet-orange?logo=anthropic&logoColor=white)](https://anthropic.com)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-lightgrey)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.9.28-blueviolet)]()
+[![Version](https://img.shields.io/badge/Version-0.9.29-blueviolet)]()
 [![Mobile Ready](https://img.shields.io/badge/Mobile-PWA%20Ready-success?logo=pwa&logoColor=white)]()
 
 ---
@@ -191,6 +191,8 @@ Player types action
 
 The Director also generates enriched scene summaries that replace the Brain's bare-bones log entries, giving the narrator better context about *why* things matter, not just *what* happened.
 
+A fourth agent — the **Story Architect** — runs once at game start and once per chapter start, using Sonnet to generate a story blueprint (3-act or Kishōtenketsu structure) with act goals, revelations, and possible endings. This blueprint guides pacing throughout the entire story without railroading the player.
+
 ### Core Design Principle: AI Narrates, It Does Not Decide
 
 The engine guarantees a strict separation: **dice determine outcomes, the AI only provides prose.** Your exact input - dialogue, actions, descriptions - is never rewritten or reinterpreted. The Narrator responds *to* what you write, never *replacing* it. And it never overrides the dice — a miss is always a miss, no matter how eloquent the player's action was.
@@ -253,6 +255,7 @@ Install only what you need:
 pip install chatterbox-tts torchaudio   # Offline AI TTS with voice cloning
 pip install faster-whisper               # Speech-to-Text (microphone input)
 pip install cryptography                 # HTTPS auto-certificate generation
+pip install nameparser                   # Enhanced NPC name/title detection (619 titles)
 ```
 
 | Package | Purpose | Notes |
@@ -265,6 +268,7 @@ pip install cryptography                 # HTTPS auto-certificate generation
 | `torchaudio` | Audio processing for Chatterbox | Match your PyTorch version |
 | `faster-whisper` | Speech-to-text (STT) | Models: tiny → large-v3 |
 | `cryptography` | Auto TLS certificate generation | Only needed for HTTPS mode |
+| `nameparser` | NPC name/title detection (619 built-in titles) | Graceful fallback to ~60 manual titles if missing |
 
 ---
 

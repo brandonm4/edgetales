@@ -5,6 +5,29 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.29]
+
+### Added
+- **NPC Duplicate Detection via Description:** New `_description_match_existing_npc()` catches duplicates when names have zero word overlap but descriptions match (e.g., "Sächsischer NVA-Kommandant" → "Hauptmann Rolf Ziegler"). Features: exact word overlap + substring matching for typos, hyphen-part decomposition for compound words ("NVA-Kommandant" → "NVA" + "Kommandant"), long compound bonus (≥10 char distinctive terms count 1.5×). Threshold: ≥25% overlap ratio OR any long match with effective score ≥1.5. Called in `_process_new_npcs` after fuzzy name match fails, before creating a new NPC
+- **NPC Seed Memory on Discovery:** `_process_new_npcs()` now auto-creates a seed memory entry for every newly discovered NPC, using their description text and disposition-derived emotional weight. Prevents "hollow NPCs" with zero memories when the Narrator forgets `<memory_updates>` for characters it just introduced via `<new_npcs>`. Seed importance is scored normally (with `_score_debug: "auto-seed from new_npcs"`) and floored at 3
+- **Narrator Location & Time Update Tags:** Two new optional metadata tags `<location_update>` and `<time_update>` in both dialog and action narrator prompts. Parser extracts them to update `game.current_location` and `game.time_of_day` — fixes frozen locations during narrative movement (e.g., takeoff/flight sequences) and stuck time progression despite explicit in-narration time jumps
+- **NPC Description Updates via `<npc_details>`:** Narrator prompt schema expanded: `<npc_details>` now accepts optional `"description"` field alongside the existing `"full_name"`. Enables mid-game description corrections when a character's role changes (e.g., "Mech-Kampfpilotin" → "ehemalige Pilotin, jetzt Mechanikerin"). Parser applies updates to existing NPCs and logs changes
+
+### Improved
+- **Story Architect upgraded to Sonnet:** `call_story_architect()` now uses `NARRATOR_MODEL` (Sonnet) instead of `BRAIN_MODEL` (Haiku). Called once per game/chapter start (~$0.01 per call — negligible vs. ongoing narrator costs), but the quality of the blueprint shapes the entire story arc, pacing, and revelations. Haiku struggled with the complex nested JSON structure + foreign-language requirement, silently producing generic fallback blueprints
+- **Story Architect diagnostic logging & retry:** All three previously silent failure paths now log detailed diagnostics: no JSON in response (logs first 300 chars), JSON parse + repair both failed (logs error + raw JSON head), JSON valid but missing `acts`/`central_conflict` (logs present keys). Two-attempt retry loop before falling through to context-aware fallback. `max_tokens` increased 1000 → 1200
+- **Story Blueprint fallback localization:** Fallback blueprints now use language-aware text via `_fb_texts` dict — German act titles ("Erste Schatten", "Eskalation", "Die Entscheidung"), goals, and endings for German narration; English for all other languages. Location/genre strings shortened to first 40/30 chars to prevent ugly concatenation artifacts in fallback text
+- **Keyword generation overhaul:** Removed agenda text from keyword sources entirely — generic goal verbs ("eindämmen", "überleben", "funktionsfähig") caused false-positive NPC activation. Keywords now derived exclusively from: name parts + aliases + capitalized proper nouns from description. Cap reduced 20 → 8 per NPC (fewer = less noise). ~165 RPG-specific German stopwords added (capitalized nouns that pass the library filter: "Wohngebiete", "Blockade", "Bedrohung", "Uniform", "Waffe" etc.). Name titles filtered via `_NAME_TITLES` set ("hauptmann", "major", "kommandant" etc.). Keywords always regenerated on load — they're derived data, so algorithm improvements apply retroactively to existing savegames
+- **Emotion taxonomy:** Added `"urgent": 5` to `IMPORTANCE_MAP` (Tier 5, alongside `determined`). Fixed German emotion mappings: `"dringend"` and `"dringlich"` now correctly map to `"urgent"` via `_EMOTION_DE_EN` (were incorrectly mapped to `"desperate"`, causing Tier 9 over-scoring)
+
+### Changed
+- `call_story_architect()` uses `NARRATOR_MODEL` (Sonnet) instead of `BRAIN_MODEL` (Haiku)
+- `_auto_generate_keywords()`: agenda text no longer used as keyword source; cap 20 → 8; ~165 RPG stopwords added
+- Keywords regenerated on every save load (derived data, not persisted algorithm state)
+- **New optional dependency:** `nameparser` (`pip install nameparser`) — provides 619 English name titles for NPC keyword filtering. Graceful fallback to ~60 manual titles if not installed
+
+---
+
 ## [0.9.28]
 
 ### Added
