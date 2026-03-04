@@ -119,7 +119,7 @@ from nicegui import app, ui, Client
 # Engine & Voice imports
 # ---------------------------------------------------------------------------
 from engine import (
-    E, log,
+    E, log, VERSION,
     GameState, RollResult, EngineConfig,
     LANGUAGES, CHATTERBOX_DEVICE_OPTIONS,
     VOICE_DIR,
@@ -308,8 +308,8 @@ def _clean_narration(text: str) -> str:
     import re
     # Unclosed tags at end of text (engine only strips properly closed tags)
     text = re.sub(r'<(?:game_data|new_npcs|memory_updates|scene_context|npc_rename)>[\s\S]*$', '', text)
-    # Unclosed ```game_data or ```json code blocks
-    text = re.sub(r'```\s*(?:game_data|json)\s*(?:\{[\s\S]*)?$', '', text)
+    # Unclosed ```game_data, ```json, or any ```word code blocks
+    text = re.sub(r'```\s*(?:\w+)\s*(?:\{[\s\S]*)?$', '', text)
     # Trailing bare ```word with no closing
     text = re.sub(r'```\w*\s*$', '', text)
     # Bold-bracket metadata blocks: **[char: state | location | threat | ...]**
@@ -2057,7 +2057,7 @@ def render_epilogue() -> bool:
                         g, epilogue_text = await asyncio.to_thread(generate_epilogue, client, game, config)
                         s["game"] = g
                         s["messages"].append({"scene_marker": f"{E['star']} {t('epilogue.marker', lang)}"})
-                        s["messages"].append({"role":"assistant","content":f"*{E['star']} {t('epilogue.marker', lang)}*\n\n{epilogue_text}"})
+                        s["messages"].append({"role":"assistant","content": epilogue_text})
                         save_game(g, username, s["messages"], s.get("active_save","autosave"))
                         if s.get("tts_enabled", False): s["pending_tts"] = epilogue_text
                         ui.navigate.reload()
@@ -2377,6 +2377,8 @@ async def main_page(client: Client):
                 with sidebar_status_container:
                     render_sidebar_status(game)
             render_sidebar_actions(on_switch_user=_handle_switch_user)
+            # Version display at bottom of sidebar
+            ui.label(f"v{VERSION}").classes("w-full text-center text-xs mt-4").style("color: var(--text-secondary); opacity: 0.5")
         drawer.set_value(False)
         header.set_value(True)
 

@@ -9,6 +9,7 @@ Core Module (Framework-Independent)
 import json
 import re
 import random
+import math
 import logging
 import sys
 from pathlib import Path
@@ -51,6 +52,8 @@ except ImportError:
 # CONFIGURATION
 # ===============================================================
 
+VERSION = "0.9.33"
+
 BRAIN_MODEL = "claude-haiku-4-5-20251001"
 NARRATOR_MODEL = "claude-sonnet-4-5-20250929"
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -77,6 +80,265 @@ DIRECTOR_INTERVAL = 3              # Call director every N scenes (when no trigg
 MEMORY_RECENCY_DECAY = 0.92        # Exponential decay factor for memory recency
 DIRECTOR_MODEL = BRAIN_MODEL       # Director uses same model as Brain (Haiku)
 
+# --- Structured Output Schemas (constrained decoding, GA since Dec 2025) ---
+# These schemas guarantee valid JSON from the API — no parsing, repair, or retry needed.
+# Used with output_config={"format": {"type": "json_schema", "schema": <SCHEMA>}}
+
+BRAIN_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type":               {"type": "string", "enum": ["action"]},
+        "move":               {"type": "string", "enum": [
+            "face_danger", "compel", "gather_information", "secure_advantage",
+            "clash", "strike", "endure_harm", "endure_stress",
+            "make_connection", "test_bond", "resupply", "world_shaping", "dialog",
+        ]},
+        "stat":               {"type": "string", "enum": [
+            "edge", "heart", "iron", "shadow", "wits", "none",
+        ]},
+        "approach":           {"type": "string"},
+        "target_npc":         {"type": ["string", "null"]},
+        "dialog_only":        {"type": "boolean"},
+        "player_intent":      {"type": "string"},
+        "world_addition":     {"type": ["string", "null"]},
+        "position":           {"type": "string", "enum": ["controlled", "risky", "desperate"]},
+        "effect":             {"type": "string", "enum": ["limited", "standard", "great"]},
+        "dramatic_question":  {"type": "string"},
+        "location_change":    {"type": ["string", "null"]},
+        "time_progression":   {"type": "string", "enum": ["none", "short", "moderate", "long"]},
+    },
+    "required": [
+        "type", "move", "stat", "approach", "target_npc", "dialog_only",
+        "player_intent", "world_addition", "position", "effect",
+        "dramatic_question", "location_change", "time_progression",
+    ],
+    "additionalProperties": False,
+}
+
+SETUP_BRAIN_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "character_name":      {"type": "string"},
+        "character_concept":   {"type": "string"},
+        "setting_description": {"type": "string"},
+        "stats": {
+            "type": "object",
+            "properties": {
+                "edge":   {"type": "integer"},
+                "heart":  {"type": "integer"},
+                "iron":   {"type": "integer"},
+                "shadow": {"type": "integer"},
+                "wits":   {"type": "integer"},
+            },
+            "required": ["edge", "heart", "iron", "shadow", "wits"],
+            "additionalProperties": False,
+        },
+        "starting_location":   {"type": "string"},
+        "opening_situation":   {"type": "string"},
+    },
+    "required": [
+        "character_name", "character_concept", "setting_description",
+        "stats", "starting_location", "opening_situation",
+    ],
+    "additionalProperties": False,
+}
+
+DIRECTOR_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scene_summary":      {"type": "string"},
+        "narrator_guidance":  {"type": "string"},
+        "npc_guidance": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "npc_id":   {"type": "string"},
+                    "guidance": {"type": "string"},
+                },
+                "required": ["npc_id", "guidance"],
+                "additionalProperties": False,
+            },
+        },
+        "pacing": {"type": "string", "enum": [
+            "tension_rising", "building", "climax", "breather", "resolution",
+        ]},
+        "npc_reflections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "npc_id":              {"type": "string"},
+                    "reflection":          {"type": "string"},
+                    "tone":                {"type": "string"},
+                    "tone_key":            {"type": "string", "enum": [
+                        "neutral", "curious", "wary", "suspicious", "grateful",
+                        "terrified", "loyal", "conflicted", "betrayed", "devastated",
+                        "euphoric", "defiant", "guilty", "protective", "angry",
+                        "devoted", "impressed", "hopeful",
+                    ]},
+                    "updated_description": {"type": ["string", "null"]},
+                    "agenda":              {"type": ["string", "null"]},
+                    "instinct":            {"type": ["string", "null"]},
+                },
+                "required": ["npc_id", "reflection", "tone", "tone_key",
+                             "updated_description", "agenda", "instinct"],
+                "additionalProperties": False,
+            },
+        },
+        "arc_notes": {"type": "string"},
+        "act_transition": {"type": "boolean"},
+    },
+    "required": ["scene_summary", "narrator_guidance", "npc_guidance",
+                  "pacing", "npc_reflections", "arc_notes", "act_transition"],
+    "additionalProperties": False,
+}
+
+STORY_ARCHITECT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "central_conflict":  {"type": "string"},
+        "antagonist_force":  {"type": "string"},
+        "thematic_thread":   {"type": "string"},
+        "acts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "phase":              {"type": "string"},
+                    "title":              {"type": "string"},
+                    "goal":               {"type": "string"},
+                    "scene_range":        {"type": "array", "items": {"type": "integer"}},
+                    "mood":               {"type": "string"},
+                    "transition_trigger": {"type": "string"},
+                },
+                "required": ["phase", "title", "goal", "scene_range", "mood", "transition_trigger"],
+                "additionalProperties": False,
+            },
+        },
+        "revelations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id":              {"type": "string"},
+                    "content":         {"type": "string"},
+                    "earliest_scene":  {"type": "integer"},
+                    "dramatic_weight": {"type": "string", "enum": [
+                        "low", "medium", "high", "critical",
+                    ]},
+                },
+                "required": ["id", "content", "earliest_scene", "dramatic_weight"],
+                "additionalProperties": False,
+            },
+        },
+        "possible_endings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type":        {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["type", "description"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["central_conflict", "antagonist_force", "thematic_thread", "acts",
+                  "revelations", "possible_endings"],
+    "additionalProperties": False,
+}
+
+CHAPTER_SUMMARY_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title":              {"type": "string"},
+        "summary":            {"type": "string"},
+        "unresolved_threads": {"type": "array", "items": {"type": "string"}},
+        "character_growth":   {"type": "string"},
+        "npc_evolutions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name":       {"type": "string"},
+                    "projection": {"type": "string"},
+                },
+                "required": ["name", "projection"],
+                "additionalProperties": False,
+            },
+        },
+        "thematic_question":  {"type": "string"},
+    },
+    "required": ["title", "summary", "unresolved_threads", "character_growth",
+                  "npc_evolutions", "thematic_question"],
+    "additionalProperties": False,
+}
+
+NARRATOR_METADATA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scene_context": {"type": "string"},
+        "location_update": {"type": ["string", "null"]},
+        "time_update": {"type": ["string", "null"]},
+        "memory_updates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "npc_id":           {"type": "string"},
+                    "event":            {"type": "string"},
+                    "emotional_weight": {"type": "string"},
+                },
+                "required": ["npc_id", "event", "emotional_weight"],
+                "additionalProperties": False,
+            },
+        },
+        "new_npcs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name":        {"type": "string"},
+                    "description": {"type": "string"},
+                    "disposition": {"type": "string"},
+                },
+                "required": ["name", "description", "disposition"],
+                "additionalProperties": False,
+            },
+        },
+        "npc_renames": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "npc_id":   {"type": "string"},
+                    "new_name": {"type": "string"},
+                },
+                "required": ["npc_id", "new_name"],
+                "additionalProperties": False,
+            },
+        },
+        "npc_details": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "npc_id":      {"type": "string"},
+                    "full_name":   {"type": ["string", "null"]},
+                    "description": {"type": ["string", "null"]},
+                },
+                "required": ["npc_id", "full_name", "description"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["scene_context", "location_update", "time_update",
+                  "memory_updates", "new_npcs", "npc_renames", "npc_details"],
+    "additionalProperties": False,
+}
+
 # --- NPC name matching: title/honorific filter ---
 # Uses nameparser library (619 English titles) + German/French/Spanish/RPG additions.
 # Prevents false positive fuzzy matches like "Mrs. Chen" ↔ "Mrs. Kowalski".
@@ -85,6 +347,12 @@ _NAME_TITLES_EXTRA = frozenset({
     "herr", "frau", "fräulein", "doktor", "hauptmann", "leutnant",
     "feldwebel", "meister", "schwester", "bruder", "onkel", "tante",
     "oma", "opa", "alter", "alte", "junger", "junge", "der", "die", "das",
+    # German academic & professional titles
+    "dekan", "dekanin", "prodekan", "prodekanin",
+    "rektor", "rektorin", "prorektor", "prorektorin",
+    "dozent", "dozentin", "privatdozent", "privatdozentin",
+    "referent", "referentin", "direktor", "direktorin",
+    "intendant", "intendantin", "sekretär", "sekretärin",
     # French
     "monsieur", "madame", "mademoiselle",
     # Spanish
@@ -598,10 +866,36 @@ def _next_npc_id(game) -> tuple[str, int]:
     return f"npc_{max_num}", max_num
 
 
-def _fuzzy_match_existing_npc(game, new_name: str) -> Optional[dict]:
+def _edit_distance_le1(a: str, b: str) -> bool:
+    """Check if Levenshtein distance between a and b is ≤ 1.
+    Catches single-char STT transcription errors (Chan→Chen, Wong→Wang)."""
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if a == b:
+        return True
+    if la == lb:
+        # Substitution: exactly 1 position differs
+        return sum(x != y for x, y in zip(a, b)) == 1
+    # Insertion/deletion: shorter string + 1 char = longer string
+    if la > lb:
+        a, b = b, a  # a is now shorter
+    j = diffs = 0
+    for i in range(len(b)):
+        if j < len(a) and a[j] == b[i]:
+            j += 1
+        else:
+            diffs += 1
+            if diffs > 1:
+                return False
+    return True
+
+
+def _fuzzy_match_existing_npc(game, new_name: str) -> tuple:
     """Check if a 'new' NPC name fuzzy-matches an existing NPC.
     Handles identity reveals like 'Unbekannter Söldner' → 'Hauptmann Krahe'.
-    Returns the matching NPC dict or None.
+    Returns (matching_npc, match_type) or (None, None).
+    match_type is 'identity' for normal matches or 'stt_variant' for edit-distance-1 matches.
 
     v0.9.29 safety rules:
     - Titles/honorifics (Mr., Mrs., Dr., Herr, Frau, Detective...) never count
@@ -610,7 +904,7 @@ def _fuzzy_match_existing_npc(game, new_name: str) -> Optional[dict]:
     - Substring matching requires the shorter string to be ≥5 chars
     """
     if not new_name or len(new_name.strip()) < 3:
-        return None
+        return None, None
     new_lower = new_name.lower().strip()
     # Extract words, filtering out titles/honorifics
     new_words_raw = set(new_lower.split())
@@ -618,6 +912,7 @@ def _fuzzy_match_existing_npc(game, new_name: str) -> Optional[dict]:
 
     best_match = None
     best_score = 0
+    best_type = "identity"  # default match type
 
     for n in game.npcs:
         name_lower = n.get("name", "").lower().strip()
@@ -632,18 +927,20 @@ def _fuzzy_match_existing_npc(game, new_name: str) -> Optional[dict]:
             if shorter_len >= 5 and shorter_len > best_score:
                 best_score = shorter_len
                 best_match = n
+                best_type = "identity"
             continue
 
         # 2. Check aliases for substring match (same ≥5 rule)
         for alias in n.get("aliases", []):
             alias_lower = alias.lower().strip()
             if alias_lower == new_lower:
-                return n  # Exact alias match — always definite
+                return n, "identity"  # Exact alias match — always definite
             if new_lower in alias_lower or alias_lower in new_lower:
                 shorter_len = min(len(new_lower), len(alias_lower))
                 if shorter_len >= 5 and shorter_len > best_score:
                     best_score = shorter_len
                     best_match = n
+                    best_type = "identity"
 
         # 3. Significant word overlap (e.g. "Krahe" appears in "Hauptmann Krahe")
         #    Filter titles from BOTH sides before comparing
@@ -677,20 +974,107 @@ def _fuzzy_match_existing_npc(game, new_name: str) -> Optional[dict]:
                 best_score = score
                 best_match = n
 
+        # 4. STT variant check: edit distance ≤ 1 on name parts after title stripping.
+        #    Catches transcription errors like "Mrs. Chan" → "Mrs. Chen", "Mr. Wang" → "Mr. Wong".
+        #    Safety rules:
+        #    - Titles (if present on both sides) must match
+        #    - Each name-part word must be ≥ 3 chars
+        #    - Single untitled word requires ≥ 5 chars (avoids "Ross" ↔ "Moss")
+        #    - Number of name words must match
+        ext_titles = {w.rstrip(".") for w in name_lower.split() if w.rstrip(".") in _NAME_TITLES}
+        ext_name_words = sorted(w for w in name_lower.split() if w.rstrip(".") not in _NAME_TITLES)
+        new_title_set = {w.rstrip(".") for w in new_lower.split() if w.rstrip(".") in _NAME_TITLES}
+        new_name_words = sorted(w for w in new_lower.split() if w.rstrip(".") not in _NAME_TITLES)
+
+        if ext_name_words and new_name_words and len(ext_name_words) == len(new_name_words):
+            # Titles must be compatible: if both have titles, they must match
+            titles_ok = True
+            if new_title_set and ext_titles and new_title_set != ext_titles:
+                titles_ok = False
+            titles_match = bool(new_title_set and ext_titles and new_title_set == ext_titles)
+
+            if titles_ok:
+                exact = 0
+                near = 0
+                fail = False
+                for nw, ew in zip(new_name_words, ext_name_words):
+                    if nw == ew:
+                        exact += 1
+                    elif len(nw) >= 3 and len(ew) >= 3 and _edit_distance_le1(nw, ew):
+                        near += 1
+                    else:
+                        fail = True
+                        break
+
+                if not fail and near >= 1:
+                    accept = False
+                    if titles_match:
+                        accept = True  # "Mrs. Chan" ~ "Mrs. Chen"
+                    elif exact >= 1:
+                        accept = True  # "Tommy Chan" ~ "Tommy Chen"
+                    elif len(new_name_words) == 1 and len(new_name_words[0]) >= 5:
+                        accept = True  # "Kowalski" ~ "Kowalsky"
+                    if accept:
+                        stt_score = sum(len(w) for w in new_name_words) + 10  # bonus for STT match
+                        if stt_score > best_score:
+                            best_score = stt_score
+                            best_match = n
+                            best_type = "stt_variant"
+                            log(f"[NPC] STT variant match: '{new_name}' ~ '{n['name']}' "
+                                f"(edit distance ≤ 1)")
+
+        # Also check aliases for STT variants
+        for alias in n.get("aliases", []):
+            alias_lower = alias.lower().strip()
+            a_titles = {w.rstrip(".") for w in alias_lower.split() if w.rstrip(".") in _NAME_TITLES}
+            a_name_words = sorted(w for w in alias_lower.split() if w.rstrip(".") not in _NAME_TITLES)
+            if a_name_words and new_name_words and len(a_name_words) == len(new_name_words):
+                a_titles_ok = True
+                if new_title_set and a_titles and new_title_set != a_titles:
+                    a_titles_ok = False
+                a_titles_match = bool(new_title_set and a_titles and new_title_set == a_titles)
+                if a_titles_ok:
+                    a_exact = a_near = 0
+                    a_fail = False
+                    for nw, aw in zip(new_name_words, a_name_words):
+                        if nw == aw:
+                            a_exact += 1
+                        elif len(nw) >= 3 and len(aw) >= 3 and _edit_distance_le1(nw, aw):
+                            a_near += 1
+                        else:
+                            a_fail = True
+                            break
+                    if not a_fail and a_near >= 1:
+                        a_accept = a_titles_match or a_exact >= 1 or (len(new_name_words) == 1 and len(new_name_words[0]) >= 5)
+                        if a_accept:
+                            stt_score = sum(len(w) for w in new_name_words) + 10
+                            if stt_score > best_score:
+                                best_score = stt_score
+                                best_match = n
+                                best_type = "stt_variant"
+                                log(f"[NPC] STT variant match via alias: '{new_name}' ~ alias '{alias}' of '{n['name']}'")
+
     if best_match:
         log(f"[NPC] Fuzzy match accepted: '{new_name}' → '{best_match['name']}' "
-            f"(score={best_score})")
-    return best_match
+            f"(score={best_score}, type={best_type})")
+    return best_match, best_type
 
 
 def _merge_npc_identity(existing: dict, new_name: str, new_desc: str = ""):
     """Merge a new identity into an existing NPC (identity reveal).
     Old name becomes an alias, new name becomes primary."""
     old_name = existing["name"]
+    new_name = new_name.strip()
+    # Guard: don't merge if names are identical (case-insensitive)
+    if old_name.lower().strip() == new_name.lower():
+        log(f"[NPC] Identity merge skipped: '{old_name}' → '{new_name}' (same name)")
+        return
     existing.setdefault("aliases", [])
     if old_name and old_name not in existing["aliases"]:
         existing["aliases"].append(old_name)
-    existing["name"] = new_name.strip()
+    existing["name"] = new_name
+    # Clean up: remove current name from aliases if present (prevents self-alias)
+    existing["aliases"] = [a for a in existing["aliases"] if a.lower() != new_name.lower()]
     if new_desc and not existing.get("description"):
         existing["description"] = new_desc
     # Ensure active status
@@ -710,13 +1094,12 @@ def _description_match_existing_npc(game, new_desc: str, new_name_lower: str) ->
         return None
 
     # Extract significant words from new description (≥4 chars, no stopwords)
-    stopwords = _get_keyword_stopwords()
     new_words = {
         w.strip(".,;:!?\"'()-").lower()
         for w in new_desc.split()
         if len(w.strip(".,;:!?\"'()-")) >= 4
     }
-    new_words -= stopwords
+    new_words -= _STOPWORDS
     if len(new_words) < 2:
         return None
 
@@ -740,7 +1123,7 @@ def _description_match_existing_npc(game, new_desc: str, new_name_lower: str) ->
             for w in existing_desc.split()
             if len(w.strip(".,;:!?\"'()-")) >= 4
         }
-        existing_words -= stopwords
+        existing_words -= _STOPWORDS
 
         # Calculate overlap: exact match + substring matching
         exact_overlap = new_words & existing_words
@@ -814,12 +1197,23 @@ def _process_npc_renames(game, json_text: str):
                     level="warning")
                 continue
             new_name = r["new_name"].strip()
-            # Don't rename to player character
-            if new_name.lower() == game.player_name.lower().strip():
+            # Don't rename to player character (exact or partial match)
+            new_lower = new_name.lower()
+            player_lower = game.player_name.lower().strip()
+            if new_lower == player_lower or (set(new_lower.split()) & set(player_lower.split())):
+                log(f"[NPC] Rename rejected: '{new_name}' matches player character")
                 continue
             _merge_npc_identity(npc, new_name, r.get("description", ""))
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         log(f"[NPC] Failed to process NPC renames: {e}", level="warning")
+
+
+def _is_complete_description(desc: str) -> bool:
+    """Check if a description looks complete (not truncated mid-sentence).
+    Incomplete descriptions are discarded in favor of the existing one."""
+    if not desc or len(desc) < 10:
+        return False
+    return desc.rstrip().endswith(('.', '!', '?', '"', '»', '«', '…', ')', '–', '—'))
 
 
 def _process_npc_details(game, json_text: str):
@@ -869,10 +1263,13 @@ def _process_npc_details(game, json_text: str):
             new_desc = d.get("description", "").strip()
             if new_desc:
                 old_desc = npc.get("description", "")
-                npc["description"] = new_desc
-                log(f"[NPC] Description updated for {npc['name']}: "
-                    f"'{old_desc[:50]}' → '{new_desc[:50]}'")
-
+                if _is_complete_description(new_desc) or not old_desc:
+                    npc["description"] = new_desc
+                    log(f"[NPC] Description updated for {npc['name']}: "
+                        f"'{old_desc[:50]}' → '{new_desc[:50]}'")
+                else:
+                    log(f"[NPC] Rejected truncated description for {npc['name']}: "
+                        f"'{new_desc[:60]}' — keeping existing")
             # Append additional details (legacy format, non-breaking)
             extra = d.get("details", "").strip()
             if extra and extra not in (npc.get("description") or ""):
@@ -895,6 +1292,7 @@ def _process_new_npcs(game, json_text: str):
             return
 
         player_lower = game.player_name.lower().strip()
+        player_parts = set(player_lower.split())
         existing_names = {n["name"].lower().strip() for n in game.npcs}
 
         for nd in new_npcs:
@@ -902,8 +1300,10 @@ def _process_new_npcs(game, json_text: str):
                 continue
             name_lower = nd["name"].lower().strip()
 
-            # Skip player character
-            if name_lower == player_lower:
+            # Skip player character (exact match OR any name part overlap)
+            name_parts = set(name_lower.split())
+            if name_lower == player_lower or (name_parts & player_parts):
+                log(f"[NPC] Skipping player character from new_npcs: '{nd['name']}'")
                 continue
 
             # Check if this NPC already exists (exact name match, possibly background)
@@ -917,9 +1317,20 @@ def _process_new_npcs(game, json_text: str):
 
             # Fuzzy match: check if this "new" NPC is actually a known NPC
             # under a different name (identity reveal, nickname, etc.)
-            fuzzy_hit = _fuzzy_match_existing_npc(game, nd["name"])
+            fuzzy_hit, match_type = _fuzzy_match_existing_npc(game, nd["name"])
             if fuzzy_hit:
-                _merge_npc_identity(fuzzy_hit, nd["name"], nd.get("description", ""))
+                if match_type == "stt_variant":
+                    # STT transcription variant (Chan→Chen, Wang→Wong): do NOT rename.
+                    # Add the variant as alias so future exact-matches catch it.
+                    fuzzy_hit.setdefault("aliases", [])
+                    variant = nd["name"].strip()
+                    if variant.lower() not in {a.lower() for a in fuzzy_hit["aliases"]}:
+                        fuzzy_hit["aliases"].append(variant)
+                        log(f"[NPC] Added STT variant as alias: '{variant}' → '{fuzzy_hit['name']}'")
+                    if fuzzy_hit.get("status") == "background":
+                        _reactivate_npc(fuzzy_hit, reason="STT variant reappeared")
+                else:
+                    _merge_npc_identity(fuzzy_hit, nd["name"], nd.get("description", ""))
                 existing_names.add(name_lower)
                 continue
 
@@ -944,7 +1355,7 @@ def _process_new_npcs(game, json_text: str):
             npc = {
                 "id": npc_id,
                 "name": nd["name"].strip(),
-                "description": nd.get("description", ""),
+                "description": nd.get("description", "").strip(),
                 "agenda": "",
                 "instinct": "",
                 "secrets": [],
@@ -958,8 +1369,8 @@ def _process_new_npcs(game, json_text: str):
                 "keywords": [],
                 "importance_accumulator": 0,
                 "last_reflection_scene": 0,
+                "last_location": game.current_location or "",
             }
-            npc["keywords"] = _auto_generate_keywords(npc)
 
             game.npcs.append(npc)
             existing_names.add(name_lower)
@@ -1104,12 +1515,10 @@ def retrieve_memories(npc: dict, context_text: str = "", max_count: int = 5,
     reflections = [m for m in memories if m.get("type") == "reflection"]
     observations = [m for m in memories if m.get("type") != "reflection"]
 
-    # Context keywords for relevance scoring
+    # Context words for relevance scoring
     context_words = set()
     if context_text:
         context_words = {w.lower() for w in context_text.split() if len(w) >= 3}
-    # Also use NPC keywords for relevance
-    npc_keywords = {kw.lower() for kw in npc.get("keywords", [])}
 
     def _score_memory(mem):
         """Calculate retrieval score for a single memory."""
@@ -1125,11 +1534,11 @@ def retrieve_memories(npc: dict, context_text: str = "", max_count: int = 5,
         # Importance: normalized 0-1 from 1-10 scale
         importance = mem.get("importance", 3) / 10.0
 
-        # Relevance: keyword overlap with context
+        # Relevance: word overlap with context
         relevance = 0.0
         if context_words:
             event_words = {w.lower() for w in mem.get("event", "").split() if len(w) >= 3}
-            overlap = context_words & (event_words | npc_keywords)
+            overlap = context_words & event_words
             if overlap:
                 relevance = min(1.0, len(overlap) / max(3, len(context_words)) * 2)
 
@@ -1210,41 +1619,16 @@ def _consolidate_memory(npc: dict):
             f"{len(kept_reflections)} reflections, {len(kept_observations)} observations)")
 
 
-# --- NPC keyword stopwords (library-based, language-aware) ---
-# Maps narration language English names (LANGUAGES dict values) to ISO 639-1 codes
-_NARRATION_LANG_TO_ISO = {
-    "German": "de", "English": "en", "Spanish": "es", "French": "fr",
-    "Portuguese": "pt", "Italian": "it", "Dutch": "nl", "Russian": "ru",
-    "Chinese (Mandarin)": "zh", "Japanese": "ja", "Korean": "ko",
-    "Arabic": "ar", "Hindi": "hi", "Indonesian": "id", "Turkish": "tr",
-    "Polish": "pl", "Vietnamese": "vi", "Swedish": "sv", "Danish": "da",
-    # Thai not available in stop-words library — falls back to EN-only
-}
-
-# Cached stopword sets per ISO code
-_stopwords_cache: dict[str, frozenset] = {}
-
-def _load_stopwords(iso_code: str) -> frozenset:
-    """Load stopwords for a single ISO language code (cached)."""
-    if iso_code in _stopwords_cache:
-        return _stopwords_cache[iso_code]
-    if _HAS_STOP_WORDS_LIB:
-        try:
-            words = frozenset(_lib_get_stop_words(iso_code))
-            _stopwords_cache[iso_code] = words
-            return words
-        except Exception:
-            pass
-    _stopwords_cache[iso_code] = frozenset()
-    return frozenset()
-
-# Base stopwords: DE + EN (loaded once at import time)
-_BASE_KEYWORD_STOPWORDS: frozenset = frozenset()
+# --- Stopwords (DE+EN) for NPC description comparison ---
+# Used by _description_match_existing_npc() for duplicate detection.
+_STOPWORDS: frozenset = frozenset()
 if _HAS_STOP_WORDS_LIB:
-    _BASE_KEYWORD_STOPWORDS = _load_stopwords("de") | _load_stopwords("en")
-else:
-    # Fallback if stop-words library not installed
-    _BASE_KEYWORD_STOPWORDS = frozenset({
+    try:
+        _STOPWORDS = frozenset(_lib_get_stop_words("de")) | frozenset(_lib_get_stop_words("en"))
+    except Exception:
+        pass
+if not _STOPWORDS:
+    _STOPWORDS = frozenset({
         "der", "die", "das", "den", "dem", "des", "ein", "eine", "einer", "einem",
         "einen", "eines", "mit", "und", "oder", "für", "von", "vor", "bei", "aus",
         "auf", "nach", "über", "unter", "aber", "als", "wie", "nicht", "sich",
@@ -1255,115 +1639,148 @@ else:
         "will", "can", "may", "been", "were", "into", "than", "then",
     })
 
-# RPG-context stopwords: common verbs and generic words that create
-# false-positive NPC keyword matches. Added regardless of library availability.
-_RPG_KEYWORD_STOPWORDS = frozenset({
-    # German common verbs
-    "halten", "lassen", "laufen", "überleben", "machen", "gehen", "kommen",
-    "sagen", "wissen", "sehen", "finden", "stehen", "bleiben", "nehmen",
-    "geben", "helfen", "sprechen", "bringen", "denken", "kennen", "wollen",
-    "müssen", "sollen", "dürfen", "werden", "haben", "möchte", "versuchen",
-    "suchen", "brauchen", "glauben", "meinen", "zeigen", "führen", "leben",
-    "arbeiten", "warten", "spielen", "liegen", "setzen", "ziehen",
-    # German generic nouns/adjectives (often capitalized → leak from descriptions)
-    "etwas", "jemand", "andere", "ersten", "letzte", "kleine", "große",
-    "immer", "wieder", "vielleicht", "eigentlich", "bereits", "zusammen",
-    "ehemalige", "ehemaliger", "ehemaliges", "ehemaligen",
-    "erfahrene", "erfahrener", "erfahrenes", "erfahrenen",
-    "derzeit", "aktuell", "aktuelle", "sichtlich", "pragmatisch",
-    "effizient", "effizienter", "jetzt", "schnell", "langsam",
-    # German generic RPG nouns (too common for unique NPC activation)
-    "stimme", "uniform", "waffe", "waffen", "soldat", "soldaten",
-    "gruppe", "trupp", "feind", "feinde", "verbündete", "anführer",
-    "kämpfer", "krieger", "bewohner", "bevölkerung", "wohngebiete",
-    "bedrohung", "gefahr", "angriff", "verteidigung", "blockade",
-    "zugang", "stützpunkt", "station", "position", "sektor",
-    "einsatz", "auftrag", "mission", "befehl", "kommando",
-    "funkgerät", "sensoren", "systeme", "signal", "signale",
-    # English common verbs
-    "wants", "needs", "tries", "keeps", "makes", "takes", "gives",
-    "holds", "knows", "finds", "seems", "looks", "feels", "comes",
-    "goes", "says", "tells", "shows", "lives", "works", "helps",
-    "stays", "leaves", "moves", "turns", "brings", "seeks", "wants",
-    "believe", "think", "should", "would", "could", "might", "still",
-    # English generic
-    "about", "there", "their", "those", "these", "other", "which",
-    "never", "always", "something", "someone", "everything", "nothing",
+
+# --- Cyrillic homoglyph replacement (LLMs occasionally mix Cyrillic lookalikes) ---
+_CYRILLIC_TO_LATIN = str.maketrans({
+    '\u0410': 'A', '\u0430': 'a',   # А/а
+    '\u0412': 'B',                    # В
+    '\u0415': 'E', '\u0435': 'e',   # Е/е
+    '\u041A': 'K', '\u043A': 'k',   # К/к
+    '\u041C': 'M', '\u043C': 'm',   # М/м
+    '\u041D': 'H',                    # Н
+    '\u041E': 'O', '\u043E': 'o',   # О/о
+    '\u0420': 'P', '\u0440': 'p',   # Р/р
+    '\u0421': 'C', '\u0441': 'c',   # С/с
+    '\u0422': 'T', '\u0442': 't',   # Т/т
+    '\u0423': 'Y', '\u0443': 'y',   # У/у
+    '\u0425': 'X', '\u0445': 'x',   # Х/х
 })
-_BASE_KEYWORD_STOPWORDS = _BASE_KEYWORD_STOPWORDS | _RPG_KEYWORD_STOPWORDS
+_CYRILLIC_RANGE = range(0x0400, 0x0500)  # Unicode Cyrillic block
+_LATIN_RANGES = (range(0x0041, 0x005B), range(0x0061, 0x007B),  # Basic Latin A-Z, a-z
+                 range(0x00C0, 0x0250))  # Latin Extended (ä, ö, ü, etc.)
 
-def _get_keyword_stopwords(narration_lang: str = "") -> frozenset:
-    """Get combined stopwords for NPC keyword filtering.
-    Always includes DE+EN base. If narration_lang is provided (e.g. 'French'),
-    that language's stopwords are included too (cached after first load).
-    narration_lang: English name from LANGUAGES dict values."""
-    if not narration_lang or narration_lang in ("German", "English"):
-        return _BASE_KEYWORD_STOPWORDS
-    iso = _NARRATION_LANG_TO_ISO.get(narration_lang)
-    if not iso:
-        return _BASE_KEYWORD_STOPWORDS
-    return _BASE_KEYWORD_STOPWORDS | _load_stopwords(iso)
+def _is_cyrillic(ch: str) -> bool:
+    return ord(ch) in _CYRILLIC_RANGE
+
+def _is_latin(ch: str) -> bool:
+    cp = ord(ch)
+    return any(cp in r for r in _LATIN_RANGES)
+
+def _fix_cyrillic_homoglyphs(text: str) -> str:
+    """Context-aware replacement of Cyrillic lookalike characters in Latin text.
+    Only replaces Cyrillic homoglyphs in MIXED-SCRIPT words (words containing both
+    Latin and Cyrillic characters). Purely Cyrillic words (authentic Russian, Ukrainian,
+    etc.) are left untouched. This handles:
+    - 'kniест' (mixed Latin+Cyrillic) → 'kniest' (fixed)
+    - 'Товарищ' (pure Cyrillic) → 'Товарищ' (untouched)
+    - 'Der Солдат murmelte' → 'Der Солдат murmelte' (Cyrillic word preserved)
+    """
+    # Fast path: no Cyrillic characters at all
+    if not any(_is_cyrillic(ch) for ch in text):
+        return text
+
+    result = []
+    i = 0
+    while i < len(text):
+        # Collect a "word" (contiguous letters)
+        if text[i].isalpha():
+            word_start = i
+            while i < len(text) and text[i].isalpha():
+                i += 1
+            word = text[word_start:i]
+            # Check if this word has BOTH Latin and Cyrillic characters
+            has_latin = any(_is_latin(ch) for ch in word)
+            has_cyrillic = any(_is_cyrillic(ch) for ch in word)
+            if has_latin and has_cyrillic:
+                # Mixed-script word: replace Cyrillic homoglyphs with Latin
+                result.append(word.translate(_CYRILLIC_TO_LATIN))
+            else:
+                # Pure Latin or pure Cyrillic: leave untouched
+                result.append(word)
+        else:
+            result.append(text[i])
+            i += 1
+    return ''.join(result)
 
 
-def _auto_generate_keywords(npc: dict, narration_lang: str = "") -> list[str]:
-    """Auto-generate activation keywords for an NPC from their data.
-    
-    Strategy (informed by envy-ai/ai_rpg research):
-    - PRIMARY: Name parts + full name + aliases (player references NPCs by name)
-    - SECONDARY: Capitalized proper nouns from description (role titles, places)
-    - EXCLUDED: Agenda text (generic verbs/goals cause false-positive activation)
-    
-    narration_lang: English name (e.g. 'French') for language-aware stopword filtering."""
-    stopwords = _get_keyword_stopwords(narration_lang)
-    keywords = set()
+# --- TF-IDF NPC relevance scoring (zero-dependency implementation) ---
+# Replaces keyword-based activation. TF-IDF automatically weights rare/distinctive
+# words higher (proper nouns > common words), works across all languages.
 
-    # Name parts (split compound names) — PRIMARY activation signal
-    name = npc.get("name", "")
-    for part in name.split():
-        low = part.lower().strip(".,;:!?\"'()-")
-        if len(low) >= 3 and low not in stopwords and low.rstrip(".") not in _NAME_TITLES:
-            keywords.add(low)
-    keywords.add(name.lower())
+def _compute_npc_tfidf_scores(npcs: list, query_text: str) -> dict[str, float]:
+    """Compute TF-IDF cosine similarity between query text and each NPC profile.
+    Returns {npc_id: similarity_score} with scores 0.0–1.0.
+    Zero external dependencies — uses basic term frequency × inverse document frequency."""
+    from collections import Counter
 
-    # Aliases — equally important as name
-    for alias in npc.get("aliases", []):
-        keywords.add(alias.lower())
-        for part in alias.split():
-            low = part.lower().strip(".,;:!?\"'()-")
-            if len(low) >= 3 and low not in stopwords and low.rstrip(".") not in _NAME_TITLES:
-                keywords.add(low)
+    def _tokenize(text: str) -> list[str]:
+        return [w.lower().strip(".,;:!?\"'()-—–") for w in text.split()
+                if len(w.strip(".,;:!?\"'()-—–")) >= 3]
 
-    # Description: ONLY extract words that were capitalized in original text
-    # (proper nouns, role titles like "Kommandant", place names)
-    # Skip generic adjectives and verbs even if capitalized (German nouns)
-    desc = npc.get("description", "")
-    if desc:
-        for word in desc.split():
-            if not word[0:1].isupper():
-                continue  # Skip lowercase words entirely
-            clean = word.strip(".,;:!?\"'()-—–")
-            low = clean.lower()
-            if (len(low) >= 4 and low not in stopwords
-                    and low.rstrip(".") not in _NAME_TITLES
-                    and low not in keywords):  # Avoid duplicating name parts
-                keywords.add(low)
+    # Build NPC profile texts from all available identity + context signals
+    profiles: dict[str, list[str]] = {}
+    for npc in npcs:
+        if npc.get("status") not in ("active", "background"):
+            continue
+        npc_id = npc.get("id", "")
+        if not npc_id:
+            continue
+        parts = [
+            npc.get("name", ""),
+            " ".join(npc.get("aliases", [])),
+            npc.get("description", ""),
+            npc.get("agenda", ""),
+        ]
+        # Recent memories (last 5 observations) — captures evolving context
+        for m in npc.get("memory", [])[-5:]:
+            if isinstance(m, dict) and m.get("type") != "reflection":
+                parts.append(m.get("event", ""))
+        profiles[npc_id] = _tokenize(" ".join(parts))
 
-    # Agenda is deliberately EXCLUDED — generic goal verbs ("eindämmen",
-    # "bekämpfen", "überleben") cause false-positive NPC activation.
-    # NPCs are activated by name reference, not by thematic overlap.
+    if not profiles:
+        return {}
 
-    return list(keywords)[:8]  # Cap at 8 (was 20; fewer = less noise)
+    # Tokenize query
+    query_tokens = _tokenize(query_text)
+    if not query_tokens:
+        return {npc_id: 0.0 for npc_id in profiles}
+
+    # Compute IDF across all documents (NPC profiles + query)
+    all_docs = list(profiles.values()) + [query_tokens]
+    n_docs = len(all_docs)
+    doc_freq: dict[str, int] = {}
+    for tokens in all_docs:
+        for word in set(tokens):
+            doc_freq[word] = doc_freq.get(word, 0) + 1
+    idf = {word: math.log(n_docs / count) for word, count in doc_freq.items()}
+
+    # TF-IDF vector + cosine similarity
+    def _tfidf_vec(tokens: list[str]) -> dict[str, float]:
+        tf = Counter(tokens)
+        total = len(tokens) or 1
+        return {w: (c / total) * idf.get(w, 0) for w, c in tf.items()}
+
+    def _cosine(a: dict, b: dict) -> float:
+        common = set(a) & set(b)
+        if not common:
+            return 0.0
+        dot = sum(a[w] * b[w] for w in common)
+        na = math.sqrt(sum(v * v for v in a.values()))
+        nb = math.sqrt(sum(v * v for v in b.values()))
+        return dot / (na * nb) if na and nb else 0.0
+
+    q_vec = _tfidf_vec(query_tokens)
+    return {npc_id: _cosine(q_vec, _tfidf_vec(tokens))
+            for npc_id, tokens in profiles.items()}
 
 
 def _ensure_npc_memory_fields(npc: dict):
     """Ensure NPC has all memory system fields (migration + new NPC creation)."""
     npc.setdefault("memory", [])
-    npc.setdefault("keywords", [])
+    npc.setdefault("keywords", [])  # Kept for savegame backward compatibility
     npc.setdefault("importance_accumulator", 0)
     npc.setdefault("last_reflection_scene", 0)
-    # Always regenerate keywords from NPC data (keywords are derived, not curated;
-    # ensures algorithm improvements apply to existing savegames)
-    npc["keywords"] = _auto_generate_keywords(npc)
+    npc.setdefault("last_location", "")  # Where NPC was last seen (spatial consistency)
     # Migrate existing memories: add importance and type if missing
     for m in npc["memory"]:
         if isinstance(m, dict):
@@ -1377,7 +1794,7 @@ def _ensure_npc_memory_fields(npc: dict):
 
 
 # ===============================================================
-# NPC KEYWORD-BASED CONTEXT ACTIVATION
+# NPC TF-IDF CONTEXT ACTIVATION
 # ===============================================================
 
 def activate_npcs_for_prompt(game, brain: dict, player_input: str) -> tuple[list[dict], list[dict], dict]:
@@ -1401,7 +1818,9 @@ def activate_npcs_for_prompt(game, brain: dict, player_input: str) -> tuple[list
     for s in game.session_log[-2:]:
         scan_parts.append(s.get("summary", ""))
     scan_text = " ".join(scan_parts).lower()
-    scan_words = {w for w in scan_text.split() if len(w) >= 3}
+
+    # Compute TF-IDF similarity between scene context and each NPC profile (once)
+    tfidf_scores = _compute_npc_tfidf_scores(game.npcs, scan_text)
 
     activated = []
     mentioned = []
@@ -1440,12 +1859,12 @@ def activate_npcs_for_prompt(game, brain: dict, player_input: str) -> tuple[list
                 reasons.append(f"alias:{alias}")
                 break
 
-        # 4. Keyword overlap
-        npc_kws = {kw.lower() for kw in npc.get("keywords", [])}
-        kw_overlap = scan_words & npc_kws
-        if kw_overlap:
-            score += min(0.4, len(kw_overlap) * 0.15)
-            reasons.append(f"kw:{','.join(list(kw_overlap)[:3])}")
+        # 4. TF-IDF content similarity (replaces keyword overlap)
+        tfidf = tfidf_scores.get(npc.get("id", ""), 0.0)
+        if tfidf > 0.05:  # Noise threshold
+            tfidf_contrib = min(0.5, tfidf * 1.5)
+            score += tfidf_contrib
+            reasons.append(f"tfidf:{tfidf:.2f}")
 
         # 5. Location match
         npc_desc = (npc.get("description", "") + " " + npc.get("agenda", "")).lower()
@@ -1465,7 +1884,7 @@ def activate_npcs_for_prompt(game, brain: dict, player_input: str) -> tuple[list
             activation_debug[npc_name] = {"score": round(score, 2), "reasons": reasons, "status": "activated"}
             # Auto-reactivate background NPCs that are contextually relevant
             if npc.get("status") == "background":
-                _reactivate_npc(npc, reason=f"keyword activation (score={score:.2f})")
+                _reactivate_npc(npc, reason=f"context activation (score={score:.2f})")
         elif score >= NPC_MENTION_THRESHOLD:
             mentioned.append(npc)
             activation_debug[npc_name] = {"score": round(score, 2), "reasons": reasons, "status": "mentioned"}
@@ -1801,7 +2220,19 @@ def update_location(game: GameState, new_location: str):
     if not new_location or new_location == game.current_location:
         return
     if game.current_location:
-        game.location_history.append(game.current_location)
+        # Dedup: if current location is very similar to last history entry,
+        # replace it instead of appending (prevents "Janas Büro" + "Janas privates Büro")
+        if game.location_history:
+            last = game.location_history[-1]
+            last_words = set(last.lower().split())
+            cur_words = set(game.current_location.lower().split())
+            overlap = len(last_words & cur_words) / max(min(len(last_words), len(cur_words)), 1)
+            if overlap > 0.5:
+                game.location_history[-1] = game.current_location
+            else:
+                game.location_history.append(game.current_location)
+        else:
+            game.location_history.append(game.current_location)
         game.location_history = game.location_history[-5:]
     game.current_location = new_location
 
@@ -2046,8 +2477,10 @@ def _story_context_block(game: GameState) -> str:
         ending_hint = f'\n<story_ending>Story nearing conclusion. Possible endings: {", ".join(e["type"] for e in endings)}. Let player actions determine which.</story_ending>'
 
     structure = bp.get("structure_type", "3act")
+    thematic = bp.get("thematic_thread", "")
+    thematic_attr = f' thematic_thread="{thematic}"' if thematic else ""
     return f"""<story_arc structure="{structure}" act="{act['act_number']}/{act['total_acts']}" phase="{act['phase']}" progress="{act['progress']}" mood="{act.get('mood','')}"
- conflict="{bp.get('central_conflict','')}" act_goal="{act.get('goal','')}"{rev_hint}/>
+ conflict="{bp.get('central_conflict','')}" act_goal="{act.get('goal','')}"{rev_hint}{thematic_attr}/>
 {ending_hint}
 """
 
@@ -2117,7 +2550,7 @@ def call_brain(client: anthropic.Anthropic, game: GameState, player_message: str
                   f"location than the current loc, set location_change to match the actual location.\n"
                   f"- player_intent and location_change MUST be in {_brain_lang}")
 
-    system = """<role>RPG engine parser. Convert player input to a game move as JSON.</role>
+    system = """<role>RPG engine parser. Convert player input to a game move.</role>
 """ + _kid_friendly_block(_cfg) + _content_boundaries_block(game) + """<rules>
 - Accept ALL player input including world-building declarations
 - Pick the move that best fits the player's ACTION, not their words
@@ -2146,11 +2579,7 @@ resupply:wits
 world_shaping:wits|heart|shadow
 dialog:none
 </moves>
-<stats>edge=speed/stealth heart=empathy/charm iron=force shadow=cunning wits=knowledge</stats>
-<o>
-Return ONLY valid JSON, no other text:
-{"type":"action","move":"name","stat":"stat","approach":"how(5w)","target_npc":"id|null","dialog_only":false,"player_intent":"1 sentence","world_addition":"element|null","position":"controlled|risky|desperate","effect":"limited|standard|great","dramatic_question":"Can/Will...?","location_change":"new location|null","time_progression":"none|short|moderate|long"}
-</o>"""
+<stats>edge=speed/stealth heart=empathy/charm iron=force shadow=cunning wits=knowledge</stats>"""
 
     campaign_ctx = ""
     if game.campaign_history:
@@ -2173,52 +2602,26 @@ time:{game.time_of_day or 'unspecified'} | prev_locations:{', '.join(game.locati
 <recent>{last_scenes}</recent>
 {_story_context_block(game)}{campaign_ctx}{backstory_ctx}<input>{player_message}</input>"""
 
-    MAX_RETRIES = 3
-
-    for attempt in range(MAX_RETRIES):
-        msgs = [{"role": "user", "content": user_msg}]
-        if attempt > 0:
-            # Prefill technique: start the assistant response with { to force JSON
-            msgs.append({"role": "assistant", "content": "{"})
+    try:
         response = _api_create_with_retry(
             client, max_retries=2,
             model=BRAIN_MODEL, max_tokens=512, system=system,
-            messages=msgs,
+            messages=[{"role": "user", "content": user_msg}],
+            output_config={"format": {"type": "json_schema", "schema": BRAIN_OUTPUT_SCHEMA}},
         )
-        text = response.content[0].text
-        if attempt > 0:
-            text = "{" + text  # Prepend the prefill
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
-            try:
-                result = json.loads(match.group())
-                if result.get("move"):
-                    # Ensure defaults for new v5.0 fields
-                    result.setdefault("position", "risky")
-                    result.setdefault("effect", "standard")
-                    result.setdefault("dramatic_question", "")
-                    result.setdefault("location_change", None)
-                    result.setdefault("time_progression", "none")
-                    # Sanitize: Brain may return JSON null for string fields
-                    # dict.get(k, default) does NOT apply when value is None,
-                    # so downstream .join() / f-string calls would crash.
-                    for _sk in ("player_intent", "approach", "dramatic_question",
-                                "stat", "move", "position", "effect",
-                                "time_progression"):
-                        if result.get(_sk) is None:
-                            result[_sk] = ""
-                    log(f"[Brain] Result: move={result.get('move')}, pos={result.get('position')}, "
-                        f"effect={result.get('effect')}, intent={result.get('player_intent','')[:60]}")
-                    return result
-            except json.JSONDecodeError:
-                continue
-
-    # All retries failed  --  fallback to dialog
-    log("[Brain] All retries failed, falling back to dialog", level="warning")
-    return {"type": "action", "move": "dialog", "dialog_only": True,
-            "player_intent": player_message, "position": "risky",
-            "effect": "standard", "dramatic_question": "",
-            "location_change": None, "time_progression": "none"}
+        result = json.loads(response.content[0].text)
+        log(f"[Brain] Result: move={result['move']}, pos={result['position']}, "
+            f"effect={result['effect']}, intent={result['player_intent'][:60]}")
+        return result
+    except Exception as e:
+        log(f"[Brain] Structured output failed ({type(e).__name__}: {e}), "
+            f"falling back to dialog", level="warning")
+        return {"type": "action", "move": "dialog", "dialog_only": True,
+                "target_npc": None, "stat": "none", "approach": "",
+                "player_intent": player_message, "world_addition": None,
+                "position": "risky", "effect": "standard",
+                "dramatic_question": "", "location_change": None,
+                "time_progression": "none"}
 
 
 def call_setup_brain(client: anthropic.Anthropic, creation_data: dict,
@@ -2233,12 +2636,9 @@ def call_setup_brain(client: anthropic.Anthropic, creation_data: dict,
 - If player provides a name via character_name(USE EXACTLY), use it VERBATIM as character_name — even if it is a number, code, or unusual. Never modify, expand, or embellish it.
 - character_concept = WHO the character is NOW (identity, role, current situation) — 1 sentence, no backstory
 - Do NOT put backstory details (past events, relationships, family) into character_concept — the player's backstory is stored separately and will be provided to the narrator directly
-- Stats MUST total exactly 7, each 0-3, matched to archetype
+- Stats MUST total exactly {STAT_TARGET_SUM}, each 0-3, matched to archetype
 - All text fields in {lang}
-</rules>
-<o>Return ONLY valid JSON:
-{{"character_name":"str","character_concept":"1 sentence identity in {lang} (NO backstory)","setting_description":"2-3 sentences in {lang}","stats":{{"edge":int,"heart":int,"iron":int,"shadow":int,"wits":int}},"starting_location":"str","opening_situation":"1-2 sentences in {lang}"}}
-</o>"""
+</rules>"""
 
     genre_info = creation_data.get('genre', 'dark_fantasy')
     if creation_data.get('genre_description'):
@@ -2251,38 +2651,45 @@ def call_setup_brain(client: anthropic.Anthropic, creation_data: dict,
     user_msg = f"""genre:{genre_info} tone:{tone_info} archetype:{creation_data.get('archetype','outsider')}{name_line}
 player_input: {creation_data.get('custom_desc','')}"""
 
-    response = _api_create_with_retry(
-        client, max_retries=2,
-        model=BRAIN_MODEL, max_tokens=512, system=system,
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    text = response.content[0].text
-    match = re.search(r'\{[\s\S]*\}', text)
-    if match:
-        try:
-            result = json.loads(match.group())
-            # Validate stat sum
-            stats = result.get("stats", {})
-            stat_keys = ("edge", "heart", "iron", "shadow", "wits")
-            total = sum(stats.get(k, 0) for k in stat_keys)
-            if total != STAT_TARGET_SUM:
-                log(f"[Setup] AI returned stats summing to {total}, normalizing to {STAT_TARGET_SUM}", level="warning")
-                result["stats"] = {"edge":1,"heart":2,"iron":1,"shadow":1,"wits":2}
-            else:
-                # Clamp individual stats to 0-3
-                for k in stat_keys:
-                    stats[k] = max(0, min(3, stats.get(k, 1)))
-                # Re-check sum after clamping (clamping can reduce total)
-                clamped_total = sum(stats.get(k, 0) for k in stat_keys)
-                if clamped_total != STAT_TARGET_SUM:
-                    log(f"[Setup] Stats sum changed to {clamped_total} after clamping, using defaults", level="warning")
-                    result["stats"] = {"edge":1,"heart":2,"iron":1,"shadow":1,"wits":2}
-            return result
-        except json.JSONDecodeError:
-            pass
-    return {"character_name": "Namenlos", "character_concept": "Ein Wanderer",
-            "setting_description": "", "stats": {"edge":1,"heart":2,"iron":1,"shadow":1,"wits":2},
-            "starting_location": "Unbekannter Ort", "opening_situation": "Eine Reise beginnt."}
+    log(f"[Setup] Generating character: genre={genre_info}, tone={tone_info}, "
+        f"archetype={creation_data.get('archetype','?')}, "
+        f"name_override={name_override!r}, "
+        f"has_desc={bool(creation_data.get('custom_desc'))}, "
+        f"has_wishes={bool(creation_data.get('wishes'))}")
+
+    try:
+        response = _api_create_with_retry(
+            client, max_retries=2,
+            model=BRAIN_MODEL, max_tokens=512, system=system,
+            messages=[{"role": "user", "content": user_msg}],
+            output_config={"format": {"type": "json_schema", "schema": SETUP_BRAIN_OUTPUT_SCHEMA}},
+        )
+        result = json.loads(response.content[0].text)
+
+        # Validate stat sum — structured outputs guarantee valid JSON + correct types,
+        # but cannot enforce cross-field constraints like "all stats must total 7"
+        stats = result["stats"]
+        stat_keys = ("edge", "heart", "iron", "shadow", "wits")
+        # Clamp individual stats to 0-3
+        for k in stat_keys:
+            stats[k] = max(0, min(3, stats[k]))
+        total = sum(stats[k] for k in stat_keys)
+        if total != STAT_TARGET_SUM:
+            log(f"[Setup] AI returned stats summing to {total}, "
+                f"normalizing to {STAT_TARGET_SUM}", level="warning")
+            result["stats"] = {"edge":1,"heart":2,"iron":1,"shadow":1,"wits":2}
+
+        log(f"[Setup] Success: name={result['character_name']!r}, "
+            f"location={result['starting_location']!r}")
+        return result
+
+    except Exception as e:
+        log(f"[Setup] Structured output failed ({type(e).__name__}: {e}), "
+            f"using fallback", level="warning")
+        fallback_name = name_override if name_override else "Namenlos"
+        return {"character_name": fallback_name, "character_concept": "Ein Wanderer",
+                "setting_description": "", "stats": {"edge":1,"heart":2,"iron":1,"shadow":1,"wits":2},
+                "starting_location": "Unbekannter Ort", "opening_situation": "Eine Reise beginnt."}
 
 
 def call_recap(client: anthropic.Anthropic, game: GameState,
@@ -2370,64 +2777,31 @@ def call_story_architect(client: anthropic.Anthropic, game: GameState,
 - Ten (Twist): A surprising PERSPECTIVE SHIFT {E['dash']} not conflict escalation, but something seemingly unrelated that recontextualizes everything. This is the heart of Kishōtenketsu.
 - Ketsu (Resolution): Reconcile the new understanding with what came before
 - Each act has a GOAL the player should work toward, not a script
+- Each act has a TRANSITION_TRIGGER: a narrative condition that signals this act is complete and the next should begin. This is a PLAYER ACTION or STORY EVENT, not a scene number. Example: "The player discovers the truth about the shrine" or "The protagonist's daily routine is disrupted by an outsider". The scene_range is a fallback estimate; the trigger is the real boundary.
+- Include a THEMATIC_THREAD: the emotional/philosophical question that runs through the entire chapter as a vertical narrative layer. This connects to character_growth from previous chapters if available.
 - Include 2-3 key revelations that can be woven in at appropriate moments
 - Define 2-3 possible endings (harmony, bittersweet, melancholy)
 - The blueprint is a COMPASS, not rails {E['dash']} player choices override everything
-- If this is a continuing campaign (campaign_chapter > 1): build on unresolved threads from previous chapters, evolve existing relationships, introduce new conflicts that connect to the established world
+- If this is a continuing campaign (campaign_chapter > 1): build on unresolved threads from previous chapters, evolve existing relationships, introduce new conflicts that connect to the established world. Use previous character_growth and thematic_question to continue the emotional arc.
 - All text fields in {lang}
-</rules>
-<o>Return ONLY valid JSON:
-{{
-  "central_conflict": "1 sentence core tension/theme in {lang}",
-  "antagonist_force": "the opposing force or tension in {lang}",
-  "acts": [
-    {{"phase": "ki_introduction", "title": "act title in {lang}", "goal": "what should happen in {lang}", "scene_range": [1, 5], "mood": "atmosphere keyword"}},
-    {{"phase": "sho_development", "title": "act title in {lang}", "goal": "what should happen in {lang}", "scene_range": [6, 10], "mood": "atmosphere keyword"}},
-    {{"phase": "ten_twist", "title": "act title in {lang}", "goal": "what perspective shift occurs in {lang}", "scene_range": [11, 15], "mood": "atmosphere keyword"}},
-    {{"phase": "ketsu_resolution", "title": "act title in {lang}", "goal": "what should happen in {lang}", "scene_range": [16, 20], "mood": "atmosphere keyword"}}
-  ],
-  "revelations": [
-    {{"id": "rev_1", "content": "what is revealed in {lang}", "earliest_scene": 4, "dramatic_weight": "medium"}},
-    {{"id": "rev_2", "content": "what is revealed in {lang}", "earliest_scene": 10, "dramatic_weight": "high"}},
-    {{"id": "rev_3", "content": "perspective shift revelation in {lang}", "earliest_scene": 12, "dramatic_weight": "critical"}}
-  ],
-  "possible_endings": [
-    {{"type": "harmony", "description": "in {lang}"}},
-    {{"type": "bittersweet", "description": "in {lang}"}},
-    {{"type": "melancholy", "description": "in {lang}"}}
-  ]
-}}</o>"""
+- Use these phase names: ki_introduction, sho_development, ten_twist, ketsu_resolution
+- dramatic_weight must be one of: low, medium, high, critical
+</rules>"""
     else:
         system = f"""<role>Story architect for an RPG campaign. Create a flexible story blueprint.</role>
 {kf}{cb}<rules>
 - Design a 3-act structure with ~15-20 total scenes
 - Each act has a GOAL the player should work toward, not a script
+- Each act has a TRANSITION_TRIGGER: a narrative condition that signals this act is complete and the next should begin. This is a PLAYER ACTION or STORY EVENT, not a scene number. Example: "Mike decides to cooperate with the authorities" or "The first repair attempt fails spectacularly". The scene_range is a fallback estimate; the trigger is the real boundary.
+- Include a THEMATIC_THREAD: the emotional/philosophical question that runs through the entire chapter as a vertical narrative layer. This connects to character_growth from previous chapters if available.
 - Include 2-3 key revelations that can be woven in at appropriate moments
 - Define 2-3 possible endings (triumphant, bittersweet, tragic)
 - The blueprint is a COMPASS, not rails {E['dash']} player choices override everything
-- If this is a continuing campaign (campaign_chapter > 1): build on unresolved threads from previous chapters, evolve existing relationships, introduce new conflicts that connect to the established world
+- If this is a continuing campaign (campaign_chapter > 1): build on unresolved threads from previous chapters, evolve existing relationships, introduce new conflicts that connect to the established world. Use previous character_growth and thematic_question to continue the emotional arc.
 - All text fields in {lang}
-</rules>
-<o>Return ONLY valid JSON:
-{{
-  "central_conflict": "1 sentence core tension in {lang}",
-  "antagonist_force": "the opposition in {lang}",
-  "acts": [
-    {{"phase": "setup", "title": "act title in {lang}", "goal": "what should happen in {lang}", "scene_range": [1, 6], "mood": "atmosphere keyword"}},
-    {{"phase": "confrontation", "title": "act title in {lang}", "goal": "what should happen in {lang}", "scene_range": [7, 13], "mood": "atmosphere keyword"}},
-    {{"phase": "climax", "title": "act title in {lang}", "goal": "what should happen in {lang}", "scene_range": [14, 20], "mood": "atmosphere keyword"}}
-  ],
-  "revelations": [
-    {{"id": "rev_1", "content": "what is revealed in {lang}", "earliest_scene": 4, "dramatic_weight": "medium"}},
-    {{"id": "rev_2", "content": "what is revealed in {lang}", "earliest_scene": 8, "dramatic_weight": "high"}},
-    {{"id": "rev_3", "content": "what is revealed in {lang}", "earliest_scene": 13, "dramatic_weight": "critical"}}
-  ],
-  "possible_endings": [
-    {{"type": "triumph", "description": "in {lang}"}},
-    {{"type": "bittersweet", "description": "in {lang}"}},
-    {{"type": "tragedy", "description": "in {lang}"}}
-  ]
-}}</o>"""
+- Use these phase names: setup, confrontation, climax
+- dramatic_weight must be one of: low, medium, high, critical
+</rules>"""
 
     npc_text = ", ".join(n["name"] for n in game.npcs) if game.npcs else "none yet"
     campaign_ctx = ""
@@ -2438,6 +2812,12 @@ def call_story_architect(client: anthropic.Anthropic, game: GameState,
             threads = ch.get("unresolved_threads", [])
             if threads:
                 campaign_ctx += f" [threads: {'; '.join(threads)}]"
+            growth = ch.get("character_growth", "")
+            if growth:
+                campaign_ctx += f" [growth: {growth}]"
+            thematic = ch.get("thematic_question", "")
+            if thematic:
+                campaign_ctx += f" [thematic_question: {thematic}]"
     backstory_text = ""
     if getattr(game, 'backstory', ''):
         backstory_text = f"\nbackstory(canon past):{game.backstory}"
@@ -2450,62 +2830,25 @@ npcs:{npc_text}{campaign_ctx}{backstory_text}"""
 
     # Story Architect uses NARRATOR_MODEL (Sonnet) — called once per game/chapter,
     # cost is negligible (~$0.01), but quality of the blueprint shapes the entire story.
-    # Haiku struggles with this complex nested JSON + foreign language requirement.
-    for attempt in range(2):  # Up to 2 attempts
-        try:
-            response = _api_create_with_retry(
-                client, max_retries=2,
-                model=NARRATOR_MODEL, max_tokens=1200, system=system,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            text = response.content[0].text
-            match = re.search(r'\{[\s\S]*\}', text)
-            if not match:
-                log(f"[Story] Architect attempt {attempt+1}: no JSON found in response. "
-                    f"Raw text (first 300 chars): {text[:300]}", level="warning")
-                continue  # Retry
+    try:
+        response = _api_create_with_retry(
+            client, max_retries=2,
+            model=NARRATOR_MODEL, max_tokens=2500, system=system,
+            messages=[{"role": "user", "content": user_msg}],
+            output_config={"format": {"type": "json_schema", "schema": STORY_ARCHITECT_OUTPUT_SCHEMA}},
+        )
+        blueprint = json.loads(response.content[0].text)
+        blueprint["revealed"] = []  # Track which revelations have fired
+        blueprint["structure_type"] = structure_type
+        log(f"[Story] Architect succeeded: "
+            f"conflict={blueprint['central_conflict'][:80]}, "
+            f"acts={len(blueprint['acts'])}, "
+            f"revelations={len(blueprint.get('revelations', []))}")
+        return blueprint
 
-            raw_json = match.group()
-            try:
-                blueprint = json.loads(raw_json)
-            except json.JSONDecodeError:
-                try:
-                    blueprint = json.loads(_repair_json(raw_json))
-                except (json.JSONDecodeError, Exception) as repair_err:
-                    log(f"[Story] Architect attempt {attempt+1}: JSON parse+repair both failed. "
-                        f"Error: {repair_err}. Raw JSON (first 400 chars): {raw_json[:400]}",
-                        level="warning")
-                    continue  # Retry
-
-            # Validate minimal structure
-            missing = []
-            if not blueprint.get("acts"):
-                missing.append("acts")
-            if not blueprint.get("central_conflict"):
-                missing.append("central_conflict")
-            if missing:
-                log(f"[Story] Architect attempt {attempt+1}: JSON valid but missing required fields: "
-                    f"{missing}. Keys present: {list(blueprint.keys())}. "
-                    f"central_conflict={blueprint.get('central_conflict', '(missing)')!r}",
-                    level="warning")
-                continue  # Retry
-
-            blueprint["revealed"] = []  # Track which revelations have fired
-            blueprint["structure_type"] = structure_type
-            log(f"[Story] Architect succeeded (attempt {attempt+1}): "
-                f"conflict={blueprint['central_conflict'][:80]}, "
-                f"acts={len(blueprint['acts'])}, "
-                f"revelations={len(blueprint.get('revelations', []))}")
-            return blueprint
-
-        except Exception as e:
-            log(f"[Story] Architect attempt {attempt+1} exception: {type(e).__name__}: {e}",
-                level="warning")
-            if attempt == 0:
-                continue  # Retry once on exception
-            # Second attempt also failed — fall through to fallback
-
-    log(f"[Story] Architect failed after 2 attempts, using context-aware fallback", level="warning")
+    except Exception as e:
+        log(f"[Story] Architect failed ({type(e).__name__}: {e}), "
+            f"using context-aware fallback", level="warning")
 
     # Fallback: minimal context-aware blueprint in narration language.
     # Uses actual game info instead of generic English placeholder text.
@@ -2517,13 +2860,14 @@ npcs:{npc_text}{campaign_ctx}{backstory_text}"""
         "German": {
             "conflict": f"{game.player_name} steht vor einer unbekannten Bedrohung{' in ' + _loc_short if _loc_short else ''}.",
             "antagonist": f"Feindliche Kräfte{' in der ' + _genre_short + '-Welt' if _genre_short else ''}",
+            "thematic": "Was ist der Preis des Überlebens?",
             "3act": [
                 {"phase": "setup", "title": "Erste Schatten", "goal": "Die Bedrohung erkennen und Verbündete finden",
-                 "scene_range": [1, 6], "mood": "mysterious"},
+                 "scene_range": [1, 6], "mood": "mysterious", "transition_trigger": "Die Bedrohung wird konkret und der Protagonist entscheidet sich zu handeln"},
                 {"phase": "confrontation", "title": "Eskalation", "goal": "Der Bedrohung direkt begegnen",
-                 "scene_range": [7, 13], "mood": "tense"},
+                 "scene_range": [7, 13], "mood": "tense", "transition_trigger": "Eine unerwartete Eskalation zwingt zur finalen Auseinandersetzung"},
                 {"phase": "climax", "title": "Die Entscheidung", "goal": "Das Schicksal entscheiden",
-                 "scene_range": [14, 20], "mood": "desperate"},
+                 "scene_range": [14, 20], "mood": "desperate", "transition_trigger": ""},
             ],
             "3act_endings": [
                 {"type": "triumph", "description": "Sieg über die Bedrohung."},
@@ -2532,13 +2876,13 @@ npcs:{npc_text}{campaign_ctx}{backstory_text}"""
             ],
             "kish": [
                 {"phase": "ki_introduction", "title": "Der Alltag", "goal": "Die Welt und ihre Menschen kennenlernen",
-                 "scene_range": [1, 5], "mood": "contemplative"},
+                 "scene_range": [1, 5], "mood": "contemplative", "transition_trigger": "Der Alltag wird durch ein unerwartetes Ereignis unterbrochen"},
                 {"phase": "sho_development", "title": "Vertiefung", "goal": "Beziehungen und Muster vertiefen",
-                 "scene_range": [6, 10], "mood": "intimate"},
+                 "scene_range": [6, 10], "mood": "intimate", "transition_trigger": "Ein scheinbar unzusammenhängendes Element taucht auf"},
                 {"phase": "ten_twist", "title": "Die Wendung", "goal": "Eine unerwartete Perspektive verändert alles",
-                 "scene_range": [11, 15], "mood": "surprising"},
+                 "scene_range": [11, 15], "mood": "surprising", "transition_trigger": "Die neue Perspektive wird erkannt und beginnt alles zu verändern"},
                 {"phase": "ketsu_resolution", "title": "Versöhnung", "goal": "Das Neue mit dem Alten vereinen",
-                 "scene_range": [16, 20], "mood": "reflective"},
+                 "scene_range": [16, 20], "mood": "reflective", "transition_trigger": ""},
             ],
             "kish_endings": [
                 {"type": "harmony", "description": "Frieden und Verständnis."},
@@ -2560,16 +2904,17 @@ npcs:{npc_text}{campaign_ctx}{backstory_text}"""
         return {
             "central_conflict": _conflict,
             "antagonist_force": _antag,
+            "thematic_thread": fb.get("thematic", "What is the cost of understanding?") if fb else "What is the cost of understanding?",
             "structure_type": "kishotenketsu",
             "acts": fb["kish"] if fb else [
                 {"phase": "ki_introduction", "title": "Daily Life", "goal": "Get to know the world",
-                 "scene_range": [1, 5], "mood": "contemplative"},
+                 "scene_range": [1, 5], "mood": "contemplative", "transition_trigger": "Daily life is disrupted by an unexpected event"},
                 {"phase": "sho_development", "title": "Deepening", "goal": "Deepen relationships",
-                 "scene_range": [6, 10], "mood": "intimate"},
+                 "scene_range": [6, 10], "mood": "intimate", "transition_trigger": "A seemingly unrelated element appears"},
                 {"phase": "ten_twist", "title": "The Twist", "goal": "An unexpected perspective changes everything",
-                 "scene_range": [11, 15], "mood": "surprising"},
+                 "scene_range": [11, 15], "mood": "surprising", "transition_trigger": "The new perspective is recognized"},
                 {"phase": "ketsu_resolution", "title": "Reconciliation", "goal": "Unite the new with the old",
-                 "scene_range": [16, 20], "mood": "reflective"},
+                 "scene_range": [16, 20], "mood": "reflective", "transition_trigger": ""},
             ],
             "revelations": [],
             "possible_endings": fb["kish_endings"] if fb else [
@@ -2583,14 +2928,15 @@ npcs:{npc_text}{campaign_ctx}{backstory_text}"""
         return {
             "central_conflict": _conflict,
             "antagonist_force": _antag,
+            "thematic_thread": fb.get("thematic", "What is the price of survival?") if fb else "What is the price of survival?",
             "structure_type": "3act",
             "acts": fb["3act"] if fb else [
                 {"phase": "setup", "title": "First Shadows", "goal": "Discover the threat and find allies",
-                 "scene_range": [1, 6], "mood": "mysterious"},
+                 "scene_range": [1, 6], "mood": "mysterious", "transition_trigger": "The threat becomes concrete and the protagonist decides to act"},
                 {"phase": "confrontation", "title": "Escalation", "goal": "Confront the threat directly",
-                 "scene_range": [7, 13], "mood": "tense"},
+                 "scene_range": [7, 13], "mood": "tense", "transition_trigger": "An unexpected escalation forces the final confrontation"},
                 {"phase": "climax", "title": "The Decision", "goal": "Decide the fate",
-                 "scene_range": [14, 20], "mood": "desperate"},
+                 "scene_range": [14, 20], "mood": "desperate", "transition_trigger": ""},
             ],
             "revelations": [],
             "possible_endings": fb["3act_endings"] if fb else [
@@ -2603,26 +2949,44 @@ npcs:{npc_text}{campaign_ctx}{backstory_text}"""
 
 
 def get_current_act(game: GameState) -> dict:
-    """Determine which act the story is in based on scene count."""
+    """Determine which act the story is in based on transition triggers and scene count.
+    Dual logic: (1) Check if Director has signaled an act transition via trigger fulfillment,
+    tracked in story_blueprint['triggered_transitions']. (2) Fallback to scene_range."""
     bp = game.story_blueprint
     if not bp or not bp.get("acts"):
         return {"phase": "setup", "title": "?", "goal": "?", "mood": "mysterious",
-                "act_number": 1, "total_acts": 3, "progress": "early", "approaching_end": False}
+                "act_number": 1, "total_acts": 3, "progress": "early",
+                "approaching_end": False, "transition_trigger": ""}
 
     acts = bp["acts"]
     scene = game.scene_count
+    triggered = set(bp.get("triggered_transitions", []))
+
+    # Determine current act: walk through acts, advancing past those whose
+    # transition_trigger has been fulfilled OR whose scene_range has been exceeded
     current = acts[0]
     act_number = 1
 
-    for i, act in enumerate(acts):
+    for i, act in enumerate(acts[:-1]):  # Last act has no transition_trigger
+        trigger = act.get("transition_trigger", "")
         sr = act.get("scene_range", [1, 20])
-        if scene >= sr[0]:
+        act_id = f"act_{i}"
+
+        # Act is complete if trigger was fulfilled OR we're past its scene_range
+        if act_id in triggered or scene > sr[1]:
+            # Move to next act
+            if i + 1 < len(acts):
+                current = acts[i + 1]
+                act_number = i + 2
+        else:
+            # Still in this act
             current = act
             act_number = i + 1
+            break
 
     # Estimate progress within act
     sr = current.get("scene_range", [1, 20])
-    act_len = sr[1] - sr[0] + 1
+    act_len = max(sr[1] - sr[0] + 1, 1)
     scenes_in = scene - sr[0] + 1
     if scenes_in <= act_len * 0.3:
         progress = "early"
@@ -2765,20 +3129,17 @@ def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) 
 {kf}{cb}{bs}
 <rules>
 - NEVER mention dice, stats, numbers, or game mechanics
-- ALL text content in metadata fields (description, event, scene_context, trigger_description) MUST be in {lang}, just like the narration itself
 - MISS: concrete failure, situation worsens, NO silver linings
 - WEAK_HIT: success at tangible cost
 - STRONG_HIT: clean success
 - NPCs act per their disposition and memories
-- NEW NPCs: When a new NAMED character appears who is NOT in <npcs_present>, include them in <new_npcs> metadata. Only named, story-relevant characters {E['dash']} not unnamed crowd or background figures.
-- NPC IDENTITY REVEAL: When a character already listed in <npcs_present> is revealed to have a DIFFERENT true name (unmasking, introduction by full name, alias reveal), use <npc_rename> metadata INSTEAD of <new_npcs>. This prevents duplicate NPCs. Example: a mysterious stranger reveals themselves as a known captain.
-- NPC SURNAME ESTABLISHMENT: When you INVENT a surname or other new biographical fact for a known NPC who only has a first name (e.g. police use their full name for the first time), add a <npc_details> block so the system remembers. Do NOT use <npc_rename> for this {E['dash']} rename is for identity REVEALS (spy's true name), details is for filling in GAPS (a surname never established).
+- Introduce new NAMED characters through action and dialog {E['dash']} give them distinct voices and traits
 - BACKSTORY CANON: If <backstory> is present, treat it as ESTABLISHED HISTORY. People mentioned there (family, friends, rivals) are ALREADY KNOWN to the player character {E['dash']} if they appear, they recognize the player and vice versa. NEVER introduce a backstory character as a stranger or reinterpret established relationships. Backstory events ALREADY HAPPENED {E['dash']} reference them as shared memory, not new plot.
 - Describe only sensory impressions, never player thoughts
 - End scenes OPEN {E['dash']} no option lists, no suggested actions
 - 2-4 paragraphs
 - TEMPORAL CONSISTENCY: If <time> is provided, maintain that time period. Time only moves FORWARD (never backward). If you mention specific times, they must be later than any previously mentioned time. Do NOT invent specific clock times unless narratively important {E['dash']} prefer atmospheric time cues (moonlight, sunset glow, morning mist). CRITICAL: Each scene transition represents minutes to hours of in-world time, NOT days or years. Events from recent scenes just happened {E['dash']} signs don't weather, wounds are fresh, sent NPCs are still en route or just arrived. Never describe recent events or objects as aged, decayed, or long-past unless the player explicitly time-skips.
-- SPATIAL CONSISTENCY: The <location> tag shows where the player currently IS. If <prev_locations> is provided, the player has LEFT those places. NEVER place the player back at a previous location unless they explicitly travel there. If the scene moves to a new location, you MUST update the location field in your metadata.
+- SPATIAL CONSISTENCY: The <location> tag shows where the player currently IS. If <prev_locations> is provided, the player has LEFT those places. NEVER place the player back at a previous location unless they explicitly travel there. If an NPC has a last_seen attribute showing a DIFFERENT location than the player's current <location>, that NPC is NOT physically present {E['dash']} they cannot be heard through walls, seen, or interact directly. They can only appear if they plausibly traveled to the player's location (and the narration should describe their arrival). NPCs without last_seen or with last_seen matching <location> ARE present and can interact normally.
 - If <story_arc> is present, steer scenes toward the act goal and mood
 - If revelation_ready is set, weave it into the scene naturally (through NPC dialog, discovered evidence, or environmental storytelling) {E['dash']} NEVER dump exposition
 - If <story_ending> is present, build toward a satisfying conclusion
@@ -2792,13 +3153,15 @@ def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) 
 - If <chaos_interrupt> is present, weave the specified disruption naturally into the scene. For type="dilemma", present the forced choice clearly so the player must decide next turn. For type="ticking_clock", establish the deadline or urgency so it shapes future actions. For type="positive_windfall", make it feel earned by the world, not a gift from nowhere.
 - If <dramatic_question> is present, the scene should address this question (resolve or deepen it)
 - If story_arc structure="kishotenketsu" and phase="ten_twist": focus on perspective SHIFT, not conflict escalation. Something seemingly unrelated recontextualizes everything.
+- PURE PROSE ONLY: Output ONLY narrative text. No JSON, no XML tags, no metadata, no code blocks, no markdown formatting (no *italics*, no **bold**, no # headings). Use typographic emphasis through word choice, sentence rhythm, and punctuation instead. Your entire response is visible to the player.
 </rules>
 <player_authorship>
 - The PLAYER IS the character. If <player_words> is provided, these are CANONICAL.
-- DIALOG: The narration MUST SHOW the player character speaking. Include their words as quoted dialog in the scene (with speech tags/body language). You may lightly polish grammar, but NEVER omit, skip, or replace what they said. The player's speech MUST appear in the text BEFORE NPCs react to it.
+- DIALOG: The narration MUST SHOW the player character speaking. Include their words as quoted dialog in the scene (with speech tags/body language). The player's speech MUST appear in the text BEFORE NPCs react to it.
+- PRESERVE EXACTLY: Keep the player's word choices, names, spelling, and phrasing intact. If the player writes a wrong name, a typo, slang, or informal language, that IS what the character said {E['dash']} reproduce it faithfully. NEVER correct names, fix factual errors, convert numbers to words, or "improve" the player's language. The ONLY permitted changes are adding punctuation and capitalizing sentence starts.
+- DESCRIBED SPEECH: If the player describes speaking WITHOUT giving exact words (e.g. "I ask him about Thornhill" or "I describe the suspect"), narrate this as INDIRECT SPEECH or brief summary {E['dash']} do NOT invent specific quoted dialog for the player character. Write "Du fragst ihn nach Thornhill" or "Du beschreibst den Verdächtigen", then show the NPC's reaction. NEVER put invented words in the player character's mouth.
 - ACTIONS: The narration MUST SHOW the player character performing the described action. You may add sensory detail and atmosphere, but the core action stays as stated and must be visible in the text.
 - NEVER skip the player's contribution. NEVER jump straight to NPC reactions without first showing what the player character said or did.
-- NEVER invent dialog the player character didn't say. NEVER replace player actions with different ones.
 - NPCs REACT to what the player actually said/did, not to a reinterpretation.
 </player_authorship>
 <style>Terse, vivid, sensory. Show, don't tell. Player co-creates the world  --  integrate new elements seamlessly.</style>"""
@@ -2837,46 +3200,28 @@ def call_narrator(client: anthropic.Anthropic, prompt: str,
         raw = _salvage_truncated_narration(raw)
 
     log(f"[Narrator] Raw response ({len(raw)} chars): {raw[:500]}")
-    # Log metadata tags found
-    tags_found = []
-    if '<game_data>' in raw: tags_found.append('game_data')
-    if '<npc_rename>' in raw: tags_found.append('npc_rename')
-    if '<new_npcs>' in raw: tags_found.append('new_npcs')
-    if '<npc_details>' in raw: tags_found.append('npc_details')
-    if '<memory_updates>' in raw: tags_found.append('memory_updates')
-    if '<scene_context>' in raw: tags_found.append('scene_context')
-    if '<location_update>' in raw: tags_found.append('location_update')
-    if '<time_update>' in raw: tags_found.append('time_update')
-    if tags_found:
-        log(f"[Narrator] Metadata tags found: {', '.join(tags_found)}")
-    else:
-        log(f"[Narrator] WARNING: No metadata tags found in response")
+    # Log if game_data present (opening scene/chapter only)
+    if '<game_data>' in raw:
+        log(f"[Narrator] Found <game_data> tag (opening/chapter scene)")
+    # Fix Cyrillic homoglyphs (LLMs occasionally emit е instead of e, с instead of s, etc.)
+    raw = _fix_cyrillic_homoglyphs(raw)
     return raw
 
 
 def _salvage_truncated_narration(raw: str) -> str:
     """Clean up a truncated narrator response so it ends at a natural break.
-    Preserves any complete metadata tags, trims prose to last full sentence."""
-    # Split into prose and metadata parts
-    # Find the last complete metadata tag boundary
-    metadata_tags = ['<game_data>', '<npc_rename>', '<new_npcs>',
-                     '<npc_details>', '<memory_updates>', '<scene_context>',
-                     '<location_update>', '<time_update>']
-    # Check for incomplete metadata at the end (tag opened but not closed)
-    for tag in metadata_tags:
-        close_tag = tag.replace('<', '</')
-        last_open = raw.rfind(tag)
-        if last_open != -1 and raw.find(close_tag, last_open) == -1:
-            # Incomplete metadata tag — remove it
-            raw = raw[:last_open].rstrip()
-            log(f"[Narrator] Removed incomplete {tag} from truncated response")
+    Preserves any complete game_data tag (opening scenes), trims prose to last full sentence."""
+    # Check for incomplete game_data at the end (tag opened but not closed)
+    last_open = raw.rfind('<game_data>')
+    if last_open != -1 and raw.find('</game_data>', last_open) == -1:
+        raw = raw[:last_open].rstrip()
+        log(f"[Narrator] Removed incomplete <game_data> from truncated response")
 
-    # Now find the prose portion (before any metadata)
+    # Find the prose portion (before any game_data tag)
     prose_end = len(raw)
-    for tag in metadata_tags:
-        idx = raw.find(tag)
-        if idx != -1 and idx < prose_end:
-            prose_end = idx
+    idx = raw.find('<game_data>')
+    if idx != -1 and idx < prose_end:
+        prose_end = idx
 
     prose = raw[:prose_end]
     metadata = raw[prose_end:]
@@ -2910,6 +3255,112 @@ def _salvage_truncated_narration(raw: str) -> str:
     return prose + metadata
 
 
+def call_narrator_metadata(client: anthropic.Anthropic, narration: str,
+                           game: GameState,
+                           config: Optional[EngineConfig] = None) -> dict:
+    """Extract structured metadata from narrator prose via Haiku (Two-Call pattern).
+    Returns guaranteed-valid dict matching NARRATOR_METADATA_SCHEMA."""
+    lang = get_narration_lang(config or EngineConfig())
+
+    # Build compact NPC reference list for the extractor
+    npc_refs = []
+    for n in game.npcs:
+        if n.get("status") not in ("active", "background"):
+            continue
+        entry = f'{n["id"]}={n["name"]}'
+        if n.get("aliases"):
+            entry += f' (aka {", ".join(n["aliases"])})'
+        npc_refs.append(entry)
+
+    system = f"""You are a metadata extractor for an RPG engine. Analyze the narration and extract game state changes.
+All text fields (event, description, scene_context) MUST be in {lang}.
+emotional_weight must be ONE of: neutral, curious, wary, angry, grateful, suspicious, terrified, loyal, conflicted, betrayed, devastated, euphoric.
+disposition must be ONE of: neutral, friendly, distrustful, hostile, loyal.
+time_update must be ONE of: early_morning, morning, midday, afternoon, evening, late_evening, night, deep_night — or null if no time change.
+location_update: new location name if the character MOVED, null if they stayed.
+npc_renames: only for identity REVEALS (spy unmasked, alias discovered). NOT for surname additions.
+npc_details: for newly established facts (surname, role change). full_name if name extended, description if role/situation changed.
+new_npcs: ONLY for characters who are PHYSICALLY PRESENT in the scene AND actively interacting (speaking, acting, reacting). They must NOT already be in the known NPC list. NEVER include the player character. NEVER include:
+- Characters who are only MENTIONED in conversation, stories, or memories
+- Deceased persons (people discussed as dead, seen only in photos/flashbacks)
+- Historical or absent figures (people talked about but not physically there)
+- Unnamed characters described only by role ("a waiter", "some guard") unless they speak or interact meaningfully
+If a NAMED person is mentioned in dialog but a DIFFERENT unnamed person is physically present, create the NPC for the PHYSICAL person with their own appropriate name/description — do NOT assign the mentioned person's name to the physical person's description.
+description must be a PHYSICAL/ROLE description (appearance, occupation, species), NOT what they did in this scene.
+memory_updates: for EACH NPC who participated in or witnessed this scene. Use their npc_id from the known list. NEVER create memory_updates for the player character. NEVER create memory_updates for deceased or absent characters — only for NPCs physically present in the scene."""
+
+    prompt = f"""<narration>{narration}</narration>
+<player_character>{game.player_name}</player_character>
+<known_npcs>{chr(10).join(npc_refs) if npc_refs else '(none)'}</known_npcs>
+<current_location>{game.current_location or 'unknown'}</current_location>
+<current_time>{game.time_of_day or 'unknown'}</current_time>
+Extract all metadata from the narration above. Remember: {game.player_name} is the PLAYER CHARACTER, not an NPC."""
+
+    try:
+        response = _api_create_with_retry(
+            client, max_retries=2,
+            model=BRAIN_MODEL, max_tokens=2000,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+            output_config={"format": {
+                "type": "json_schema",
+                "schema": NARRATOR_METADATA_SCHEMA,
+            }},
+        )
+        metadata = json.loads(response.content[0].text)
+        log(f"[Metadata] Extracted: {len(metadata.get('memory_updates', []))} memories, "
+            f"{len(metadata.get('new_npcs', []))} new NPCs, "
+            f"loc={metadata.get('location_update')}, time={metadata.get('time_update')}")
+        return metadata
+    except Exception as e:
+        log(f"[Metadata] Extraction failed: {e}", level="warning")
+        return {"scene_context": "", "location_update": None, "time_update": None,
+                "memory_updates": [], "new_npcs": [], "npc_renames": [], "npc_details": []}
+
+
+def _apply_narrator_metadata(game: GameState, metadata: dict):
+    """Apply structured metadata from the metadata extractor to game state."""
+    # Scene context (always present)
+    ctx = metadata.get("scene_context", "").strip()
+    if ctx:
+        game.current_scene_context = ctx
+
+    # Location update
+    new_loc = metadata.get("location_update")
+    if new_loc and new_loc.strip().lower() not in ("none", "null", "same", ""):
+        update_location(game, new_loc.strip())
+
+    # Time update
+    new_time = metadata.get("time_update")
+    if new_time and new_time.strip().lower().replace(" ", "_") in TIME_PHASES:
+        game.time_of_day = new_time.strip().lower().replace(" ", "_")
+
+    # NPC renames (delegate to existing logic via JSON roundtrip)
+    renames = metadata.get("npc_renames", [])
+    if renames:
+        _process_npc_renames(game, json.dumps(renames, ensure_ascii=False))
+
+    # New NPCs
+    new_npcs = metadata.get("new_npcs", [])
+    if new_npcs:
+        _process_new_npcs(game, json.dumps(new_npcs, ensure_ascii=False))
+
+    # NPC details (sanitize nulls → empty strings before delegation)
+    details = metadata.get("npc_details", [])
+    if details:
+        for d in details:
+            if d.get("full_name") is None:
+                d["full_name"] = ""
+            if d.get("description") is None:
+                d["description"] = ""
+        _process_npc_details(game, json.dumps(details, ensure_ascii=False))
+
+    # Memory updates
+    mem_updates = metadata.get("memory_updates", [])
+    if mem_updates:
+        _apply_memory_updates(game, json.dumps(mem_updates, ensure_ascii=False))
+
+
 # ===============================================================
 # DIRECTOR AGENT — Lazy story steering, summaries, reflections
 # ===============================================================
@@ -2929,9 +3380,7 @@ Focus on relationship evolution, not event recaps.
 
 Be SPECIFIC in narrator_guidance. Not "make things interesting" but
 "Borin should test the player's loyalty with a dangerous request before
-revealing the secret passage."
-
-Always reply with valid JSON only. No markdown, no backticks."""
+revealing the secret passage." """
 
 
 def _should_call_director(game: GameState, roll_result: str = "",
@@ -3024,14 +3473,22 @@ def build_director_prompt(game: GameState, latest_narration: str,
 
     # Story arc info
     story_info = ""
+    transition_trigger = ""
     if game.story_blueprint and game.story_blueprint.get("acts"):
         act = get_current_act(game)
         bp = game.story_blueprint
+        transition_trigger = act.get("transition_trigger", "")
+        thematic = bp.get("thematic_thread", "")
         story_info = (
             f'\n<story_arc structure="{bp.get("structure_type", "3act")}" '
             f'act="{act["act_number"]}/{act["total_acts"]}" phase="{act["phase"]}" '
-            f'progress="{act["progress"]}" conflict="{bp.get("central_conflict", "")}"/>'
+            f'progress="{act["progress"]}" conflict="{bp.get("central_conflict", "")}"'
         )
+        if transition_trigger:
+            story_info += f' transition_trigger="{transition_trigger}"'
+        if thematic:
+            story_info += f' thematic_thread="{thematic}"'
+        story_info += '/>'
 
     # Active NPC overview (include descriptions so Director stays consistent with narrative)
     npc_overview = "\n".join(
@@ -3059,143 +3516,25 @@ def build_director_prompt(game: GameState, latest_narration: str,
 <task>
 Analyze the latest scene and provide strategic guidance in {lang}.
 Reflections and narrator_guidance MUST be in {lang}.
-Reply ONLY with this JSON:
-{{
-  "scene_summary": "2-3 sentence summary of what happened and WHY it matters (in {lang})",
-  "narrator_guidance": "Specific direction for the next 1-2 scenes (in {lang})",
-  "npc_guidance": {{"npc_id": "what this NPC should do/feel next (in {lang})"}},
-  "pacing": "tension_rising|building|climax|breather|resolution",
-  "npc_reflections": [{{"npc_id": "...", "reflection": "1-2 sentence higher-level insight (in {lang})", "tone": "1-3 English words capturing the emotional shift, e.g. 'protective_guilt', 'reluctant_trust', 'growing_dread'. Capture the NUANCE — how has this NPC's feeling evolved since their last reflection?", "tone_key": "ONE word from: neutral|curious|wary|suspicious|grateful|terrified|loyal|conflicted|betrayed|devastated|euphoric|defiant|guilty|protective|angry|devoted|impressed|hopeful", "updated_description": "STRICTLY in {lang}. Max 100 characters. Role + key visual traits (from existing description) + personality. Keep physical details like age, hair, build. Do NOT start with the NPC's name. NO actions, NO posture. Example: 'Grumpy dwarf blacksmith with burn scars, secretly loyal'. Omit if unchanged.", "agenda": "NPC's hidden goal (optional, only if needs_profile=true)", "instinct": "NPC's default behavior pattern (optional, only if needs_profile=true)"}}],
-  "arc_notes": "Brief story arc progress observation"
-}}
-Only include npc_reflections for NPCs listed in <reflect> tags.
+
+Field instructions:
+- scene_summary: 2-3 sentence summary of what happened and WHY it matters (in {lang})
+- narrator_guidance: Specific direction for the next 1-2 scenes (in {lang})
+- npc_guidance: Array of {{"npc_id": "npc_1", "guidance": "what this NPC should do/feel next"}} — guidance text in {lang}
+- pacing: one of tension_rising, building, climax, breather, resolution
+- npc_reflections: Only for NPCs listed in <reflect> tags. Each object has:
+  - npc_id: the NPC's ID from the <reflect> tag
+  - reflection: 1-2 sentence higher-level insight (in {lang})
+  - tone: 1-3 English words capturing the emotional shift (e.g. 'protective_guilt', 'reluctant_trust')
+  - tone_key: ONE word from the enum (neutral, curious, wary, suspicious, grateful, terrified, loyal, conflicted, betrayed, devastated, euphoric, defiant, guilty, protective, angry, devoted, impressed, hopeful)
+  - updated_description: STRICTLY in {lang}. Max 100 characters. Role + key visual traits + personality. Keep physical details like age, hair, build. Do NOT start with the NPC's name. NO actions, NO posture. Example: 'Grumpy dwarf blacksmith with burn scars, secretly loyal'. null if unchanged.
+  - agenda: NPC's hidden goal (max 8 words, only if needs_profile="true"), null otherwise
+  - instinct: NPC's default behavior pattern (max 8 words, only if needs_profile="true"), null otherwise
+- arc_notes: Brief story arc progress observation
+- act_transition: Set to true ONLY if this scene's events fulfill the current act's transition_trigger (shown in <story_arc> tag). This means the story should move to the next act. Set to false if the trigger condition has NOT been met yet. When in doubt, set false — premature act transitions hurt pacing.
+
 If a <reflect> tag has a last_reflection attribute, write a NEW insight that builds on, deepens, or contradicts it. Do NOT repeat the same theme or emotional tone. If last_tone is present, evolve the emotion — show how the NPC's feelings have shifted, intensified, or transformed since then.
-If a <reflect> tag has needs_profile="true", include "agenda" (their hidden goal, max 8 words) and "instinct" (their default behavior, max 8 words) in the reflection object.
-npc_guidance keys should be NPC IDs like "npc_1".
 </task>"""
-
-
-def _close_truncated_json(text: str) -> str:
-    """Attempt to close truncated JSON by removing incomplete trailing content
-    and closing all open brackets/braces in correct order.
-    Best-effort for max_tokens cutoffs."""
-    # Step 1: Remove trailing whitespace
-    text = text.rstrip()
-    # Step 2: If we're mid-string, close the string
-    in_string = False
-    escape = False
-    for ch in text:
-        if escape:
-            escape = False
-            continue
-        if ch == '\\':
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-    if in_string:
-        text += '"'
-    # Step 3: Strip back to the last structurally complete point
-    for _ in range(5):
-        stripped = text.rstrip()
-        # Trailing colon (key with no value): remove "key":
-        if stripped.endswith(':'):
-            text = re.sub(r',?\s*"[^"]*"\s*:\s*$', '', stripped)
-            continue
-        # Trailing comma
-        if stripped.endswith(','):
-            text = stripped[:-1]
-            continue
-        # Trailing dangling key or incomplete array element after comma:
-        # e.g. '..., "narrator_gui"' — truncated before ":"
-        # Safe to remove: in objects it's a dangling key, in arrays it's
-        # an incomplete last element; both produce valid JSON when removed.
-        m = re.search(r',\s*"[^"]*"\s*$', stripped)
-        if m:
-            text = stripped[:m.start()]
-            continue
-        break
-    # Step 4: Close all open brackets/braces IN CORRECT ORDER
-    # Track the stack of open delimiters to close them properly
-    stack = []
-    in_str = False
-    esc = False
-    for ch in text:
-        if esc:
-            esc = False
-            continue
-        if ch == '\\':
-            esc = True
-            continue
-        if ch == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if ch == '{':
-            stack.append('}')
-        elif ch == '[':
-            stack.append(']')
-        elif ch in ('}', ']') and stack:
-            stack.pop()
-    # Close in reverse order (innermost first)
-    text += ''.join(reversed(stack))
-    return text
-
-
-def _repair_json(text: str) -> str:
-    """Attempt to repair common LLM JSON errors before parsing.
-    Only called after json.loads() already failed — no overhead for valid JSON.
-
-    Fixes:
-    1. Unescaped control characters inside strings (newlines, tabs)
-    2. Missing commas between fields / after any value type
-    3. Trailing commas before } or ]
-    """
-    # --- Pass 1: Fix unescaped control chars inside strings ---
-    result = []
-    in_string = False
-    escape_next = False
-    for ch in text:
-        if escape_next:
-            result.append(ch)
-            escape_next = False
-            continue
-        if ch == '\\':
-            result.append(ch)
-            escape_next = True
-            continue
-        if ch == '"' and not escape_next:
-            in_string = not in_string
-            result.append(ch)
-            continue
-        if in_string:
-            if ch == '\n':
-                result.append('\\n')
-                continue
-            if ch == '\r':
-                result.append('\\r')
-                continue
-            if ch == '\t':
-                result.append('\\t')
-                continue
-        result.append(ch)
-    text = ''.join(result)
-
-    # --- Pass 2: Fix missing commas ---
-    # After string value: "value"\n"key"
-    text = re.sub(r'("\s*)\n(\s*")', r'\1,\n\2', text)
-    # After closing brace/bracket: }\n" or ]\n" or }\n{ or ]\n[
-    text = re.sub(r'([\}\]]\s*)\n(\s*["\{\[])', r'\1,\n\2', text)
-    # After number: 123\n"key" (digits, possibly with decimal/negative/exponent)
-    text = re.sub(r'(\d\s*)\n(\s*")', r'\1,\n\2', text)
-    # After boolean/null: true\n"key" or false\n"key" or null\n"key"
-    text = re.sub(r'((?:true|false|null)\s*)\n(\s*")', r'\1,\n\2', text)
-
-    # --- Pass 3: Fix trailing commas ---
-    text = re.sub(r',(\s*[\}\]])', r'\1', text)
-
-    return text
 
 
 def call_director(client: anthropic.Anthropic, game: GameState,
@@ -3207,56 +3546,34 @@ def call_director(client: anthropic.Anthropic, game: GameState,
 
     prompt = build_director_prompt(game, latest_narration, config)
 
-    for attempt in range(2):
-        try:
-            msgs = [{"role": "user", "content": prompt}]
-            if attempt > 0:
-                msgs.append({"role": "assistant", "content": "{"})
+    try:
+        response = _api_create_with_retry(
+            client, max_retries=1,
+            model=DIRECTOR_MODEL, max_tokens=1200,
+            system=DIRECTOR_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+            output_config={"format": {"type": "json_schema", "schema": DIRECTOR_OUTPUT_SCHEMA}},
+        )
+        guidance = json.loads(response.content[0].text)
 
-            response = _api_create_with_retry(
-                client, max_retries=1,
-                model=DIRECTOR_MODEL, max_tokens=1200,
-                system=DIRECTOR_SYSTEM,
-                messages=msgs,
-            )
-            text = response.content[0].text
-            if attempt > 0:
-                text = "{" + text
+        # Convert npc_guidance from array (schema) to dict (internal format)
+        # Array format: [{"npc_id": "npc_1", "guidance": "..."}]
+        # Dict format:  {"npc_1": "..."} — used by narrator prompts and savegames
+        if isinstance(guidance.get("npc_guidance"), list):
+            guidance["npc_guidance"] = {
+                item["npc_id"]: item["guidance"]
+                for item in guidance["npc_guidance"]
+                if item.get("npc_id") and item.get("guidance")
+            }
 
-            # Check if response was truncated
-            stop = getattr(response, 'stop_reason', None)
-            if stop == 'max_tokens':
-                log(f"[Director] Attempt {attempt + 1}/2: response truncated (max_tokens)", level="warning")
-                # Try to salvage truncated JSON by closing open brackets
-                text = _close_truncated_json(text)
-
-            match = re.search(r'\{[\s\S]*\}', text)
-            if match:
-                raw_json = match.group()
-                try:
-                    guidance = json.loads(raw_json)
-                except json.JSONDecodeError as je:
-                    log(f"[Director] Raw JSON parse failed ({je}), attempting repair...", level="warning")
-                    repaired = _repair_json(raw_json)
-                    try:
-                        guidance = json.loads(repaired)
-                        log("[Director] JSON repair successful")
-                    except json.JSONDecodeError as je2:
-                        # Log failing JSON for diagnosis
-                        log(f"[Director] Repair also failed ({je2}). Raw JSON tail: ...{raw_json[-300:]}", level="warning")
-                        raise
-                log(f"[Director] Guidance: pacing={guidance.get('pacing','?')}, "
-                    f"reflections={len(guidance.get('npc_reflections', []))}, "
-                    f"summary={guidance.get('scene_summary', '')[:80]}")
-                return guidance
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            log(f"[Director] Attempt {attempt + 1}/2 failed: {e}", level="warning")
-        except Exception as e:
-            log(f"[Director] API error: {e}", level="warning")
-            break
-
-    log("[Director] All attempts failed, continuing without guidance", level="warning")
-    return {}
+        log(f"[Director] Guidance: pacing={guidance.get('pacing','?')}, "
+            f"reflections={len(guidance.get('npc_reflections', []))}, "
+            f"summary={guidance.get('scene_summary', '')[:80]}")
+        return guidance
+    except Exception as e:
+        log(f"[Director] Structured output failed ({type(e).__name__}: {e}), "
+            f"continuing without guidance", level="warning")
+        return {}
 
 
 def _apply_director_guidance(game: GameState, guidance: dict):
@@ -3273,6 +3590,20 @@ def _apply_director_guidance(game: GameState, guidance: dict):
         "arc_notes": guidance.get("arc_notes", ""),
     }
 
+    # Handle act transition: Director signals that the current act's
+    # transition_trigger has been fulfilled → mark in blueprint
+    if guidance.get("act_transition") and game.story_blueprint:
+        bp = game.story_blueprint
+        bp.setdefault("triggered_transitions", [])
+        act = get_current_act(game)
+        act_idx = act.get("act_number", 1) - 1
+        act_id = f"act_{act_idx}"
+        if act_id not in bp["triggered_transitions"]:
+            bp["triggered_transitions"].append(act_id)
+            trigger_text = act.get("transition_trigger", "?")
+            log(f"[Director] Act transition triggered: act {act.get('act_number')} "
+                f"'{act.get('phase')}' → trigger fulfilled: '{trigger_text[:80]}'")
+
     # Enrich the latest session log entry with Director's summary
     if guidance.get("scene_summary") and game.session_log:
         game.session_log[-1]["rich_summary"] = guidance["scene_summary"]
@@ -3288,11 +3619,17 @@ def _apply_director_guidance(game: GameState, guidance: dict):
         reflection_text = ref.get("reflection", "")
         if not reflection_text:
             continue
+        # Reject truncated reflections (max_tokens cutoff)
+        if not reflection_text.rstrip().endswith(('.', '!', '?', '"', '»', '…', ')', '–', '—')):
+            log(f"[Director] Rejected truncated reflection for {npc.get('name','?')}: "
+                f"'{reflection_text[:60]}'", level="warning")
+            continue
 
         npc["memory"].append({
             "scene": game.scene_count,  # Track when reflection was generated
             "event": reflection_text,
             "emotional_weight": ref.get("tone", "reflective"),  # Narrative compound (e.g. "protective_guilt")
+            "tone": ref.get("tone", ""),        # Preserve narrative compound separately for arc tracking
             "tone_key": ref.get("tone_key", ""),  # Machine-readable single word from enum
             "importance": 8,  # Reflections are always important
             "type": "reflection",
@@ -3302,8 +3639,8 @@ def _apply_director_guidance(game: GameState, guidance: dict):
         npc["last_reflection_scene"] = game.scene_count
 
         # Fill empty agenda/instinct if Director suggested them
-        suggested_agenda = ref.get("agenda", "").strip()
-        suggested_instinct = ref.get("instinct", "").strip()
+        suggested_agenda = (ref.get("agenda") or "").strip()
+        suggested_instinct = (ref.get("instinct") or "").strip()
         if suggested_agenda and not npc.get("agenda", "").strip():
             npc["agenda"] = suggested_agenda
             log(f"[Director] Agenda set for {npc['name']}: '{suggested_agenda}'")
@@ -3312,7 +3649,7 @@ def _apply_director_guidance(game: GameState, guidance: dict):
             log(f"[Director] Instinct set for {npc['name']}: '{suggested_instinct}'")
 
         # Update description if Director provided a meaningful character description
-        new_desc = ref.get("updated_description", "").strip()
+        new_desc = (ref.get("updated_description") or "").strip()
         # Safety net: strip prompt-leak prefixes the AI may copy literally
         new_desc = re.sub(r'^(?:SIDEBAR\s*(?:LABEL)?[:\-—]\s*)', '', new_desc, flags=re.IGNORECASE).strip()
         # Strip redundant NPC name prefix ("Detective Vance:", "Sarah Vance –", etc.)
@@ -3325,13 +3662,14 @@ def _apply_director_guidance(game: GameState, guidance: dict):
                 rf'^(?:{name_pattern})(?:\s+(?:{name_pattern}))*\s*[:\-—]\s*',
                 '', new_desc, count=1, flags=re.IGNORECASE
             ).strip()
-        # Fix truncated descriptions: trim trailing comma, dash, open clause
-        new_desc = re.sub(r'[,;\-—–\s]+$', '', new_desc).strip()
         if new_desc and len(new_desc) > 10:
-            # Reject scene snapshots: too long or starts with action verbs
+            # Reject scene snapshots: too long
             if len(new_desc) > 200:
                 log(f"[Director] Rejected description for {npc['name']}: "
                     f"too long ({len(new_desc)} chars), likely scene snapshot")
+            elif not _is_complete_description(new_desc) and npc.get("description", ""):
+                log(f"[Director] Rejected truncated description for {npc['name']}: "
+                    f"'{new_desc[:60]}' — keeping existing")
             else:
                 old_desc = npc.get("description", "")
                 npc["description"] = new_desc
@@ -3440,9 +3778,16 @@ def _activated_npcs_block(activated: list[dict], target_id: Optional[str],
             else:
                 mem_hint = f' recent="{memories[0].get("event","")[:60]}({memories[0].get("emotional_weight","")})"'
 
+        # Spatial hint: show last location if different from player's current location
+        loc_hint = ""
+        npc_loc = npc.get("last_location", "")
+        player_loc = game.current_location or ""
+        if npc_loc and player_loc and npc_loc.lower() != player_loc.lower():
+            loc_hint = f' last_seen="{npc_loc}"'
+
         parts.append(
             f'<activated_npc name="{npc["name"]}" disposition="{npc["disposition"]}" '
-            f'bond="{npc["bond"]}"{mem_hint}/>'
+            f'bond="{npc["bond"]}"{mem_hint}{loc_hint}/>'
         )
     return "\n".join(parts)
 
@@ -3452,16 +3797,24 @@ def _known_npcs_string(mentioned: list[dict], game: GameState,
     """Build compact known-NPCs line for name-only mentions.
     Also includes remaining active/background NPCs not in activated or mentioned."""
     exclude_ids = exclude_ids or set()
+    player_loc = (game.current_location or "").lower()
     parts = []
+
+    def _npc_entry(n):
+        entry = f'{n["name"]}({n["disposition"]})'
+        if n.get("status") == "background":
+            entry += "[bg]"
+        # Spatial hint: show last location if different from player
+        npc_loc = n.get("last_location", "")
+        if npc_loc and player_loc and npc_loc.lower() != player_loc:
+            entry += f'[at:{npc_loc}]'
+        return entry
 
     # Mentioned NPCs (scored but below activation threshold)
     for n in mentioned:
         if n.get("id") in exclude_ids:
             continue
-        entry = f'{n["name"]}({n["disposition"]})'
-        if n.get("status") == "background":
-            entry += "[bg]"
-        parts.append(entry)
+        parts.append(_npc_entry(n))
         exclude_ids.add(n.get("id"))
 
     # Remaining active NPCs not yet included
@@ -3470,10 +3823,7 @@ def _known_npcs_string(mentioned: list[dict], game: GameState,
             continue
         if n.get("status") not in ("active", "background"):
             continue
-        entry = f'{n["name"]}({n["disposition"]})'
-        if n.get("status") == "background":
-            entry += "[bg]"
-        parts.append(entry)
+        parts.append(_npc_entry(n))
 
     return ", ".join(parts) or "none"
 
@@ -3507,6 +3857,7 @@ def _pacing_block(game: GameState, chaos_interrupt: Optional[str] = None,
 
 def _npcs_present_string(game: GameState) -> str:
     """Build <npcs_present> content including aliases so Narrator recognizes known NPCs."""
+    player_loc = (game.current_location or "").lower()
     parts = []
     for n in game.npcs:
         if n.get("status") != "active":
@@ -3514,6 +3865,9 @@ def _npcs_present_string(game: GameState) -> str:
         entry = f'{n["name"]}:{n["disposition"]}'
         if n.get("aliases"):
             entry += f'(aka {",".join(n["aliases"])})'
+        npc_loc = n.get("last_location", "")
+        if npc_loc and player_loc and npc_loc.lower() != player_loc:
+            entry += f'[at:{npc_loc}]'
         parts.append(entry)
     return ", ".join(parts) or "none"
 
@@ -3572,24 +3926,7 @@ def build_dialog_prompt(game: GameState, brain: dict, player_words: str = "",
 {npc}{npcs_section}{wl}{crisis}
 {pacing}{director_block}
 {_story_context_block(game)}</scene>
-<task>2-3 paragraphs. After narration append invisible metadata:
-- If ANY named character appears who is NOT listed in <known_npcs>, add a <new_npcs> block
-- If a known NPC is revealed to have a DIFFERENT true name (unmasking, alias reveal), add a <npc_rename> block INSTEAD of <new_npcs>
-- If you INVENTED a surname or other new biographical fact for a known NPC, add a <npc_details> block
-- If a known NPC's role or situation CHANGED significantly from their <npcs_present> description, update via <npc_details> with a new "description"
-- Always add <memory_updates> for NPCs involved in this scene
-- Always add <scene_context>
-- If the character MOVED to a different location in this scene, add <location_update> with the new location name
-- If significant time passed in this scene (minutes+), add <time_update> with the current time phase
-- If <director_guidance> is present, follow its narrative direction while maintaining your creative voice
-</task>
-<npc_rename>[{{"npc_id":"id_or_name","new_name":"revealed true name"}}]</npc_rename>
-<new_npcs>[{{"name":"","description":"1 sentence in {lang}","disposition":"neutral|friendly|distrustful|hostile|loyal"}}]</new_npcs>
-<npc_details>[{{"npc_id":"id_or_name","full_name":"opt. full name","description":"opt. updated 1-sentence role/situation in {lang}"}}]</npc_details>
-<memory_updates>[{{"npc_id":"id_or_name","event":"what happened (in {lang})","emotional_weight":"ONE English word: neutral|curious|wary|angry|grateful|suspicious|terrified|loyal|conflicted|betrayed|devastated|euphoric"}}]</memory_updates>
-<scene_context>updated context</scene_context>
-<location_update>new location name (only if moved)</location_update>
-<time_update>early_morning|morning|midday|afternoon|evening|late_evening|night|deep_night</time_update>"""
+<task>2-3 paragraphs of immersive narration. Focus entirely on atmosphere, dialog, and character interaction. If <director_guidance> is present, follow its narrative direction while maintaining your creative voice.</task>"""
 
 
 def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
@@ -3676,24 +4013,7 @@ def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
 {npc}{npcs_section}{wl}{flags}{agency}
 {pacing}{director_block}
 {_story_context_block(game)}</scene>
-<task>2-4 paragraphs. After narration append invisible metadata:
-- If ANY named character appears who is NOT listed in <known_npcs>, add a <new_npcs> block
-- If a known NPC is revealed to have a DIFFERENT true name (unmasking, alias reveal), add a <npc_rename> block INSTEAD of <new_npcs>
-- If you INVENTED a surname or other new biographical fact for a known NPC, add a <npc_details> block
-- If a known NPC's role or situation CHANGED significantly from their <npcs_present> description, update via <npc_details> with a new "description"
-- Always add <memory_updates> for NPCs involved in this scene
-- Always add <scene_context>
-- If the character MOVED to a different location in this scene, add <location_update> with the new location name
-- If significant time passed in this scene (minutes+), add <time_update> with the current time phase
-- If <director_guidance> is present, follow its narrative direction while maintaining your creative voice
-</task>
-<npc_rename>[{{"npc_id":"id_or_name","new_name":"revealed true name"}}]</npc_rename>
-<new_npcs>[{{"name":"","description":"1 sentence in {lang}","disposition":"neutral|friendly|distrustful|hostile|loyal"}}]</new_npcs>
-<npc_details>[{{"npc_id":"id_or_name","full_name":"opt. full name","description":"opt. updated 1-sentence role/situation in {lang}"}}]</npc_details>
-<memory_updates>[{{"npc_id":"id_or_name","event":"what happened (in {lang})","emotional_weight":"ONE English word: neutral|curious|wary|angry|grateful|suspicious|terrified|loyal|conflicted|betrayed|devastated|euphoric"}}]</memory_updates>
-<scene_context>updated context</scene_context>
-<location_update>new location name (only if moved)</location_update>
-<time_update>early_morning|morning|midday|afternoon|evening|late_evening|night|deep_night</time_update>"""
+<task>2-4 paragraphs of immersive narration. If <director_guidance> is present, follow its narrative direction while maintaining your creative voice.</task>"""
 
 
 # ===============================================================
@@ -3728,6 +4048,7 @@ def _process_game_data(game: GameState, data: dict, force_npcs: bool = True):
             nd.setdefault("keywords", [])
             nd.setdefault("importance_accumulator", 0)
             nd.setdefault("last_reflection_scene", 0)
+            nd.setdefault("last_location", game.current_location or "")
             nd["memory"] = [
                 m if isinstance(m, dict) else {"scene": 0, "event": str(m), "emotional_weight": "neutral"}
                 for m in nd["memory"]
@@ -3741,9 +4062,6 @@ def _process_game_data(game: GameState, data: dict, force_npcs: bool = True):
                     m["importance"] = imp
                     m["type"] = m.get("type", "observation")
                     m["_score_debug"] = f"opening game_data | {dbg}"
-            # Auto-generate keywords if missing
-            if not nd["keywords"]:
-                nd["keywords"] = _auto_generate_keywords(nd)
         # Filter out NPCs that match the player character name
         player_lower = game.player_name.lower().strip()
         data["npcs"] = [
@@ -3771,16 +4089,18 @@ def _process_game_data(game: GameState, data: dict, force_npcs: bool = True):
 
 
 def parse_narrator_response(game: GameState, raw: str) -> str:
+    """Parse narrator response: extract game_data (opening scenes) and clean prose.
+    Metadata extraction (memory_updates, scene_context, NPCs, etc.) is handled
+    separately by call_narrator_metadata() — this function only strips leaked
+    metadata from the prose to keep it player-facing clean."""
     narration = raw
 
-    # --- 1) Tagged game_data (opening scene) ---
+    # --- 1) Tagged game_data (opening scene / new chapter) ---
     gd = re.search(r'<game_data>([\s\S]*?)</game_data>', narration)
     if gd:
         log(f"[Parser] Step 1: Found <game_data> tag ({len(gd.group(1))} chars)")
         try:
             data = json.loads(gd.group(1))
-            # Only allow force_npcs=True (full NPC replacement) in opening scene.
-            # Mid-game game_data tags are AI hallucinations — merge only, never replace.
             if game.scene_count <= 1:
                 _process_game_data(game, data)
             else:
@@ -3793,7 +4113,6 @@ def parse_narrator_response(game: GameState, raw: str) -> str:
 
     # --- 1.5) Untagged game_data (Narrator omitted XML tags) ---
     if not gd:
-        # Look for a JSON object containing "npcs" key (opening scene data without tags)
         npcs_obj_match = re.search(r'\{[\s\S]*?"npcs"\s*:\s*\[', narration)
         if npcs_obj_match:
             log(f"[Parser] Step 1.5: Found untagged game_data JSON at pos {npcs_obj_match.start()}")
@@ -3803,374 +4122,83 @@ def parse_narrator_response(game: GameState, raw: str) -> str:
                 data, end_idx = decoder.raw_decode(narration, start)
                 if isinstance(data, dict) and (data.get("npcs") or data.get("clocks")):
                     _process_game_data(game, data)
-                    # Remove the JSON block from narration
                     narration = (narration[:start].rstrip() + "\n" + narration[start + end_idx:].lstrip()).strip()
             except (json.JSONDecodeError, ValueError) as e:
                 log(f"[Parser] Step 1.5: Failed to parse untagged game_data: {e}", level="warning")
 
-    # --- 1.6) Tagged npc_rename (identity reveals / NPC merging) ---
-    rename_match = re.search(r'<npc_rename>([\s\S]*?)</npc_rename>', narration)
-    if rename_match:
-        log(f"[Parser] Step 1.6: Found <npc_rename> tag: {rename_match.group(1)[:200]}")
-        _process_npc_renames(game, rename_match.group(1))
-        narration = re.sub(r'<npc_rename>[\s\S]*?</npc_rename>', '', narration).strip()
+    # --- 2) Strip all XML metadata tags (narrator may still emit them from history) ---
+    narration = re.sub(r'<(?:npc_rename|new_npcs|npc_details|memory_updates|scene_context|'
+                       r'location_update|time_update|game_data)>[\s\S]*?</(?:npc_rename|new_npcs|'
+                       r'npc_details|memory_updates|scene_context|location_update|time_update|'
+                       r'game_data)>', '', narration).strip()
+    # Strip prompt-echo tags (narrator sometimes echoes input XML)
+    narration = re.sub(r'</?(?:task|scene|world|character|situation|conflict|possible_endings|'
+                       r'session_log|npc|returning_npc|campaign_history|chapter|story_arc|'
+                       r'story_ending|momentum_burn)[^>]*>', '', narration).strip()
 
-    # --- 1.7) Tagged new_npcs (mid-game NPC discovery) ---
-    new_npc_match = re.search(r'<new_npcs>([\s\S]*?)</new_npcs>', narration)
-    if new_npc_match:
-        log(f"[Parser] Step 1.7: Found <new_npcs> tag: {new_npc_match.group(1)[:200]}")
-        _process_new_npcs(game, new_npc_match.group(1))
-        narration = re.sub(r'<new_npcs>[\s\S]*?</new_npcs>', '', narration).strip()
+    # --- 3) Strip code fences ---
+    narration = re.sub(r'```(?:\w+)?\s*[\s\S]*?```', '', narration).strip()
+    narration = re.sub(r'^\s*```(?:\w+)?\s*$', '', narration, flags=re.MULTILINE).strip()
 
-    # --- 1.8) Tagged npc_details (narrator established new facts about known NPCs) ---
-    details_match = re.search(r'<npc_details>([\s\S]*?)</npc_details>', narration)
-    if details_match:
-        log(f"[Parser] Step 1.8: Found <npc_details> tag: {details_match.group(1)[:200]}")
-        _process_npc_details(game, details_match.group(1))
-        narration = re.sub(r'<npc_details>[\s\S]*?</npc_details>', '', narration).strip()
-
-    # --- 2) Tagged memory_updates ---
-    mem = re.search(r'<memory_updates>([\s\S]*?)</memory_updates>', narration)
-    if mem:
-        log(f"[Parser] Step 2: Found <memory_updates> tag: {mem.group(1)[:200]}")
-        _apply_memory_updates(game, mem.group(1))
-        narration = re.sub(r'<memory_updates>[\s\S]*?</memory_updates>', '', narration).strip()
-
-    # --- 3) Tagged scene_context ---
-    ctx = re.search(r'<scene_context>([\s\S]*?)</scene_context>', narration)
-    if ctx:
-        game.current_scene_context = ctx.group(1).strip()
-        narration = re.sub(r'<scene_context>[\s\S]*?</scene_context>', '', narration).strip()
-
-    # --- 3.1) Tagged location_update (narrator detected character movement) ---
-    loc_upd = re.search(r'<location_update>([\s\S]*?)</location_update>', narration)
-    if loc_upd:
-        new_loc = loc_upd.group(1).strip()
-        if new_loc and new_loc.lower() not in ("none", "null", "same", ""):
-            log(f"[Parser] Step 3.1: Narrator location_update → '{new_loc}'")
-            update_location(game, new_loc)
-        narration = re.sub(r'<location_update>[\s\S]*?</location_update>', '', narration).strip()
-
-    # --- 3.2) Tagged time_update (narrator detected time passage) ---
-    time_upd = re.search(r'<time_update>([\s\S]*?)</time_update>', narration)
-    if time_upd:
-        new_time = time_upd.group(1).strip().lower().replace(" ", "_")
-        if new_time in TIME_PHASES:
-            log(f"[Parser] Step 3.2: Narrator time_update → '{new_time}'")
-            game.time_of_day = new_time
-        narration = re.sub(r'<time_update>[\s\S]*?</time_update>', '', narration).strip()
-
-    # --- 4) Strip ALL remaining XML tags with content ---
-    narration = re.sub(r'<[^>]+>[\s\S]*?</[^>]+>', '', narration).strip()
-    narration = re.sub(r'<[^>]+/>', '', narration).strip()
-
-    # --- 4.5) Bracket-format metadata (Narrator sometimes uses [tag] instead of <tag>) ---
-    # Patterns: "[memory_updates]", "[scene_context] ...", "[memory_updates]\n[{json}]"
-    # Also handles multi-line scene_context that continues after the tag line.
-
-    # Catch "[scene_context] rest of text" → everything from this tag to end is metadata
-    # (scene_context often spans multiple lines when it's the last block)
-    bracket_ctx = re.search(
-        r'^\[scene[_\s-]*context\]\s*(.+)', narration, re.IGNORECASE | re.MULTILINE | re.DOTALL)
-    if bracket_ctx:
-        # Grab everything after the tag →
-        remaining = bracket_ctx.group(1).strip()
-        # If there's a next bracket tag, only take up to that point
-        next_bracket = re.search(r'^\[(?:memory|scene|location)', remaining, re.IGNORECASE | re.MULTILINE)
-        if next_bracket:
-            val = remaining[:next_bracket.start()].strip()
-            rest_after = remaining[next_bracket.start():]
-        else:
-            val = remaining
-            rest_after = ""
-        if val:
-            game.current_scene_context = val
-        narration = narration[:bracket_ctx.start()].rstrip()
-        if rest_after:
-            narration = narration + "\n" + rest_after
-        narration = narration.strip()
-
-    # Catch "[npc_rename]" standalone or with inline content, possibly followed by JSON
-    bracket_rename = re.search(
-        r'^\[npc[_\s-]*renames?\][ \t]*(.*)$', narration, re.IGNORECASE | re.MULTILINE)
-    if bracket_rename:
-        inline = bracket_rename.group(1).strip()
-        before = narration[:bracket_rename.start()].rstrip()
-        after = narration[bracket_rename.end():].lstrip()
-        if inline and inline.startswith('['):
-            _process_npc_renames(game, inline)
-        else:
-            json_after = re.match(r'(\[[\s\S]*?\])', after)
-            if json_after:
-                _process_npc_renames(game, json_after.group(1))
-                after = after[json_after.end():].lstrip()
-        narration = (before + "\n" + after).strip()
-
-    # Catch "[new_npcs]" standalone or with inline content, possibly followed by JSON
-    bracket_new_npcs = re.search(
-        r'^\[new[_\s-]*npcs?\][ \t]*(.*)$', narration, re.IGNORECASE | re.MULTILINE)
-    if bracket_new_npcs:
-        inline = bracket_new_npcs.group(1).strip()
-        before = narration[:bracket_new_npcs.start()].rstrip()
-        after = narration[bracket_new_npcs.end():].lstrip()
-        if inline and inline.startswith('['):
-            _process_new_npcs(game, inline)
-        else:
-            json_after = re.match(r'(\[[\s\S]*?\])', after)
-            if json_after:
-                _process_new_npcs(game, json_after.group(1))
-                after = after[json_after.end():].lstrip()
-        narration = (before + "\n" + after).strip()
-
-    # Catch "[memory_updates]" standalone or with inline content, possibly followed by JSON
-    bracket_mem = re.search(
-        r'^\[memory[_\s-]*updates?\][ \t]*(.*)$', narration, re.IGNORECASE | re.MULTILINE)
-    if bracket_mem:
-        inline = bracket_mem.group(1).strip()
-        before = narration[:bracket_mem.start()].rstrip()
-        after = narration[bracket_mem.end():].lstrip()
-        # Inline JSON or JSON on next line
-        if inline and inline.startswith('['):
-            _apply_memory_updates(game, inline)
-        else:
-            json_after = re.match(r'(\[[\s\S]*?\])', after)
-            if json_after:
-                _apply_memory_updates(game, json_after.group(1))
-                after = after[json_after.end():].lstrip()
-        narration = (before + "\n" + after).strip()
-
-    # Catch any remaining standalone bracket labels (including [scene_context] without content)
-    narration = re.sub(
-        r'^\[(?:memory[_\s-]*updates?|scene[_\s-]*context|new[_\s-]*npcs?|npc[_\s-]*renames?|npc[_\s-]*details?|location)\][ \t]*.*$',
-        '', narration, flags=re.IGNORECASE | re.MULTILINE).strip()
-
-    # --- 5) Strip markdown code fences (``` blocks) ---
-    # Extract and process JSON content inside code blocks before removing
-    for code_match in re.finditer(r'```(?:json)?\s*([\s\S]*?)```', narration):
-        code_content = code_match.group(1).strip()
-        # Try to extract game_data, memory_updates or scene_context from code blocks
-        if '"npcs"' in code_content or '"clocks"' in code_content:
-            # game_data block in code fence
-            try:
-                data = json.loads(code_content)
-                if isinstance(data, dict) and (data.get("npcs") or data.get("clocks")):
-                    _process_game_data(game, data, force_npcs=False)
-            except json.JSONDecodeError:
-                pass
-        elif '"npc_id"' in code_content and '"new_name"' in code_content:
-            # npc_rename data in code fence
-            _process_npc_renames(game, code_content)
-        elif '"npc_id"' in code_content and '"full_name"' in code_content:
-            # npc_details data in code fence (surname establishment)
-            _process_npc_details(game, code_content)
-        elif '"npc_id"' in code_content:
-            _apply_memory_updates(game, code_content)
-        elif '"disposition"' in code_content and '"name"' in code_content and '"npc_id"' not in code_content:
-            # Likely new_npcs data in code fence (has name+disposition but no npc_id)
-            _process_new_npcs(game, code_content)
-        elif not code_content.startswith('{'):
-            # Plain text in code block might be scene_context
-            game.current_scene_context = code_content
-        else:
-            try:
-                obj = json.loads(code_content)
-                if isinstance(obj, dict):
-                    if obj.get("scene_context"):
-                        game.current_scene_context = obj["scene_context"]
-                        if obj.get("time_of_day") and obj["time_of_day"] in TIME_PHASES:
-                            game.time_of_day = obj["time_of_day"]
-                    if obj.get("location"):
-                        update_location(game, obj["location"])
-            except json.JSONDecodeError:
-                pass
-    narration = re.sub(r'```(?:json)?\s*[\s\S]*?```', '', narration).strip()
-
-    # --- 6) Untagged JSON arrays anywhere (memory updates without wrapper) ---
-    # Find the FIRST JSON array with npc_id  --  everything from there onward is metadata
-    json_arr_match = re.search(r'\[[\s]*\{[^[\]]*"(?:npc_id|event|emotional_weight)"', narration)
-    if json_arr_match:
-        before = narration[:json_arr_match.start()].rstrip()
-        after_section = narration[json_arr_match.start():]
-        # Extract all JSON arrays from the after section
-        for jm in re.finditer(r'\[[\s\S]*?\]', after_section):
-            _apply_memory_updates(game, jm.group())
-        # Any remaining non-JSON text after the array = scene_context
-        remaining = re.sub(r'\[[\s\S]*?\]', '', after_section).strip()
-        remaining = re.sub(r'```(?:json)?|```', '', remaining).strip()
-        if remaining and not remaining.startswith('{'):
-            game.current_scene_context = remaining
-        narration = before
-
-    # --- 7) Untagged single JSON objects (scene_context, location etc.) ---
-    for obj_match in re.finditer(r'\{[^{}]*"(?:scene_context|location|npc_id)"[^{}]*\}', narration):
-        try:
-            obj = json.loads(obj_match.group())
-            if obj.get("scene_context"):
-                game.current_scene_context = obj["scene_context"]
-                if obj.get("time_of_day") and obj["time_of_day"] in TIME_PHASES:
-                    game.time_of_day = obj["time_of_day"]
-            if obj.get("location"):
-                update_location(game, obj["location"])
-        except json.JSONDecodeError:
-            pass
+    # --- 4) Strip JSON arrays/objects that leaked into prose ---
+    narration = re.sub(r'\[[\s]*\{[^[\]]*"(?:npc_id|event|emotional_weight)"[\s\S]*$',
+                       '', narration).strip()
     narration = re.sub(r'\{[^{}]*"(?:scene_context|location|npc_id)"[^{}]*\}', '', narration).strip()
 
-    # --- 7.5) Markdown-formatted metadata paragraphs (e.g. **Scene Context:** ...) ---
-    _META_LABEL_RE = re.compile(
-        r'^[*_#\s]*(scene[\s_-]*context|memory[\s_-]*updates?|szenenkontext|location)\s*[*_#]*\s*[:=]\s*',
-        re.IGNORECASE | re.MULTILINE,
-    )
-    meta_match = _META_LABEL_RE.search(narration)
-    if meta_match:
-        # Everything from the label onward is metadata
-        before = narration[:meta_match.start()].rstrip()
-        after = narration[meta_match.end():].strip()
-        # Strip leading and trailing markdown formatting from value
-        val = re.sub(r'^[*_#\s]+', '', after).strip()
-        val = re.sub(r'[*_#]+$', '', val).strip()
-        label = meta_match.group(1).lower()
-        if val and ('scene' in label or 'szenen' in label):
-            game.current_scene_context = val
-        elif val and 'location' in label:
-            update_location(game, val)
-        narration = before
+    # --- 5) Strip bracket-format metadata labels ---
+    narration = re.sub(
+        r'^\[(?:memory[_\s-]*updates?|scene[_\s-]*context|new[_\s-]*npcs?|npc[_\s-]*renames?|'
+        r'npc[_\s-]*details?|location[_\s-]*update?|time[_\s-]*update?|game[_\s-]*data)\].*$',
+        '', narration, flags=re.IGNORECASE | re.MULTILINE).strip()
 
-    # --- 8) Trailing metadata lines ---
+    # --- 6) Strip markdown metadata labels (Scene Context:, etc.) ---
+    meta_match = re.search(
+        r'^[*_#\s]*(scene[\s_-]*context|memory[\s_-]*updates?|szenenkontext|location)\s*[*_#]*\s*[:=]\s*',
+        narration, re.IGNORECASE | re.MULTILINE,
+    )
+    if meta_match:
+        narration = narration[:meta_match.start()].rstrip()
+
+    # --- 7) Strip trailing JSON lines ---
     lines = narration.rstrip().split('\n')
     while lines:
         last = lines[-1].strip()
         if not last:
             lines.pop()
             continue
-        # JSON objects/arrays
-        if (last.startswith('{') or last.startswith('[')):
-            try:
-                parsed = json.loads(last)
-                if isinstance(parsed, dict):
-                    if parsed.get("scene_context"):
-                        game.current_scene_context = parsed["scene_context"]
-                        if parsed.get("time_of_day") and parsed["time_of_day"] in TIME_PHASES:
-                            game.time_of_day = parsed["time_of_day"]
-                    elif parsed.get("location"):
-                        update_location(game, parsed["location"])
-                elif isinstance(parsed, list):
-                    _apply_memory_updates(game, last)
-            except json.JSONDecodeError:
-                pass
+        if last.startswith(('{', '[')):
             lines.pop()
             continue
-        # Metadata prefix lines (scene_context:, memory_updates:, etc.)
-        # Strip leading markdown formatting before matching
         clean_last = re.sub(r'^[\s*_#]+', '', last)
-        if re.match(r'^(scene[\s_-]*context|memory[\s_-]*updates?|location|szenenkontext)\s*[:=]', clean_last, re.IGNORECASE):
-            val = re.sub(r'^[^:=]+[:=]\s*', '', clean_last).strip()
-            val = re.sub(r'[*_#]+$', '', val).strip()  # Strip trailing markdown
-            if val:
-                game.current_scene_context = val
-            lines.pop()
-            continue
-        # Lines that are clearly technical (contain JSON-like patterns mid-text)
-        if re.match(r'^[\[{"\s].*"(?:npc_id|npcs|clocks)"', last):
+        if re.match(r'^(scene[\s_-]*context|memory[\s_-]*updates?|location|szenenkontext)\s*[:=]',
+                    clean_last, re.IGNORECASE):
             lines.pop()
             continue
         break
-
     narration = '\n'.join(lines).rstrip()
 
-    # --- 8.5) Bold-bracket metadata blocks: **[char: state | location | threat | ...]** ---
-    # Narrator sometimes outputs scene_context as pipe-separated items in bold brackets
-    bracket_meta = re.search(r'\*{0,2}\[(?:[^\]]*\|){2,}[^\]]*\]\*{0,2}\s*$', narration)
-    if bracket_meta:
-        # Extract content between brackets as scene_context
-        inner = re.sub(r'^[\s*\[]+|[\]\s*]+$', '', bracket_meta.group()).strip()
-        if inner:
-            game.current_scene_context = inner
-        narration = narration[:bracket_meta.start()].rstrip()
-
-    # --- 9) NUCLEAR FALLBACK: find narrative boundary ---
-    # If any JSON/technical content still remains, find the last paragraph
-    # that ends with prose punctuation and cut everything after it
-    if re.search(r'"npc_id"|"npcs"|"clocks"|"scene_context"|"emotional_weight"|"event":', narration):
-        # Find the last line that ends with narrative punctuation
-        result_lines = []
-        found_end = False
-        for line in narration.split('\n'):
-            stripped = line.strip()
-            # Skip empty lines between paragraphs (keep them)
-            if not stripped:
-                if not found_end:
-                    result_lines.append(line)
-                continue
-            # If we haven't found the end yet, check if this line is narrative
-            if not found_end:
-                # Technical line detection
-                is_technical = bool(
-                    re.search(r'"npc_id"|"npcs"|"clocks"|"scene_context"|"emotional_weight"|"event"\s*:', stripped)
-                    or (stripped.startswith(('[', '{')) and '"' in stripped)
-                )
-                if is_technical:
-                    found_end = True
-                    # Try to extract data from this line
-                    if '"npc_id"' in stripped:
-                        # Try wrapping in array if needed
-                        try_json = stripped if stripped.startswith('[') else f'[{stripped}]'
-                        _apply_memory_updates(game, try_json)
-                    continue
-                result_lines.append(line)
-            # After finding end, try to extract useful data but don't add to narration
-            else:
-                if '"npc_id"' in stripped:
-                    try_json = stripped if stripped.startswith('[') else f'[{stripped}]'
-                    _apply_memory_updates(game, try_json)
-
-        narration = '\n'.join(result_lines).rstrip()
-
-    # --- 10) Final cleanup: strip trailing JSON blocks at the end ---
-    # Only strip if the narration ends with ] or } AND the bracket block
-    # starts on its own line (not embedded in prose)
-    if narration.rstrip().endswith((']', '}')):
-        # Find the last line that starts with [ or { and remove from there
-        lines_10 = narration.split('\n')
-        cut_idx = len(lines_10)
-        for i in range(len(lines_10) - 1, -1, -1):
-            stripped = lines_10[i].strip()
-            if stripped and (stripped[0] in '[{'):
-                cut_idx = i
-            elif stripped:
-                break  # Hit a non-bracket, non-empty line → stop
-        if cut_idx < len(lines_10):
-            narration = '\n'.join(lines_10[:cut_idx]).rstrip()
-
-    # --- 11) Strip markdown horizontal rules (---, ***, ___) ---
+    # --- 8) Strip markdown artifacts ---
     narration = re.sub(r'^\s*[-*_]{3,}\s*$', '', narration, flags=re.MULTILINE).strip()
-
-    # --- 12) FINAL SAFETY NET: catch any remaining bracket metadata that slipped through ---
-    # This catches patterns like "[memory_updates]", "[scene_context] ...", etc.
-    # that earlier steps might have missed due to formatting variations
-    narration = re.sub(
-        r'^\[(?:memory[_\s-]*updates?|scene[_\s-]*context|new[_\s-]*npcs?|npc[_\s-]*renames?|location|game[_\s-]*data)\].*$',
-        '', narration, flags=re.IGNORECASE | re.MULTILINE).strip()
-
-    # --- 13) Strip stray markdown artifacts (orphan bold/italic markers) ---
     narration = re.sub(r'\s*\*{1,3}\s*$', '', narration, flags=re.MULTILINE).rstrip()
+    # Strip markdown emphasis: ***bold-italic***, **bold**, *italic*
+    narration = re.sub(r'\*{3}(.+?)\*{3}', r'\1', narration)
+    narration = re.sub(r'\*{2}(.+?)\*{2}', r'\1', narration)
+    narration = re.sub(r'\*(.+?)\*', r'\1', narration)
+    # Strip orphaned asterisks (unclosed emphasis: opening * without matching close)
+    narration = re.sub(r'(?<!\*)\*(?!\*)', '', narration)
 
-    # --- 13.5) Strip stray code fence markers (empty ```json``` blocks or unclosed fences) ---
-    narration = re.sub(r'```(?:json|xml)?\s*```', '', narration).strip()
-    narration = re.sub(r'^\s*```(?:json|xml)?\s*$', '', narration, flags=re.MULTILINE).strip()
-
-    # --- 14) Normalize NPC dispositions to canonical values ---
+    # --- 9) Normalize NPC dispositions ---
     _normalize_npc_dispositions(game.npcs)
 
-    # --- 15) Mark NPCs as introduced if their name appears in visible text ---
+    # --- 10) Mark NPCs as introduced if their name appears in visible text ---
     narration_lower = narration.lower()
     for npc in game.npcs:
         if not npc.get("introduced", False) and npc.get("name"):
-            # Check if NPC name (or significant part) appears in visible narration
             name = npc["name"].strip()
             if name and name.lower() in narration_lower:
                 npc["introduced"] = True
 
-    # Summary log for debugging
+    # Summary log
     active = [n for n in game.npcs if n.get("status") == "active"]
     background = [n for n in game.npcs if n.get("status") == "background"]
     introduced = [n for n in active if n.get("introduced", False)]
@@ -4180,7 +4208,6 @@ def parse_narrator_response(game: GameState, raw: str) -> str:
     # Safety: if parser stripped everything, return a minimal fallback
     if not narration.strip():
         log("[Parser] WARNING: Narration empty after parsing — returning raw text excerpt", level="warning")
-        # Extract first substantial paragraph from raw response (before any metadata)
         for para in raw.split('\n\n'):
             clean_para = para.strip()
             if clean_para and not clean_para.startswith(('<', '{', '[', '```')):
@@ -4206,7 +4233,7 @@ def _apply_memory_updates(game: GameState, json_text: str):
             # Fuzzy fallback: try word-overlap matching before creating a stub
             # v0.9.29: additional first-name mismatch guard
             if not npc and u["npc_id"] and u["npc_id"] not in ("world", "player", ""):
-                fuzzy_candidate = _fuzzy_match_existing_npc(game, u["npc_id"])
+                fuzzy_candidate, _ = _fuzzy_match_existing_npc(game, u["npc_id"])
                 if fuzzy_candidate:
                     # Safety: if both names have 2+ words, verify first names aren't
                     # completely different (prevents "Marissa Chen" → "Mrs. Chen")
@@ -4231,7 +4258,14 @@ def _apply_memory_updates(game: GameState, json_text: str):
             # Auto-create NPC stub if not found (safety net when <new_npcs> was omitted)
             if not npc and u["npc_id"] and u["npc_id"] not in ("world", "player", ""):
                 npc_name = u["npc_id"]
-                if npc_name.lower().strip() != game.player_name.lower().strip():
+                # Skip technical ID references (e.g. "npc_4") — this is a Narrator
+                # reference error to an existing NPC, not a new character
+                if re.match(r'^npc_\d+$', npc_name, re.IGNORECASE):
+                    log(f"[NPC] Skipping auto-stub for technical ID reference: "
+                        f"{npc_name}", level="warning")
+                    continue
+                if npc_name.lower().strip() != game.player_name.lower().strip() \
+                        and not (set(npc_name.lower().split()) & set(game.player_name.lower().split())):
                     npc_id, _ = _next_npc_id(game)
                     npc = {
                         "id": npc_id,
@@ -4247,8 +4281,8 @@ def _apply_memory_updates(game: GameState, json_text: str):
                         "keywords": [],
                         "importance_accumulator": 0,
                         "last_reflection_scene": 0,
+                        "last_location": game.current_location or "",
                     }
-                    npc["keywords"] = _auto_generate_keywords(npc)
                     game.npcs.append(npc)
                     log(f"[NPC] Auto-created stub NPC from memory_update: {npc_name}")
 
@@ -4274,6 +4308,9 @@ def _apply_memory_updates(game: GameState, json_text: str):
 
                 # Update importance accumulator for reflection triggering
                 npc["importance_accumulator"] = npc.get("importance_accumulator", 0) + importance
+                # Track where this NPC was last seen (spatial consistency)
+                if game.current_location:
+                    npc["last_location"] = game.current_location
                 if npc["importance_accumulator"] >= REFLECTION_THRESHOLD:
                     npc["_needs_reflection"] = True
                     log(f"[NPC] {npc['name']} needs reflection "
@@ -4319,7 +4356,24 @@ def save_game(game: GameState, username: str, chat_messages: list = None,
     """Save game state and chat history. UI layer must provide username and chat_messages."""
     save_dir = _get_save_dir(username)
     save_dir.mkdir(parents=True, exist_ok=True)
+    # --- Version history: read existing save to carry forward ---
+    version_history = []
+    path = save_dir / f"{name}.json"
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            version_history = existing.get("version_history", [])
+            # Backfill: if old save had no version_history but had engine_version
+            if not version_history and existing.get("engine_version"):
+                version_history = [existing["engine_version"]]
+        except Exception:
+            pass
+    # Append current version only if it differs from last entry
+    if not version_history or version_history[-1] != VERSION:
+        version_history.append(VERSION)
     data = {"saved_at": datetime.now().isoformat()}
+    data["engine_version"] = VERSION
+    data["version_history"] = version_history
     data.update({k: getattr(game, k) for k in SAVE_FIELDS})
     # Chat history for visual restoration (strip audio binary data and transient recaps)
     raw_messages = chat_messages or []
@@ -4328,7 +4382,6 @@ def save_game(game: GameState, username: str, chat_messages: list = None,
         for msg in raw_messages
         if not msg.get("recap")
     ]
-    path = save_dir / f"{name}.json"
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     log(f"[Save] Game saved: {username}/{name} (Scene {game.scene_count}, {len(data['chat_messages'])} chat msgs)")
     return path
@@ -4354,6 +4407,10 @@ def load_game(username: str, name: str = "autosave") -> tuple[Optional[GameState
     # Backward compatibility: older saves don't have 'aliases' field
     for npc in game.npcs:
         npc.setdefault("aliases", [])
+    # Clean up self-aliases (bug in older versions: current name ended up in aliases list)
+    for npc in game.npcs:
+        name_lower = npc.get("name", "").lower()
+        npc["aliases"] = [a for a in npc.get("aliases", []) if a.lower() != name_lower]
     # Backward compatibility: migrate old "inactive" status to "background" (three-tier NPC system v0.9.14)
     for npc in game.npcs:
         if npc.get("status") == "inactive":
@@ -4396,10 +4453,13 @@ def get_save_info(username: str, name: str) -> dict | None:
             "chapter_number": data.get("chapter_number", 1),
             "saved_at": data.get("saved_at", ""),
             "setting_genre": data.get("setting_genre", ""),
+            "engine_version": data.get("engine_version", ""),
+            "version_history": data.get("version_history", []),
         }
     except Exception:
         return {"name": name, "player_name": "?", "scene_count": 0,
-                "chapter_number": 1, "saved_at": "", "setting_genre": ""}
+                "chapter_number": 1, "saved_at": "", "setting_genre": "",
+                "engine_version": "", "version_history": []}
 
 
 def list_saves_with_info(username: str) -> list[dict]:
@@ -4788,56 +4848,46 @@ def call_chapter_summary(client: anthropic.Anthropic, game: GameState,
     bp = game.story_blueprint or {}
     conflict = bp.get("central_conflict", "")
 
-    for attempt in range(3):
-        try:
-            response = _api_create_with_retry(
-                client, max_retries=1,
-                model=BRAIN_MODEL, max_tokens=400,
-                system=f"""Summarize an RPG chapter for campaign continuity. Return ONLY valid JSON.
+    try:
+        response = _api_create_with_retry(
+            client, max_retries=1,
+            model=BRAIN_MODEL, max_tokens=800,
+            system=f"""Summarize an RPG chapter for campaign continuity.
 - Write in {lang}
 - "title": A short evocative title for this chapter (3-6 words)
 - "summary": 3-4 sentences capturing key events, character growth, and how the chapter ended
 - "unresolved_threads": List of 1-3 open plot threads or tensions that could carry into the next chapter
 - "character_growth": 1 sentence on how the protagonist changed
+- "npc_evolutions": For each important NPC, project how they might have changed after the chapter's events. This is a PROJECTION for the time skip between chapters — not what happened, but what COULD plausibly have happened in the weeks/months after. Focus on relationship shifts, attitude changes, new circumstances. Only include NPCs who were meaningfully involved in the chapter.
+- "thematic_question": The core emotional/philosophical question this chapter raised but did not fully answer. This carries the vertical (emotional) narrative across chapters. Example: "Can you fix the damage caused by good intentions?" or "Is loyalty earned through competence or compassion?"
 """ + _kid_friendly_block(_cfg) + _content_boundaries_block(game),
-                messages=[{"role": "user", "content":
-                           f"character:{game.player_name} {E['dash']} {game.character_concept}\n"
-                           f"genre:{game.setting_genre} tone:{game.setting_tone}\n"
-                           f"world:{game.setting_description}\n"
-                           f"conflict:{conflict}\n"
-                           f"log:{log_text}\nnpcs:{npc_text}\n"
-                           f"location:{game.current_location}\n"
-                           f"situation:{game.current_scene_context}"}],
-            )
-            text = response.content[0].text
-            match = re.search(r'\{[\s\S]*\}', text)
-            if match:
-                raw_json = match.group()
-                try:
-                    data = json.loads(raw_json)
-                except json.JSONDecodeError:
-                    data = json.loads(_repair_json(raw_json))
-                data["chapter"] = game.chapter_number
-                data["scenes"] = game.scene_count
-                return data
-            # No JSON found — retry
-            log(f"[ChapterSummary] Attempt {attempt + 1}/3: no JSON in response", level="warning")
-        except json.JSONDecodeError:
-            log(f"[ChapterSummary] Attempt {attempt + 1}/3: invalid JSON", level="warning")
-        except Exception as e:
-            log(f"[ChapterSummary] Attempt {attempt + 1}/3 failed: {e}", level="warning")
-            if attempt < 2:
-                import time as _time
-                _time.sleep(2 ** attempt)
-    # Fallback (English — language-neutral)
-    return {
-        "chapter": game.chapter_number,
-        "title": f"Chapter {game.chapter_number}",
-        "summary": f"{game.player_name} had an adventure in {game.current_location}.",
-        "unresolved_threads": [],
-        "character_growth": "",
-        "scenes": game.scene_count,
-    }
+            messages=[{"role": "user", "content":
+                       f"character:{game.player_name} {E['dash']} {game.character_concept}\n"
+                       f"genre:{game.setting_genre} tone:{game.setting_tone}\n"
+                       f"world:{game.setting_description}\n"
+                       f"conflict:{conflict}\n"
+                       f"log:{log_text}\nnpcs:{npc_text}\n"
+                       f"location:{game.current_location}\n"
+                       f"situation:{game.current_scene_context}"}],
+            output_config={"format": {"type": "json_schema", "schema": CHAPTER_SUMMARY_OUTPUT_SCHEMA}},
+        )
+        data = json.loads(response.content[0].text)
+        data["chapter"] = game.chapter_number
+        data["scenes"] = game.scene_count
+        return data
+    except Exception as e:
+        log(f"[ChapterSummary] Structured output failed ({type(e).__name__}: {e}), "
+            f"using fallback", level="warning")
+        return {
+            "chapter": game.chapter_number,
+            "title": f"Chapter {game.chapter_number}",
+            "summary": f"{game.player_name} had an adventure in {game.current_location}.",
+            "unresolved_threads": [],
+            "character_growth": "",
+            "npc_evolutions": [],
+            "thematic_question": "",
+            "scenes": game.scene_count,
+        }
 
 
 def build_epilogue_prompt(game: GameState) -> str:
@@ -4902,6 +4952,12 @@ def generate_epilogue(client: anthropic.Anthropic, game: GameState,
     # Remove lines that start with [ or { (trailing JSON metadata)
     # Use MULTILINE so each line is checked independently (DOTALL would eat everything)
     narration = re.sub(r'^\s*[\[{].*$', '', narration, flags=re.MULTILINE)
+    # Strip redundant "Epilog/Epilogue" heading the narrator likes to add
+    # (the scene marker already labels this section visually)
+    narration = re.sub(
+        r'^\s*#*\s*\*{0,3}\s*(?:Epilog(?:ue)?|Épilogue|Epílogo|Epilogo)\s*\*{0,3}\s*\n+',
+        '', narration, count=1, flags=re.IGNORECASE
+    )
     narration = narration.strip()
 
     if not narration:
@@ -4932,6 +4988,19 @@ def build_new_chapter_prompt(game: GameState) -> str:
             bg_parts.append(entry)
         bg_names = ", ".join(bg_parts)
         npc_block += f'\n<background_npcs>Known but not recently active: {bg_names}</background_npcs>'
+
+    # NPC evolutions from the most recent chapter summary (time skip hints)
+    evolutions_block = ""
+    if game.campaign_history:
+        last_ch = game.campaign_history[-1]
+        evolutions = last_ch.get("npc_evolutions", [])
+        if evolutions:
+            evo_lines = "\n".join(
+                f'  {e["name"]}: {e["projection"]}'
+                for e in evolutions if e.get("name") and e.get("projection")
+            )
+            evolutions_block = f'\n<npc_evolutions hint="These are PROJECTIONS of how NPCs may have changed during the time skip. Use as inspiration, not as hard facts.">\n{evo_lines}\n</npc_evolutions>'
+
     story = _story_context_block(game)
     time_ctx = f'\n<time>{game.time_of_day}</time>' if game.time_of_day else ""
 
@@ -4941,12 +5010,13 @@ def build_new_chapter_prompt(game: GameState) -> str:
 <location>{game.current_location}</location>{time_ctx}
 <situation>{game.current_scene_context}</situation>
 {campaign}
-{npc_block}
+{npc_block}{evolutions_block}
 {story}</scene>
 <task>
 Chapter {game.chapter_number} opening: 3-4 paragraphs. This is a NEW chapter in an ongoing campaign.
 - Reference the character's history and relationships naturally (don't recap everything, just hint)
 - Some time has passed since last chapter. Show how the world/relationships evolved
+- Use <npc_evolutions> as hints for how NPCs may have changed — show their evolution through behavior, dialog, and atmosphere rather than exposition
 - Introduce a NEW tension or situation that builds on unresolved threads
 - Returning NPCs should feel familiar but may have changed
 - Introduce 1-2 NEW NPCs alongside returning characters
@@ -4990,6 +5060,26 @@ def start_new_chapter(client: anthropic.Anthropic, game: GameState,
     game.story_blueprint = {}  # Cleared; new blueprint generated after opening scene
     game.time_of_day = ""      # Reset -- new chapter, new time context
     game.location_history = []  # Reset -- new chapter, fresh location tracking
+    game.director_guidance = {}  # Reset -- old pacing/guidance shouldn't carry over
+
+    # Retire dead or irrelevant NPCs to background before new chapter
+    for npc in game.npcs:
+        if npc.get("status") != "active":
+            continue
+        name_lower = npc.get("name", "").lower()
+        desc_lower = npc.get("description", "").lower()
+        # Dead NPCs: name or description indicates death
+        is_dead = any(marker in name_lower for marker in ("(getötet)", "(killed)", "(dead)", "(tot)"))
+        is_dead = is_dead or any(marker in desc_lower for marker in ("getötet", "killed", "deceased", "gestorben"))
+        # Low-engagement NPCs: no bond, minimal memories, no agenda (filler NPCs)
+        is_filler = (npc.get("bond", 0) == 0
+                     and len(npc.get("memory", [])) <= 1
+                     and not npc.get("agenda", "").strip())
+        if is_dead or is_filler:
+            npc["status"] = "background"
+            reason = "dead" if is_dead else "low-engagement filler"
+            log(f"[Campaign] Retired NPC to background at chapter boundary: "
+                f"{npc['name']} ({reason})")
 
     # Keep NPCs but consolidate memories (keep significant ones across chapters)
     for npc in game.npcs:
@@ -5031,6 +5121,10 @@ def start_new_chapter(client: anthropic.Anthropic, game: GameState,
             continue
         old_npc["introduced"] = True  # Player knows them from previous chapter
         game.npcs.append(old_npc)
+
+    # Seed location_history with the new chapter's starting location
+    if game.current_location and not game.location_history:
+        game.location_history.append(game.current_location)
 
     # Choose story structure for new chapter
     structure = choose_story_structure(game.setting_tone)
@@ -5091,6 +5185,8 @@ def process_turn(client: anthropic.Anthropic, game: GameState,
                                      config=config)
         raw = call_narrator(client, prompt, game, config)
         narration = parse_narrator_response(game, raw)
+        metadata = call_narrator_metadata(client, narration, game, config)
+        _apply_narrator_metadata(game, metadata)
         # Mark first pending revelation as used (narrator was instructed to weave it in)
         if pending_revs:
             mark_revelation_used(game, pending_revs[0]["id"])
@@ -5118,7 +5214,7 @@ def process_turn(client: anthropic.Anthropic, game: GameState,
         director_ctx = None
         director_reason = _should_call_director(game, roll_result="dialog",
                                   chaos_used=bool(chaos_interrupt),
-                                  new_npcs_found='<new_npcs>' in raw,
+                                  new_npcs_found=bool(metadata.get("new_npcs")),
                                   revelation_used=bool(pending_revs))
         if director_reason:
             director_ctx = {"narration": narration, "config": config}
@@ -5171,6 +5267,8 @@ def process_turn(client: anthropic.Anthropic, game: GameState,
                                 config=config)
     raw = call_narrator(client, prompt, game, config)
     narration = parse_narrator_response(game, raw)
+    metadata = call_narrator_metadata(client, narration, game, config)
+    _apply_narrator_metadata(game, metadata)
     # Update chaos factor based on result
     update_chaos_factor(game, roll.result)
     # Record pacing
@@ -5203,7 +5301,7 @@ def process_turn(client: anthropic.Anthropic, game: GameState,
     director_ctx = None
     director_reason = _should_call_director(game, roll_result=roll.result,
                               chaos_used=bool(chaos_interrupt),
-                              new_npcs_found='<new_npcs>' in raw,
+                              new_npcs_found=bool(metadata.get("new_npcs")),
                               revelation_used=bool(pending_revs))
     if director_reason:
         director_ctx = {"narration": narration, "config": config}
@@ -5352,6 +5450,8 @@ def process_momentum_burn(client: anthropic.Anthropic, game: GameState,
 
     raw = call_narrator(client, prompt, game, config)
     narration = parse_narrator_response(game, raw)
+    metadata = call_narrator_metadata(client, narration, game, config)
+    _apply_narrator_metadata(game, metadata)
 
     # Update chaos after burn (new result counts)
     update_chaos_factor(game, new_result)

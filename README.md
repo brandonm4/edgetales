@@ -6,7 +6,7 @@
 [![NiceGUI](https://img.shields.io/badge/UI-NiceGUI-4CAF50?logo=vuedotjs&logoColor=white)](https://nicegui.io)
 [![Claude AI](https://img.shields.io/badge/AI-Claude%20Haiku%20%2B%20Sonnet-orange?logo=anthropic&logoColor=white)](https://anthropic.com)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-lightgrey)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.9.30-blueviolet)]()
+[![Version](https://img.shields.io/badge/Version-0.9.33-blueviolet)]()
 [![Mobile Ready](https://img.shields.io/badge/Mobile-PWA%20Ready-success?logo=pwa&logoColor=white)]()
 
 ---
@@ -34,7 +34,8 @@ EdgeTales is a self-hosted, AI-driven solo tabletop RPG engine. Type what your c
 - Dynamic NPC system with persistent memory, evolving dispositions, bonds, agendas, and mid-game discovery
 - NPC memory and reflection: characters remember what you did and form opinions over time - the Director periodically synthesises their accumulated experiences into higher-level insights that shape their future behaviour
 - AI-generated epilogues that wrap up your story with a satisfying conclusion
-- Campaign mode - continue into a new chapter with the same character, NPCs, and world
+- Story arc intelligence: each chapter gets a blueprint with act goals, transition triggers (narrative conditions, not scene numbers), a thematic thread, and possible endings - the Director steers act transitions based on what actually happens in the story
+- Campaign mode - continue into a new chapter with the same character, NPCs, and world. NPC evolution projections and thematic continuity carry across chapters
 
 **Mechanics** - *borrowed from the best tabletop RPGs*
 
@@ -79,12 +80,12 @@ The mechanics always run in the background regardless of display mode. The AI na
 
 **Epilogues & Campaigns**
 
-Stories in EdgeTales have a narrative arc. The engine tracks pacing, tension, and story structure behind the scenes using a blend of Kishōtenketsu and three-act models. When the story reaches its natural conclusion, you're offered a choice:
+Stories in EdgeTales have a narrative arc. The engine tracks pacing, tension, and story structure behind the scenes using a blend of Kishōtenketsu and three-act models, with act transitions driven by narrative conditions rather than fixed scene counts. When the story reaches its natural conclusion, you're offered a choice:
 
 - **Generate an Epilogue** - the AI writes a closing sequence that reflects on your character's journey, the relationships you built, and how the central conflict resolved. Pure narrative prose, no more dice rolls. Then you can start a **new chapter** (campaign mode) or begin something entirely new.
 - **Keep playing** - ignore the suggestion and continue the adventure. The offer won't bother you again.
 
-**Campaign mode** carries your character, stats, NPCs, and world into a new chapter. The AI summarises the previous chapter, your NPC relationships and their memories carry over, and unresolved story threads feed into the new arc. Mechanics reset (health, spirit, supply are restored), but your character's identity and history remain intact. It's the same person, a new adventure.
+**Campaign mode** carries your character, stats, NPCs, and world into a new chapter. The AI summarises the previous chapter — including how NPCs may have evolved during the time skip and what emotional questions remain open — and your NPC relationships and their memories carry over. Unresolved story threads and the previous chapter's character growth feed into the new story blueprint, creating emotional continuity across chapters. Mechanics reset (health, spirit, supply are restored), but your character's identity and history remain intact. It's the same person, a new adventure.
 
 **Safety Tools - Wishes & Boundaries**
 
@@ -185,13 +186,13 @@ Player types action
 
 **The Brain** receives the player's raw input along with the full game state and decides *what happens mechanically*: which move to roll, which stat to use, what position and effect apply, and whether the player is moving to a new location. It returns structured JSON - no prose, no creativity.
 
-**The Narrator** receives the Brain's analysis plus the dice result, and writes the scene. It produces atmospheric prose in the player's chosen narration language, plus hidden metadata: NPC updates, memory events, scene context changes, and new character introductions. The narrator never decides outcomes — it dramatises what the dice already determined.
+**The Narrator** receives the Brain's analysis plus the dice result, and writes the scene. It produces pure atmospheric prose in the player's chosen narration language — no metadata, no JSON, no technical markup. A separate metadata extractor (Haiku with Structured Outputs) then analyses the prose and extracts game state changes: NPC updates, memory events, scene context, location and time changes, and new character introductions. The narrator never decides outcomes — it dramatises what the dice already determined.
 
 **The Director** runs asynchronously after the narration is already displayed to the player — it never slows down gameplay. Think of it as the showrunner watching from behind the scenes. It analyses what just happened and provides strategic guidance: where should the story go next? Which NPCs have untapped potential? Is the pacing right? When enough has happened to a particular NPC (tracked via an importance accumulator), the Director writes a *reflection* — a higher-level insight about how that character views the player. These reflections feed back into future narrator prompts, giving NPCs the sense of evolving opinions and growing relationships.
 
 The Director also generates enriched scene summaries that replace the Brain's bare-bones log entries, giving the narrator better context about *why* things matter, not just *what* happened.
 
-A fourth agent — the **Story Architect** — runs once at game start and once per chapter start, using Sonnet to generate a story blueprint (3-act or Kishōtenketsu structure) with act goals, revelations, and possible endings. This blueprint guides pacing throughout the entire story without railroading the player.
+A fourth agent — the **Story Architect** — runs once at game start and once per chapter start, using Sonnet to generate a story blueprint (3-act or Kishōtenketsu structure) with act goals, transition triggers, revelations, a thematic thread, and possible endings. Each act has a narrative condition (the transition trigger) that signals when the story should advance to the next act — the Director evaluates these during play, allowing act transitions to follow the player's choices rather than rigid scene counts. The thematic thread carries the story's emotional core question across every scene, connecting individual moments to a larger narrative arc.
 
 ### Core Design Principle: AI Narrates, It Does Not Decide
 
@@ -276,7 +277,7 @@ If Chatterbox is not installed and you select it as your TTS backend in the sett
 | `anthropic` ≥ 0.30 | Claude AI API client | **Required** — auto-installed |
 | `reportlab` | PDF story export | **Required** — auto-installed |
 | `edge-tts` ≥ 6.1 | Online TTS (Microsoft Edge voices) | **Required** — auto-installed |
-| `stop-words` | NPC keyword stopword filtering (34+ languages) | **Required** — auto-installed |
+| `stop-words` | NPC duplicate detection stopword filtering | **Required** — auto-installed |
 | `nameparser` | NPC name/title detection (619 built-in titles) | **Required** — auto-installed |
 | `cryptography` | HTTPS auto-certificate generation | **Required** — auto-installed |
 | `faster-whisper` | Speech-to-text (STT) | **Required** — auto-installed. Models: tiny → large-v3 |

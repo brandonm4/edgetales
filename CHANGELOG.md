@@ -5,6 +5,131 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.33]
+
+### Added
+- **Structured Outputs for all JSON-returning AI calls:** Brain, Setup Brain, Director, Story Architect, and Chapter Summary now use Anthropic's Structured Outputs (`output_config` with `json_schema`) instead of free-form JSON with post-hoc repair. Schemas defined as module-level constants: `BRAIN_OUTPUT_SCHEMA`, `SETUP_BRAIN_OUTPUT_SCHEMA`, `DIRECTOR_OUTPUT_SCHEMA`, `STORY_ARCHITECT_OUTPUT_SCHEMA`, `CHAPTER_SUMMARY_OUTPUT_SCHEMA`
+- **Narrator metadata extraction via Two-Call pattern:** New `call_narrator_metadata()` uses Haiku with Structured Outputs (`NARRATOR_METADATA_SCHEMA`) to extract game state changes (scene_context, location, time, memory_updates, new_npcs, npc_renames, npc_details) from narrator prose in a separate call. `_apply_narrator_metadata()` delegates to existing `_process_*` functions via JSON roundtrip. Three callsites: dialog, action, momentum burn
+- **TF-IDF NPC activation:** New `_compute_npc_tfidf_scores()` replaces keyword-based NPC activation with zero-dependency TF-IDF cosine similarity. Builds NPC profiles from name, aliases, description, agenda, and last 5 memories. IDF naturally weights rare words (proper nouns, RPG terms) higher. Single computation per scene, shared across all NPCs. Max contribution raised 0.4 → 0.5 with noise threshold 0.05
+- **Simplified stopwords:** `_STOPWORDS` module-level constant (DE+EN, ~130 words) replaces the dynamic 18-language loading system. Used only by `_description_match_existing_npc()` for duplicate detection
+- **Cyrillic homoglyph sanitizer:** `_CYRILLIC_TO_LATIN` translation map (16 Cyrillic→Latin pairs) + context-aware `_fix_cyrillic_homoglyphs()` — only replaces Cyrillic chars in mixed-script words, preserves pure Cyrillic (Russian/Ukrainian) text. Applied in `call_narrator()`
+- **STT variant matching:** `_edit_distance_le1()` Levenshtein distance ≤ 1 function + Step 4 in `_fuzzy_match_existing_npc()`. Catches single-char STT transcription errors (Chan→Chen, Wang→Wong, Meyer→Meier). Title-aware safety rules prevent false positives. `_fuzzy_match_existing_npc()` returns `(npc, match_type)` tuple to distinguish identity reveals from STT variants
+- **NPC spatial tracking (`last_location`):** New field on every NPC, set at creation and updated on each memory. Prompt builders inject `last_seen` (activated NPCs) and `[at:Location]` (known NPCs) when location differs from player's current position. Expanded SPATIAL CONSISTENCY rule prevents narrator from having distant NPCs interact physically
+- **Narrative Continuity Pipeline:** Three-part system for richer chapter transitions informed by drama theory (serialized TV structure, RPG campaign arcs):
+  - **Chapter Summary extended:** `npc_evolutions` (projected NPC changes during time skip) and `thematic_question` (vertical emotional arc across chapters) added to `CHAPTER_SUMMARY_OUTPUT_SCHEMA`. Gives the Chapter Opening narrator concrete material for showing how the world evolved.
+  - **Transition Triggers:** `transition_trigger` field on every act in `STORY_ARCHITECT_OUTPUT_SCHEMA`. Narrative conditions (player actions or story events) that signal act completion, replacing rigid scene-number boundaries. `scene_range` retained as fallback. Director evaluates trigger fulfillment via `act_transition` boolean; `get_current_act()` uses dual logic (trigger-first, scene_range-fallback). Tracked in `story_blueprint["triggered_transitions"]`.
+  - **Thematic Thread:** `thematic_thread` field in blueprint, injected into every narrator prompt via `_story_context_block()`. Combined with `character_growth` + `thematic_question` from previous chapters, creates a vertical emotional narrative that persists across chapters.
+
+### Fixed
+- **Metadata Extractor silent failure:** `call_narrator_metadata()` used `extra_params={"output_config": ...}` instead of `output_config=...` as a direct kwarg. `_api_create_with_retry(**kwargs)` passed the nested dict to `client.messages.create()` which silently ignored the unknown parameter — Haiku responded as freetext instead of Structured Output, `json.loads()` failed, and the `except` block returned an empty fallback dict. Result: zero new NPCs discovered, zero memory updates, frozen scene_context across all scenes. Location/time updates still worked because they come from Brain, not the metadata extractor. Fix: single-line change from `extra_params={...}` to `output_config={...}`
+- **Player authorship — name/content correction:** Narrator "polished" player words beyond grammar, correcting typos (`thornwall` → `Thornhill`), converting numbers to words (`5` → `fünf`), and capitalizing informal text. New `PRESERVE EXACTLY` rule: only punctuation and sentence-start capitalization are permitted changes. Wrong names, typos, slang, and informal language are canonical — they represent what the character actually said
+- **Player authorship — invented dialog from action descriptions:** When player described a speech act without exact words (e.g. "I ask him about Thornhill and describe him"), the narrator invented specific quoted dialog with fabricated details (physical description the player never specified). New `DESCRIBED SPEECH` rule: action-described speech must be narrated as indirect speech or brief summary, never as invented quoted dialog for the player character
+- **Player character created as NPC:** Metadata extractor had no knowledge of the player character's name — saw it in narration and created it as `new_npcs`. Guard in `_process_new_npcs()` only checked exact full-name match (`"hermann" != "hermann speedlaser"` → passed). NPC then got renamed via `npc_details` to full player name, received Director agenda/instinct/reflections, and activated via TF-IDF on every scene. Fix: (a) metadata extractor prompt now includes `<player_character>` with explicit exclusion instruction, (b) all player-name guards (`_process_new_npcs`, `_process_npc_renames`, `_apply_memory_updates` auto-stub) upgraded from exact-match to name-part intersection (any shared word blocks creation)
+- **NPC descriptions as scene observations:** Metadata extractor produced event-like descriptions ("Der Chef, der laut Androhung Bernie zu Dünger verarbeiten könnte") instead of physical/role descriptions. New instruction: `description must be a PHYSICAL/ROLE description (appearance, occupation, species), NOT what they did in this scene`
+- **Cyrillic homoglyph contamination in narrator output:** Sonnet occasionally emits Cyrillic lookalike characters (е/U+0435 instead of e/U+0065, о/U+043E instead of o/U+006F, т/U+0442 instead of t/U+0074, etc.) in otherwise Latin text, producing visually broken words like `kniест` instead of `kniest`. New context-aware `_fix_cyrillic_homoglyphs()` only replaces Cyrillic chars in mixed-script words (Latin+Cyrillic in same word) — purely Cyrillic words (authentic Russian/Ukrainian) are left untouched. Applied in `call_narrator()` before return
+- **Deceased/mentioned characters created as NPCs:** Metadata extractor created NPCs for characters who were only mentioned in conversation or seen in photos, not physically present. Savegame evidence: "Tommy Chen" (deceased brother on photos) merged with "Wongs Mutter" (physically present) — extractor assigned the mentioned name to the present person's description, creating a ghost NPC with wrong identity, wrong memories, and an alias pointing to a completely different character. Fix: `call_narrator_metadata()` system prompt now explicitly distinguishes PHYSICALLY PRESENT characters (speaking, acting, reacting) from merely MENTIONED ones (in dialog, photos, memories, backstory). Exclusion list: deceased persons, historical/absent figures, unnamed roles. Anti-fusion rule: when a named person is mentioned in dialog but a different unnamed person is physically present, the NPC must be created for the physical person with their own name/description. Memory updates also restricted to physically present NPCs only
+- **STT transcription variants creating duplicate NPCs:** Voice input (faster-whisper STT) transcribed "Mrs. Chen" as "Mrs. Chan" and "Mr. Wong" as "Mr. Wang" — single-vowel differences that bypassed fuzzy matching (≥5 char word overlap rule rejected "Chen"=4 chars). Metadata extractor created duplicate NPCs for the same character. Savegame evidence: npc_2 "Mrs. Chen" (active, bond=1, 5 memories) and npc_5 "Mrs. Chan" (background, bond=0, 1 memory). Fix: new `_edit_distance_le1()` function + Step 4 in `_fuzzy_match_existing_npc()` checks title-stripped name parts for Levenshtein distance ≤ 1. Safety rules: matching titles required when both have titles, ≥3 chars per name part, single untitled word needs ≥5 chars. STT matches add the variant as alias (for future exact-match hits) without renaming the existing NPC. `_fuzzy_match_existing_npc()` now returns `(npc, match_type)` tuple — `"identity"` for normal matches (triggers rename via `_merge_npc_identity()`) or `"stt_variant"` for edit-distance matches (adds alias only)
+- **Markdown emphasis leaking into narration:** Narrator used `*word*` for emphasis and `*multi-word phrases*` for signs/thoughts, despite `PURE PROSE ONLY` rule. Orphaned asterisks (opening `*` without closing) appeared as visible characters in the UI; paired asterisks created unwanted markdown rendering and broke TTS. Fix: (a) `PURE PROSE ONLY` rule now explicitly prohibits `*italics*`, `**bold**`, `# headings` and instructs typographic emphasis via word choice instead, (b) `parse_narrator_response()` Step 8 now strips `***...***, **...**, *...*` paired emphasis and removes remaining orphaned `*` characters
+- **NPC location teleportation:** NPCs at distant locations appeared to be physically present — heard through walls, interacting with the player, reacting in real-time — because the narrator had no information about where NPCs were last seen. Savegame evidence: Mr. Wong's workshop was on Canal Street (Chinatown), but in scenes 17-18 his mother's voice came "through the ceiling" of Mike's Brooklyn basement, and Officer Ramirez walked "down the stairs" to speak with Wong as if the workshop were next door. Fix: new `last_location` field on every NPC, set when NPCs are created and updated whenever they receive a memory. Prompt builders inject `last_seen="..."` (activated NPCs) and `[at:...]` (known NPCs) when an NPC's last location differs from the player's current location. Expanded SPATIAL CONSISTENCY rule tells the narrator that NPCs at different locations cannot be heard, seen, or interact directly — they must plausibly travel to the player's location first
+
+### Removed
+- **`_auto_generate_keywords()`** (~75 lines): Keyword generation from NPC names/descriptions — replaced by TF-IDF
+- **`_build_other_npc_names()`** (~17 lines): Cross-contamination filter helper — no longer needed
+- **`_get_keyword_stopwords()`** (~10 lines): Language-aware stopword combiner — replaced by `_STOPWORDS` constant
+- **`_NARRATION_LANG_TO_ISO`** (~20 lines): 18-language ISO code mapping — no longer needed
+- **`_stopwords_cache` + `_load_stopwords()`** (~20 lines): Dynamic per-language stopword loading
+- **`_BASE_KEYWORD_STOPWORDS` + `_RPG_KEYWORD_STOPWORDS`** (~45 lines): RPG-specific stopword lists
+- **`_repair_json()`** (~45 lines): JSON repair for LLM output (trailing commas, missing commas, unescaped newlines) — Structured Outputs guarantee valid JSON
+- **`_close_truncated_json()`** (~30 lines): Stack-based bracket-tracking for truncated JSON — no longer needed with guaranteed-complete schema responses
+- **Narrator metadata instructions from prompts:** `build_dialog_prompt()` and `build_action_prompt()` no longer contain metadata XML templates or extraction rules. Narrator system prompt stripped of NPC rename/details/new_npcs rules
+- **13-step metadata extraction from `parse_narrator_response()`:** Bracket-format parsers, code fence JSON extraction, untagged JSON detection, nuclear fallback, bold-bracket metadata — all removed. Parser retained as prose cleanup only (strips leaked XML/JSON/markdown from narration)
+
+### Changed
+- **`parse_narrator_response()`:** Reduced from 18-step metadata extraction pipeline to 10-step prose cleanup. No longer extracts game state changes — that's now `call_narrator_metadata()`'s job. Retained: game_data parsing (opening scenes), XML/JSON/code-fence stripping, NPC introduction marking, disposition normalization. Step 8 expanded: strips paired markdown emphasis (`***`, `**`, `*`) and orphaned asterisks
+- **Narrator system prompt:** New `PURE PROSE ONLY` rule instructs narrator to output only narrative text. Metadata-specific rules (NPC rename, details, new_npcs, surname establishment) removed. Spatial consistency rule simplified (no metadata update instruction). Explicit markdown prohibition added (`*italics*`, `**bold**`, `# headings`)
+- **`call_narrator()`:** Tag logging simplified — only checks for `<game_data>` (opening/chapter scenes)
+- **`_salvage_truncated_narration()`:** Only handles `<game_data>` tag, not all 8 metadata tags
+- **`_should_call_director()` callsites:** `new_npcs_found` now uses `bool(metadata.get("new_npcs"))` instead of `'<new_npcs>' in raw`
+- **`_ensure_npc_memory_fields()`:** Simplified signature (removed `player_name`, `other_npc_names` params). Keywords field preserved as `setdefault("keywords", [])` for savegame backward compatibility but no longer populated. New `last_location` field with `setdefault("", "")` for backward compat
+- **`_activated_npcs_block()`:** Injects `last_seen="..."` attribute when NPC's last_location differs from player's current location
+- **`_known_npcs_string()`:** Appends `[at:Location]` tag when NPC's last_location differs from player's current location
+- **`_npcs_present_string()`:** Same `[at:Location]` tag for fallback path
+- **`_apply_memory_updates()`:** Updated for `_fuzzy_match_existing_npc()` tuple return. Sets `last_location = game.current_location` on every memory addition. Auto-stub NPCs get `last_location` at creation
+- **`_process_new_npcs()`:** New mid-game NPCs get `last_location = game.current_location` at creation. Player name guard upgraded from exact full-name match to name-part intersection. STT variant matches add alias without renaming (prevents wrong name becoming primary)
+- **`_process_game_data()`:** Opening scene NPCs get `last_location` defaulting to `game.current_location`
+- **Narrator system prompt SPATIAL CONSISTENCY:** Expanded: NPCs with `last_seen` at a different location than `<location>` are NOT physically present — cannot be heard, seen, or interact directly unless they plausibly travel to the player's location
+- **`activate_npcs_for_prompt()`:** Step 4 replaced: keyword set intersection → TF-IDF cosine similarity. Reactivation reason changed from "keyword activation" to "context activation"
+- **`retrieve_memories()`:** Removed `npc_keywords` from relevance scoring — context-word overlap with memory event text sufficient
+- **`call_brain()`, `call_setup_brain()`:** Use Structured Outputs, removed `_repair_json()` / `_close_truncated_json()` fallbacks, simplified null-safety to in-place field coercion
+- **`call_director()`:** Structured Outputs, removed JSON repair cascade, simplified retry logic
+- **`call_story_architect()`:** Structured Outputs (Sonnet), removed 2-attempt retry with truncation handling. Prompt extended with `transition_trigger` and `thematic_thread` instructions. User message includes `character_growth` and `thematic_question` from previous chapters. Schema extended: `transition_trigger` per act, `thematic_thread` at top level. All fallback blueprints updated with transition_triggers and thematic_threads
+- **`call_chapter_summary()`:** Structured Outputs, removed JSON repair. Schema extended: `npc_evolutions` (NPC change projections for time skip) and `thematic_question` (vertical emotional arc). max_tokens raised 400→800. Prompt extended with instructions for both new fields
+- **`get_current_act()`:** Dual logic: (1) checks `story_blueprint["triggered_transitions"]` for Director-signaled act completions, (2) falls back to scene_range. Returns `transition_trigger` in act dict for downstream use
+- **`build_director_prompt()`:** `<story_arc>` tag now includes `transition_trigger` and `thematic_thread` attributes. Task section includes `act_transition` boolean instruction
+- **`DIRECTOR_OUTPUT_SCHEMA`:** New `act_transition` boolean field — Director signals when current act's transition_trigger has been fulfilled
+- **`_apply_director_guidance()`:** Handles `act_transition: true` by appending act_id to `story_blueprint["triggered_transitions"]`
+- **`_story_context_block()`:** Injects `thematic_thread` attribute into `<story_arc>` tag for narrator prompts
+- **`build_new_chapter_prompt()`:** Injects `<npc_evolutions>` block from most recent campaign_history entry, giving narrator concrete time-skip hints. Task instruction added for using evolution hints through behavior/dialog
+- **`load_game()`:** Simplified `_ensure_npc_memory_fields()` calls (no player_name/other_npc_names passthrough)
+- **`call_narrator()`:** Cyrillic homoglyph sanitization (`_fix_cyrillic_homoglyphs()`) applied before return
+- **`call_narrator_metadata()`:** Fixed `extra_params` → `output_config` kwarg (Structured Outputs now actually applied). Added `<player_character>` to prompt with exclusion instructions. Description quality rule added (physical/role, not scene events). New physically-present vs. merely-mentioned distinction for `new_npcs` with exclusion list (deceased, absent, historical). Anti-fusion rule prevents mixing mentioned names with present persons' descriptions. Memory updates restricted to physically present NPCs
+- **`_fuzzy_match_existing_npc()`:** Returns `(npc, match_type)` tuple instead of plain NPC dict. New Step 4: STT variant matching via `_edit_distance_le1()` on title-stripped name parts. All callsites updated for tuple unpacking
+- **`_process_npc_renames()`:** Player name guard upgraded from exact match to name-part intersection
+- **Narrator system prompt `<player_authorship>`:** New `PRESERVE EXACTLY` rule (no name corrections, no number-to-word conversion, no content "improvement"). New `DESCRIBED SPEECH` rule (action-described speech → indirect speech, never invented quoted dialog)
+- ~5,620 → ~5,475 lines (−145 net across all changes in this version)
+
+---
+
+## [0.9.32]
+
+### Added
+- **Version display:** Sidebar shows `v0.9.32` at the bottom (small, centered, dimmed). `VERSION` constant in engine.py
+- **Savegame version tracking:** `engine_version` (current) and `version_history` (chronological list) written as top-level JSON fields. Preserves history across saves — appends only when version changes. `get_save_info()` returns both fields
+- **`_build_other_npc_names()` helper:** Builds set of name parts from all NPCs except one, used for keyword cross-contamination filtering
+
+### Fixed
+- **Ghost NPC from technical ID reference:** `_apply_memory_updates()` auto-stub creation now rejects `npc_id` values matching `^npc_\d+$` pattern. Previously, if the Narrator sent a memory_update with a raw NPC ID (e.g. `"npc_4"`) instead of a name, the system created a stub NPC with the ID string as its name — no description, no agenda, just noise. Savegame analysis showed `npc_4` with 2 neutral memories and keyword `['npc_4']`
+- **Self-alias after NPC identity merge:** `_merge_npc_identity()` now removes the new name from aliases after rename (prevents current name appearing in own alias list) and skips merge entirely when old and new names are identical. `load_game()` cleans up self-aliases in existing saves. Savegame analysis showed `Professor Albrecht` with `aliases: ['Professor Albrecht', 'Dekan Werner']` — own name as alias caused redundant keyword activation
+- **Truncated NPC reflections stored permanently:** `_apply_director_guidance()` now validates reflection text ends with sentence-terminating punctuation before storing. Truncated reflections (from Director `max_tokens` cutoff) are rejected with a warning — the `_needs_reflection` flag stays active so the Director retries next cycle. Savegame analysis found `"Albrecht hat Jana an den Rand getrieben. Sie ignoriert"` (mid-sentence cutoff) stored as importance-8 reflection
+- **NPC keyword cross-contamination:** `_auto_generate_keywords()` now accepts `other_npc_names` parameter — name parts of all other NPCs are excluded from description-derived keywords. Prevents NPC A from activating when player mentions NPC B whose name appears in A's description. All 10 call sites updated to pass `_build_other_npc_names()`. Savegame analysis: Dr. Kessler (desc: "Anwältin, die Lena Hoffmann vertritt") had keywords `['lena', 'hoffmann']` — every mention of Lena false-activated Kessler
+- **Missing academic titles in `_NAME_TITLES_EXTRA`:** Added `dekan`, `dekanin`, `prodekan`, `prodekanin`, `rektor`, `rektorin`, `prorektor`, `prorektorin`, `dozent`, `dozentin`, `privatdozent`, `privatdozentin`, `referent`, `referentin`, `direktor`, `direktorin`, `intendant`, `intendantin`, `sekretär`, `sekretärin`. Previously `"Dekan Werner"` generated `"dekan"` as a keyword (title not filtered)
+- **Noisy German description keywords:** Added ~30 common German nouns to `_RPG_KEYWORD_STOPWORDS` that frequently appear capitalized in NPC descriptions but carry no identity signal: body parts (`hand`, `augen`, `haar`), temporal (`anfang`, `mitte`, `ende`), relational (`kollege`, `freund`, `tochter`), institutional (`anhörung`, `fakultätsmitglied`, `informationen`), role-generic (`tutorin`, `anwältin`). Savegame: Reinholdt had keywords `['hand', 'anfang', 'kollege']` from description
+- **Location history near-duplicates:** `update_location()` now checks word overlap (>50%) between new entry and last history entry — replaces instead of appending. Prevents narrative variants of the same place from filling the history. Savegame showed `"Ihr privates Büro im Informatik-Gebäude nach einer langen Vorlesung"` and `"Janas privates Büro im Informatik-Gebäude"` as separate entries
+
+### Changed
+- `_apply_memory_updates()`: rejects auto-stub for `npc_\d+` pattern IDs
+- `_merge_npc_identity()`: same-name guard, self-alias cleanup after rename
+- `_apply_director_guidance()`: reflection completeness check before storage
+- `_auto_generate_keywords()`: new `other_npc_names` param for cross-contamination filter
+- `_ensure_npc_memory_fields()`: new `other_npc_names` param passthrough
+- `_NAME_TITLES_EXTRA`: +20 German academic/professional titles
+- `_RPG_KEYWORD_STOPWORDS`: +30 common German description nouns
+- `update_location()`: word-overlap dedup on history append
+- `load_game()`: self-alias cleanup on load (backward compat)
+- Reflection memory dict: explicit `tone` field alongside `emotional_weight`
+
+---
+
+## [0.9.31]
+
+### Fixed
+- **Story Architect truncation:** `max_tokens` increased 1200 → 2500 to prevent consistent JSON truncation with verbose German narration. Added `stop_reason` check + `_close_truncated_json()` salvage — the same pattern already used in `call_brain()` and `call_director()`. Savegame analysis showed both architect attempts failing at ~3100 chars with `Expecting ',' delimiter` errors, reliably triggering the generic fallback blueprint
+- **Code fence parsing:** Regex patterns in `parse_narrator_response()` only matched `` ```json `` and `` ```xml `` — any other language identifier (e.g. `` ```game_data ``) leaked through to visible narration. Updated 4 regex patterns from `(?:json)?` to `(?:\w+)?` to match any code fence language. Hardened `_clean_narration()` in app.py as safety net (same regex fix)
+- **Player name in NPC keywords (possessive forms):** The player name filter in `_auto_generate_keywords()` used exact match, missing possessive forms like `"zoey's"`, `"zoeys"`, `"peter's"`, `"peters"`. Changed to `startswith` check — `"zoey"` now filters all variants. Prevents false NPC activation when player mentions their own name
+- **Chapter transition state carry-over:** `start_new_chapter()` now resets `director_guidance` to `{}` (previously carried over `pacing: "climax"` from the final scene into Scene 1 of the new chapter). Dead NPCs (name/description contains death markers in DE+EN) and low-engagement filler NPCs (bond=0, ≤1 memory, no agenda) are retired to `background` at chapter boundary. `location_history` is seeded with the new chapter's starting location after the opening scene is parsed
+- **NPC description truncation protection:** New `_is_complete_description()` validates descriptions end with sentence-terminating punctuation (`. ! ? " » … ) – —`). `_process_npc_details()` and `_apply_director_guidance()` now reject incomplete descriptions when a valid existing description is available, instead of overwriting good data with truncated AI output. New descriptions for NPCs without any existing description are always accepted
+
+### Changed
+- `call_story_architect()`: `max_tokens` 1200 → 2500, added truncation handling via `_close_truncated_json()`
+- `_auto_generate_keywords()`: player name filter uses `startswith` instead of exact match (catches possessive forms)
+- `start_new_chapter()`: resets `director_guidance`, retires dead/filler NPCs, seeds `location_history`
+- `_process_npc_details()`: validates description completeness before overwriting
+- `_apply_director_guidance()`: validates description completeness before overwriting
+- `parse_narrator_response()`: code fence regex matches any language identifier
+- `_clean_narration()` (app.py): code fence regex matches any language identifier
+
+---
+
 ## [0.9.30]
 
 ### Added
