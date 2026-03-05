@@ -1388,6 +1388,8 @@ def render_chat_messages(container) -> Optional[str]:
         role = msg.get("role","assistant")
         content = msg.get("content","")
         css = "recap" if msg.get("recap") else role
+        if msg.get("correction_input"):
+            css += " correction"
         prefix = f"{E['scroll']} **{t('actions.recap_prefix', L())}**\n\n" if msg.get("recap") else ""
         with ui.column().classes(f"chat-msg {css} w-full"):
             if msg.get("corrected"):
@@ -1745,7 +1747,29 @@ def _render_confirm():
                 with confirm_container:
                     with ui.row().classes("w-full items-center gap-3"):
                         ui.spinner("dots", size="md", color="primary")
-                        ui.label(t("creation.world_awakens", lang)).classes("text-sm").style("color: var(--text-secondary)")
+                        loading_label = ui.label(t("creation.world_awakens", lang)) \
+                            .classes("text-sm creation-loading-label") \
+                            .style("color: var(--text-secondary)")
+                    # Rotate loading text every 10 seconds to show progress
+                    _msg1 = t("creation.world_awakens", lang)
+                    _msg2 = t("creation.world_awakens_2", lang)
+                    _msg3 = t("creation.world_awakens_3", lang)
+                    await ui.run_javascript(f'''
+                        window._loadingMsgs = ["{_msg1}", "{_msg2}", "{_msg3}"];
+                        window._loadingIdx = 0;
+                        window._loadingTimer = setInterval(() => {{
+                            window._loadingIdx = (window._loadingIdx + 1) % window._loadingMsgs.length;
+                            const el = document.querySelector('.creation-loading-label');
+                            if (el) {{
+                                el.style.transition = 'opacity 0.4s ease';
+                                el.style.opacity = '0';
+                                setTimeout(() => {{
+                                    el.textContent = window._loadingMsgs[window._loadingIdx];
+                                    el.style.opacity = '1';
+                                }}, 400);
+                            }}
+                        }}, 10000);
+                    ''', timeout=3.0)
                 await _scroll_chat_bottom()
                 try:
                     client=anthropic.Anthropic(api_key=s["api_key"]);config=get_engine_config();username=s["current_user"]
@@ -1799,9 +1823,15 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
     config=get_engine_config();username=s["current_user"]
     # On retry, the message is already in s["messages"] and rendered — don't duplicate
     if not is_retry:
-        s["messages"].append({"role":"user","content":text})
+        _is_corr_input = text.startswith("##")
+        display_text = text[2:].strip() if _is_corr_input else text
+        msg_entry = {"role": "user", "content": display_text}
+        if _is_corr_input:
+            msg_entry["correction_input"] = True
+        s["messages"].append(msg_entry)
         with chat_container:
-            with ui.column().classes("chat-msg user w-full"): ui.markdown(text)
+            css_corr = " correction" if _is_corr_input else ""
+            with ui.column().classes(f"chat-msg user{css_corr} w-full"): ui.markdown(display_text)
     try:
         with chat_container: spinner=ui.spinner("dots", size="lg")
         # Scroll down so player sees their message + spinner
@@ -1866,15 +1896,33 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
                     s["messages"][i] = {"role":"assistant","content":narration,
                                         "roll_data":roll_data,"corrected":True}
                     break
+            # Remove ephemeral correction input from message history (before save)
+            for i in range(len(s["messages"]) - 1, -1, -1):
+                if s["messages"][i].get("correction_input"):
+                    s["messages"].pop(i)
+                    break
         else:
             s["messages"].append({"role":"assistant","content":narration,"roll_data":roll_data})
         save_game(game,username,s["messages"],s.get("active_save","autosave"))
         # Render AI response
         if _is_correction:
-            # Full re-render: replace last assistant bubble in the DOM
+            # Fade out the green correction input message before re-rendering
+            try:
+                await ui.run_javascript('''
+                    const msgs = document.querySelectorAll('.chat-msg.user.correction');
+                    const last = msgs[msgs.length - 1];
+                    if (last) {
+                        last.style.transition = 'opacity 0.5s ease-out';
+                        last.style.opacity = '0';
+                    }
+                ''', timeout=3.0)
+            except TimeoutError:
+                pass
+            await asyncio.sleep(0.6)
+            # Full re-render without the correction input
             chat_container.clear()
-            render_chat_messages(chat_container)
-            scroll_target_id = None
+            with chat_container:
+                scroll_target_id = render_chat_messages(chat_container)
         else:
             scroll_target_id = f"msg-{len(s['messages'])}"
             with chat_container:

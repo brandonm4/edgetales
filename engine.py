@@ -61,7 +61,7 @@ except ImportError:
 # CONFIGURATION
 # ===============================================================
 
-VERSION = "0.9.35"
+VERSION = "0.9.36"
 
 BRAIN_MODEL = "claude-haiku-4-5-20251001"
 NARRATOR_MODEL = "claude-sonnet-4-5-20250929"
@@ -1156,6 +1156,12 @@ def _description_match_existing_npc(game, new_desc: str, new_name_lower: str) ->
         # Don't match against the NPC being created (same name)
         if n.get("name", "").lower().strip() == new_name_lower:
             continue
+        # Spatial guard: if existing NPC has a known location that differs from
+        # the player's current location, they can't be the same person appearing here
+        npc_loc = n.get("last_location", "").strip().lower()
+        current_loc = (game.current_location or "").strip().lower()
+        if npc_loc and current_loc and npc_loc != current_loc:
+            continue
 
         existing_desc = n.get("description", "")
         if not existing_desc:
@@ -1190,25 +1196,25 @@ def _description_match_existing_npc(game, new_desc: str, new_name_lower: str) ->
                         break
 
         # Weighted overlap: exact=1.0, substring=0.5
-        # Bonus: long compound terms (≥10 chars) count extra (very distinctive)
-        long_exact = sum(1 for w in exact_overlap if len(w) >= 10)
+        # Bonus: long compound terms (≥12 chars) count extra (very distinctive)
+        long_exact = sum(1 for w in exact_overlap if len(w) >= 12)
         effective_overlap = len(exact_overlap) + long_exact * 0.5 + len(substring_matches) * 0.5
         total_matches = exact_overlap | substring_matches
 
-        if effective_overlap < 1.5:  # Need at least 1 exact + 1 substring, or 1 long compound
+        if effective_overlap < 2.0:  # Need at least 2 exact, or 1 long compound + 1 substring
             continue
 
         # Require meaningful overlap:
-        # - ≥25% of shorter set with effective≥1.5, OR
-        # - Any long compound match (≥10 chars) with effective≥1.5
-        #   (a 10+ char compound like "NVA-Kommandant" is distinctive enough alone)
+        # - ≥25% of shorter set with effective≥2.0, OR
+        # - Any long compound match (≥12 chars) with effective≥2.0
+        #   (a 12+ char compound like "NVA-Kommandant" is distinctive enough with support)
         min_set_size = min(len(new_words), len(existing_words))
         overlap_ratio = effective_overlap / max(min_set_size, 1)
-        has_long_match = any(len(w) >= 10 for w in exact_overlap)
+        has_long_match = any(len(w) >= 12 for w in exact_overlap)
 
         meets_threshold = (
-            (overlap_ratio >= 0.25 and effective_overlap >= 1.5)
-            or (has_long_match and effective_overlap >= 1.5)
+            (overlap_ratio >= 0.25 and effective_overlap >= 2.0)
+            or (has_long_match and effective_overlap >= 2.0)
         )
 
         if meets_threshold and effective_overlap > best_score:
@@ -4357,8 +4363,21 @@ def parse_narrator_response(game: GameState, raw: str) -> str:
     for npc in game.npcs:
         if not npc.get("introduced", False) and npc.get("name"):
             name = npc["name"].strip()
-            if name and name.lower() in narration_lower:
+            if not name:
+                continue
+            # Check full name first
+            if name.lower() in narration_lower:
                 npc["introduced"] = True
+                continue
+            # Check individual name parts (e.g. "Totewald" from
+            # "Geschäftsführer Clemens Totewald") — min 4 chars to avoid
+            # matching generic words like "der", "von"; skip known titles
+            for part in name.split():
+                part_clean = part.strip(".,;:!?\"'()-").lower()
+                if len(part_clean) >= 4 and part_clean not in _NAME_TITLES \
+                        and part_clean in narration_lower:
+                    npc["introduced"] = True
+                    break
 
     # Summary log
     active = [n for n in game.npcs if n.get("status") == "active"]

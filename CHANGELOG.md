@@ -5,6 +5,26 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.36]
+
+### Added
+- **Ephemeral correction input with fade-out:** `##`-prefixed correction messages now appear with a green left border (`.chat-msg.user.correction` CSS class), then fade out over 0.5s once the corrected narration arrives. The correction input is removed from message history before saving — it never persists in savegames or appears after reload. The `✎ Korrigiert` badge on the corrected narration remains as the permanent indicator
+- **Rotating loading messages during world creation:** The "world awakens" loading text now cycles every 10 seconds through three atmospheric messages with a smooth 0.4s cross-fade: "Die Welt erwacht..." → "Schicksale werden verflochten..." → "Dein Abenteuer nimmt Gestalt an..." (DE) / "The world awakens..." → "Fates are being intertwined..." → "Your adventure takes shape..." (EN). New i18n keys: `creation.world_awakens_2`, `creation.world_awakens_3`
+- **Spatial guard for NPC description matching:** `_description_match_existing_npc()` now skips candidates whose `last_location` differs from `game.current_location`. Prevents false merges when two NPCs at different locations share generic description words (e.g. "Unterarmen" matching a diner owner and a dockworker). Empty locations are treated as "potentially present" for backward compatibility
+
+### Changed
+- **`##` correction input display:** The `##` prefix is stripped before rendering and storing the player message. Previously the raw `## text` was passed to `ui.markdown()`, which rendered it as an H2 heading (large bold text). Now shows as normal text with a green `border-left` instead of the default orange
+- **Correction re-render uses container context:** `render_chat_messages()` after correction is now called inside `with chat_container:`, fixing a bug where re-rendered elements landed outside the scrollable area — causing the inability to scroll after a correction
+- **Correction scroll targets scene marker:** After correction re-render, the two-step scroll now targets the last scene marker (returned by `render_chat_messages()`) instead of `None`. The chat scrolls to the corrected scene's marker after the fade-out completes
+- **Description match effective overlap threshold raised:** `_description_match_existing_npc()` now requires `effective_overlap >= 2.0` (was 1.5). A single shared word like "Unterarmen" (score 1.0) no longer triggers a false merge
+- **Description match long-compound threshold raised:** Long-compound bonus now requires `>= 12` characters (was 10). Generic body-part words like "Unterarmen" (10 chars) no longer receive the distinctive-term bonus. Truly distinctive compounds like "NVA-Kommandant" (14 chars) still qualify
+
+### Fixed
+- **NPC introduction detection for multi-part names:** `parse_narrator_response()` Step 10 previously checked only the full NPC name as a substring (e.g. `"geschäftsführer clemens totewald"`). NPCs whose full name never appeared verbatim in narration — only partial references like "Totewald" — stayed `introduced: False` indefinitely, hiding them from the sidebar despite being active with memories. Fix: Step 10 now also checks individual name parts (≥4 chars, excluding known titles from `_NAME_TITLES`) against the narration text
+- **False NPC merges via description matching across locations:** Two NPCs at different locations could be merged if their descriptions shared a single 10+ character word (e.g. "Unterarmen" in a diner owner and a dockworker). Root cause: `_description_match_existing_npc()` had no spatial awareness and the overlap threshold was too low. Fix: spatial guard + raised thresholds (see Changed)
+
+---
+
 ## [0.9.35]
 
 ### Added
