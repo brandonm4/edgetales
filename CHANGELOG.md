@@ -5,6 +5,26 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.34]
+
+### Added
+- **Deceased NPC system:** New `status="deceased"` for NPCs killed during play. Metadata Extractor schema extended with `deceased_npcs` field — reports NPCs who die on-screen in the current narration. `_process_deceased_npcs()` sets status before memory updates run, ensuring dead NPCs are immediately excluded from all active processing
+- **Deceased NPC guards:** Comprehensive protection across the NPC lifecycle: `_apply_memory_updates()` triggers resurrection instead of skipping; `_reactivate_npc()` blocks reactivation unless `force=True`; `_process_new_npcs()` refuses fuzzy-match and description-match merges into deceased NPCs (treats them as genuinely new characters); `_process_npc_renames()` skips deceased NPCs
+- **NPC resurrection:** When a deceased NPC reappears physically (necromancy, undead, etc.), exact name match in `new_npcs` or `memory_updates` from the Metadata Extractor triggers `_reactivate_npc(force=True)` — NPC returns to `active` with full history intact. Fuzzy matches remain blocked to prevent accidental merges with similarly-named new characters
+- **Deceased NPC sidebar section:** Collapsed ☠️ section shows deceased NPCs with strikethrough styling. New i18n keys `sidebar.deceased_persons` (DE: "Verstorben", EN: "Deceased")
+- **`move` field in session_log:** Both dialog and action paths now write `brain.get("move")` to session_log entries. Previously missing entirely, limiting diagnostics and Director context
+
+### Fixed
+- **Dead NPCs remained active:** NPCs killed in narration kept `status=active` — continued receiving memory updates, reflections, appeared in prompts, and could be merged with new characters via fuzzy matching. Root cause: engine had no concept of NPC death. Savegame evidence: Kravik (shot in scene 19) received observation + reflection in scene 20 from new Trandoshaner characters misidentified as him
+- **Two characters merged into one NPC slot:** When two NPCs of the same species/group appeared together (e.g. two Trandoshaner), the Metadata Extractor's fuzzy matching or description matching could merge them into a single NPC. When one died, the survivor's identity was absorbed into the dead one's slot. Now: deceased NPCs are excluded from all merge paths — new characters with similar descriptions become their own NPCs
+- **`start_new_chapter()` death detection was fragile:** Chapter transitions detected dead NPCs by scanning for text markers in names and descriptions (`"(getötet)"`, `"killed"`, `"deceased"`). Replaced with clean `status == "deceased"` check — the canonical source of truth
+
+### Changed
+- **Director `act_transition` prompt improved:** `transition_trigger` extracted from dense XML attribute into its own `<transition_trigger>` tag for visibility. Director now sees `current_scene` and `scene_range` in `<story_arc>`, plus `PAST_RANGE="true"` flag when scene count exceeds range. Instruction rewritten from cautious ("when in doubt, set false") to evaluative: trigger clearly met → true; past range + spirit met → true; otherwise false. Emphasizes that content-driven transitions produce better pacing than scene_range fallback
+- **Metadata Extractor NPC reference list:** Includes deceased NPCs marked `[DECEASED]` so the extractor can distinguish living from dead characters and avoid generating memories for the dead
+
+---
+
 ## [0.9.33]
 
 ### Added

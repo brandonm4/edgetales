@@ -52,7 +52,7 @@ except ImportError:
 # CONFIGURATION
 # ===============================================================
 
-VERSION = "0.9.33"
+VERSION = "0.9.34"
 
 BRAIN_MODEL = "claude-haiku-4-5-20251001"
 NARRATOR_MODEL = "claude-sonnet-4-5-20250929"
@@ -333,9 +333,21 @@ NARRATOR_METADATA_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "deceased_npcs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "npc_id": {"type": "string"},
+                },
+                "required": ["npc_id"],
+                "additionalProperties": False,
+            },
+        },
     },
     "required": ["scene_context", "location_update", "time_update",
-                  "memory_updates", "new_npcs", "npc_renames", "npc_details"],
+                  "memory_updates", "new_npcs", "npc_renames", "npc_details",
+                  "deceased_npcs"],
     "additionalProperties": False,
 }
 
@@ -1196,6 +1208,9 @@ def _process_npc_renames(game, json_text: str):
                 log(f"[NPC] Rename failed: could not find NPC '{r.get('npc_id', '')}' / '{r.get('old_name', '')}'",
                     level="warning")
                 continue
+            if npc.get("status") == "deceased":
+                log(f"[NPC] Rename skipped for deceased NPC: {npc.get('name', '?')}")
+                continue
             new_name = r["new_name"].strip()
             # Don't rename to player character (exact or partial match)
             new_lower = new_name.lower()
@@ -1308,31 +1323,41 @@ def _process_new_npcs(game, json_text: str):
 
             # Check if this NPC already exists (exact name match, possibly background)
             if name_lower in existing_names:
-                # Reactivate background NPCs that reappear in narration
+                # Reactivate background/deceased NPCs that reappear in narration
                 existing = next((n for n in game.npcs
                                  if n["name"].lower().strip() == name_lower), None)
                 if existing and existing.get("status") == "background":
                     _reactivate_npc(existing, reason="reappeared in new_npcs")
+                elif existing and existing.get("status") == "deceased":
+                    _reactivate_npc(existing, reason="resurrected — exact name in new_npcs",
+                                    force=True)
                 continue
 
             # Fuzzy match: check if this "new" NPC is actually a known NPC
             # under a different name (identity reveal, nickname, etc.)
             fuzzy_hit, match_type = _fuzzy_match_existing_npc(game, nd["name"])
             if fuzzy_hit:
-                if match_type == "stt_variant":
-                    # STT transcription variant (Chan→Chen, Wang→Wong): do NOT rename.
-                    # Add the variant as alias so future exact-matches catch it.
-                    fuzzy_hit.setdefault("aliases", [])
-                    variant = nd["name"].strip()
-                    if variant.lower() not in {a.lower() for a in fuzzy_hit["aliases"]}:
-                        fuzzy_hit["aliases"].append(variant)
-                        log(f"[NPC] Added STT variant as alias: '{variant}' → '{fuzzy_hit['name']}'")
-                    if fuzzy_hit.get("status") == "background":
-                        _reactivate_npc(fuzzy_hit, reason="STT variant reappeared")
+                # Never merge into deceased NPCs — treat as genuinely new character
+                if fuzzy_hit.get("status") == "deceased":
+                    log(f"[NPC] Fuzzy matched '{nd['name']}' to deceased "
+                        f"'{fuzzy_hit['name']}' — creating new NPC instead")
+                    fuzzy_hit = None
+                    # Fall through to description match / new NPC creation
                 else:
-                    _merge_npc_identity(fuzzy_hit, nd["name"], nd.get("description", ""))
-                existing_names.add(name_lower)
-                continue
+                    if match_type == "stt_variant":
+                        # STT transcription variant (Chan→Chen, Wang→Wong): do NOT rename.
+                        # Add the variant as alias so future exact-matches catch it.
+                        fuzzy_hit.setdefault("aliases", [])
+                        variant = nd["name"].strip()
+                        if variant.lower() not in {a.lower() for a in fuzzy_hit["aliases"]}:
+                            fuzzy_hit["aliases"].append(variant)
+                            log(f"[NPC] Added STT variant as alias: '{variant}' → '{fuzzy_hit['name']}'")
+                        if fuzzy_hit.get("status") == "background":
+                            _reactivate_npc(fuzzy_hit, reason="STT variant reappeared")
+                    else:
+                        _merge_npc_identity(fuzzy_hit, nd["name"], nd.get("description", ""))
+                    existing_names.add(name_lower)
+                    continue
 
             # Description-based dedup: if fuzzy name match failed, check if the
             # new NPC's description closely matches an existing NPC's description.
@@ -1342,11 +1367,16 @@ def _process_new_npcs(game, json_text: str):
             if new_desc and len(new_desc) >= 10:
                 desc_hit = _description_match_existing_npc(game, new_desc, name_lower)
                 if desc_hit:
-                    log(f"[NPC] Description-based dedup: '{nd['name']}' matches "
-                        f"'{desc_hit['name']}' — treating as identity reveal")
-                    _merge_npc_identity(desc_hit, nd["name"], new_desc)
-                    existing_names.add(name_lower)
-                    continue
+                    # Never merge into deceased NPCs
+                    if desc_hit.get("status") == "deceased":
+                        log(f"[NPC] Description matched '{nd['name']}' to deceased "
+                            f"'{desc_hit['name']}' — creating new NPC instead")
+                    else:
+                        log(f"[NPC] Description-based dedup: '{nd['name']}' matches "
+                            f"'{desc_hit['name']}' — treating as identity reveal")
+                        _merge_npc_identity(desc_hit, nd["name"], new_desc)
+                        existing_names.add(name_lower)
+                        continue
 
             # Assign ID
             npc_id, _ = _next_npc_id(game)
@@ -1435,8 +1465,16 @@ def _retire_distant_npcs(game, max_active: int = MAX_ACTIVE_NPCS):
         log(f"[NPC] Demoted to background: {npc['name']}")
 
 
-def _reactivate_npc(npc: dict, reason: str = ""):
-    """Promote a background NPC back to active status."""
+def _reactivate_npc(npc: dict, reason: str = "", force: bool = False):
+    """Promote a background (or deceased with force=True) NPC back to active status.
+    force=True enables resurrection of deceased NPCs (exact name match in narration)."""
+    if npc.get("status") == "deceased":
+        if force:
+            npc["status"] = "active"
+            log(f"[NPC] Resurrected deceased NPC: {npc['name']} (reason: {reason})")
+        else:
+            log(f"[NPC] Refused reactivation of deceased NPC: {npc.get('name', '?')}")
+        return
     if npc.get("status") == "background":
         npc["status"] = "active"
         log(f"[NPC] Reactivated: {npc['name']} (reason: {reason})")
@@ -3265,11 +3303,13 @@ def call_narrator_metadata(client: anthropic.Anthropic, narration: str,
     # Build compact NPC reference list for the extractor
     npc_refs = []
     for n in game.npcs:
-        if n.get("status") not in ("active", "background"):
+        if n.get("status") not in ("active", "background", "deceased"):
             continue
         entry = f'{n["id"]}={n["name"]}'
         if n.get("aliases"):
             entry += f' (aka {", ".join(n["aliases"])})'
+        if n.get("status") == "deceased":
+            entry += ' [DECEASED]'
         npc_refs.append(entry)
 
     system = f"""You are a metadata extractor for an RPG engine. Analyze the narration and extract game state changes.
@@ -3287,7 +3327,8 @@ new_npcs: ONLY for characters who are PHYSICALLY PRESENT in the scene AND active
 - Unnamed characters described only by role ("a waiter", "some guard") unless they speak or interact meaningfully
 If a NAMED person is mentioned in dialog but a DIFFERENT unnamed person is physically present, create the NPC for the PHYSICAL person with their own appropriate name/description — do NOT assign the mentioned person's name to the physical person's description.
 description must be a PHYSICAL/ROLE description (appearance, occupation, species), NOT what they did in this scene.
-memory_updates: for EACH NPC who participated in or witnessed this scene. Use their npc_id from the known list. NEVER create memory_updates for the player character. NEVER create memory_updates for deceased or absent characters — only for NPCs physically present in the scene."""
+memory_updates: for EACH NPC who participated in or witnessed this scene. Use their npc_id from the known list. NEVER create memory_updates for the player character. NEVER create memory_updates for NPCs marked [DECEASED] or for absent characters — only for NPCs physically present and alive in the scene.
+deceased_npcs: list NPCs (by npc_id) who DIED or were KILLED in THIS scene's narration. Only include deaths that happen on-screen in the narration text — not previously dead characters already marked [DECEASED]. This is critical for game state tracking."""
 
     prompt = f"""<narration>{narration}</narration>
 <player_character>{game.player_name}</player_character>
@@ -3310,12 +3351,14 @@ Extract all metadata from the narration above. Remember: {game.player_name} is t
         metadata = json.loads(response.content[0].text)
         log(f"[Metadata] Extracted: {len(metadata.get('memory_updates', []))} memories, "
             f"{len(metadata.get('new_npcs', []))} new NPCs, "
+            f"{len(metadata.get('deceased_npcs', []))} deceased, "
             f"loc={metadata.get('location_update')}, time={metadata.get('time_update')}")
         return metadata
     except Exception as e:
         log(f"[Metadata] Extraction failed: {e}", level="warning")
         return {"scene_context": "", "location_update": None, "time_update": None,
-                "memory_updates": [], "new_npcs": [], "npc_renames": [], "npc_details": []}
+                "memory_updates": [], "new_npcs": [], "npc_renames": [], "npc_details": [],
+                "deceased_npcs": []}
 
 
 def _apply_narrator_metadata(game: GameState, metadata: dict):
@@ -3355,10 +3398,34 @@ def _apply_narrator_metadata(game: GameState, metadata: dict):
                 d["description"] = ""
         _process_npc_details(game, json.dumps(details, ensure_ascii=False))
 
+    # Deceased NPCs (process BEFORE memory updates so dead NPCs are skipped)
+    deceased = metadata.get("deceased_npcs", [])
+    if deceased:
+        _process_deceased_npcs(game, deceased)
+
     # Memory updates
     mem_updates = metadata.get("memory_updates", [])
     if mem_updates:
         _apply_memory_updates(game, json.dumps(mem_updates, ensure_ascii=False))
+
+
+def _process_deceased_npcs(game: GameState, deceased_list: list):
+    """Mark NPCs as deceased based on metadata extractor report.
+    Sets status='deceased' — this excludes them from all active processing:
+    prompts, memories, reflections, sidebar, reactivation."""
+    for entry in deceased_list:
+        npc_id = entry.get("npc_id", "")
+        if not npc_id:
+            continue
+        npc = _find_npc(game, npc_id)
+        if not npc:
+            log(f"[NPC] Deceased report for unknown NPC: '{npc_id}'", level="warning")
+            continue
+        if npc.get("status") == "deceased":
+            continue  # Already marked
+        old_status = npc.get("status", "active")
+        npc["status"] = "deceased"
+        log(f"[NPC] Marked as deceased: {npc['name']} ({npc['id']}, was {old_status})")
 
 
 # ===============================================================
@@ -3479,16 +3546,24 @@ def build_director_prompt(game: GameState, latest_narration: str,
         bp = game.story_blueprint
         transition_trigger = act.get("transition_trigger", "")
         thematic = bp.get("thematic_thread", "")
+        scene_range = act.get("scene_range", [1, 20])
+        past_range = game.scene_count > scene_range[1]
         story_info = (
             f'\n<story_arc structure="{bp.get("structure_type", "3act")}" '
             f'act="{act["act_number"]}/{act["total_acts"]}" phase="{act["phase"]}" '
-            f'progress="{act["progress"]}" conflict="{bp.get("central_conflict", "")}"'
+            f'progress="{act["progress"]}" '
+            f'current_scene="{game.scene_count}" scene_range="{scene_range[0]}-{scene_range[1]}"'
+            f'{" PAST_RANGE=\"true\"" if past_range else ""} '
+            f'conflict="{bp.get("central_conflict", "")}"'
         )
-        if transition_trigger:
-            story_info += f' transition_trigger="{transition_trigger}"'
         if thematic:
             story_info += f' thematic_thread="{thematic}"'
         story_info += '/>'
+        if transition_trigger:
+            story_info += (
+                f'\n<transition_trigger act="{act["act_number"]}">'
+                f'{transition_trigger}</transition_trigger>'
+            )
 
     # Active NPC overview (include descriptions so Director stays consistent with narrative)
     npc_overview = "\n".join(
@@ -3531,7 +3606,10 @@ Field instructions:
   - agenda: NPC's hidden goal (max 8 words, only if needs_profile="true"), null otherwise
   - instinct: NPC's default behavior pattern (max 8 words, only if needs_profile="true"), null otherwise
 - arc_notes: Brief story arc progress observation
-- act_transition: Set to true ONLY if this scene's events fulfill the current act's transition_trigger (shown in <story_arc> tag). This means the story should move to the next act. Set to false if the trigger condition has NOT been met yet. When in doubt, set false — premature act transitions hurt pacing.
+- act_transition: Evaluate whether the current act's <transition_trigger> has been fulfilled by recent events. Set to true if:
+  (a) the narrative condition described in the trigger has clearly been met, OR
+  (b) the story has moved PAST the act's scene_range (PAST_RANGE="true") and the trigger's spirit has been approximately met.
+  Set to false only if the trigger condition is clearly unmet AND we are still within scene_range. The scene_range is a fallback — content-driven transitions via this flag produce better pacing.
 
 If a <reflect> tag has a last_reflection attribute, write a NEW insight that builds on, deepens, or contradicts it. Do NOT repeat the same theme or emotional tone. If last_tone is present, evolve the emotion — show how the NPC's feelings have shifted, intensified, or transformed since then.
 </task>"""
@@ -4287,8 +4365,13 @@ def _apply_memory_updates(game: GameState, json_text: str):
                     log(f"[NPC] Auto-created stub NPC from memory_update: {npc_name}")
 
             if npc:
+                # Resurrect deceased NPCs if the extractor reports them as active
+                # (exact npc_id match = extractor considers them physically present)
+                if npc.get("status") == "deceased":
+                    _reactivate_npc(npc, reason="memory_update for deceased NPC — "
+                                    "resurrection detected", force=True)
                 # Reactivate background NPCs that appear in current scene
-                if npc.get("status") == "background":
+                elif npc.get("status") == "background":
                     _reactivate_npc(npc, reason="memory_update in current scene")
                 # Ensure memory system fields exist
                 _ensure_npc_memory_fields(npc)
@@ -5064,22 +5147,19 @@ def start_new_chapter(client: anthropic.Anthropic, game: GameState,
 
     # Retire dead or irrelevant NPCs to background before new chapter
     for npc in game.npcs:
+        # Deceased NPCs stay deceased — skip them entirely
+        if npc.get("status") == "deceased":
+            continue
         if npc.get("status") != "active":
             continue
-        name_lower = npc.get("name", "").lower()
-        desc_lower = npc.get("description", "").lower()
-        # Dead NPCs: name or description indicates death
-        is_dead = any(marker in name_lower for marker in ("(getötet)", "(killed)", "(dead)", "(tot)"))
-        is_dead = is_dead or any(marker in desc_lower for marker in ("getötet", "killed", "deceased", "gestorben"))
         # Low-engagement NPCs: no bond, minimal memories, no agenda (filler NPCs)
         is_filler = (npc.get("bond", 0) == 0
                      and len(npc.get("memory", [])) <= 1
                      and not npc.get("agenda", "").strip())
-        if is_dead or is_filler:
+        if is_filler:
             npc["status"] = "background"
-            reason = "dead" if is_dead else "low-engagement filler"
             log(f"[Campaign] Retired NPC to background at chapter boundary: "
-                f"{npc['name']} ({reason})")
+                f"{npc['name']} (low-engagement filler)")
 
     # Keep NPCs but consolidate memories (keep significant ones across chapters)
     for npc in game.npcs:
@@ -5201,6 +5281,7 @@ def process_turn(client: anthropic.Anthropic, game: GameState,
             game.narration_history = game.narration_history[-MAX_NARRATION_HISTORY:]
         game.session_log.append({"scene": game.scene_count,
                                  "summary": brain.get("player_intent", player_message),
+                                 "move": brain.get("move", "dialog"),
                                  "result": "dialog", "consequences": [], "clock_events": [],
                                  "dramatic_question": brain.get("dramatic_question", ""),
                                  "chaos_interrupt": chaos_interrupt,
@@ -5285,6 +5366,7 @@ def process_turn(client: anthropic.Anthropic, game: GameState,
         game.narration_history = game.narration_history[-MAX_NARRATION_HISTORY:]
     game.session_log.append({"scene": game.scene_count,
                              "summary": brain.get("player_intent", player_message),
+                             "move": brain.get("move", "face_danger"),
                              "result": roll.result, "consequences": consequences,
                              "clock_events": clock_events,
                              "position": brain.get("position", "risky"),

@@ -829,7 +829,8 @@ def render_sidebar_status(game: GameState, session=None) -> None:
     # NPCs
     active_npcs = [n for n in game.npcs if n.get("status")=="active" and n.get("introduced",True)]
     background_npcs = [n for n in game.npcs if n.get("status")=="background" and n.get("introduced",True)]
-    if active_npcs or background_npcs:
+    deceased_npcs = [n for n in game.npcs if n.get("status")=="deceased"]
+    if active_npcs or background_npcs or deceased_npcs:
         # Sort by bond (desc), then by most recent memory scene (desc)
         def _npc_sort_key(n):
             last_scene = max((m.get("scene") or 0 for m in n.get("memory", []) if isinstance(m, dict)), default=0)
@@ -851,6 +852,10 @@ def render_sidebar_status(game: GameState, session=None) -> None:
                 for n in background_npcs:
                     disp = dl.get(n["disposition"],f"{E['white_circle']} Neutral")
                     ui.label(f"{disp} {n['name']} {E['dash']} {n['bond']}/{n.get('bond_max',4)}").classes("text-xs").style("opacity: 0.6")
+        if deceased_npcs:
+            with ui.expansion(f"\u2620\ufe0f {t('sidebar.deceased_persons', lang)} ({len(deceased_npcs)})").classes("w-full"):
+                for n in deceased_npcs:
+                    ui.label(f"\u2620\ufe0f {n['name']}").classes("text-xs").style("opacity: 0.4; text-decoration: line-through")
 
 
 def render_sidebar_actions(on_switch_user=None) -> None:
