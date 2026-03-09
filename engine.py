@@ -61,7 +61,7 @@ except ImportError:
 # CONFIGURATION
 # ===============================================================
 
-VERSION = "0.9.40"
+VERSION = "0.9.41"
 
 BRAIN_MODEL = "claude-haiku-4-5-20251001"
 NARRATOR_MODEL = "claude-sonnet-4-5-20250929"
@@ -1337,6 +1337,55 @@ def _is_complete_description(desc: str) -> bool:
     return desc.rstrip().endswith(('.', '!', '?', '"', '»', '«', '…', ')', '–', '—'))
 
 
+def _absorb_duplicate_npc(game, original: dict, merged_name: str):
+    """After an identity reveal renames an NPC, check if a duplicate with the
+    new name was already created by _process_new_npcs earlier in the same
+    metadata cycle. If found, absorb its data and remove the duplicate.
+
+    Example: Metadata Extractor sends both new_npcs=[{"name":"Finn"}] and
+    npc_details=[{"npc_id":"npc_7","full_name":"Finn"}]. _process_new_npcs
+    creates npc_8 "Finn", then _process_npc_details renames npc_7→"Finn".
+    This function merges npc_8 back into npc_7 to prevent duplication."""
+    merged_lower = merged_name.lower().strip()
+    for dup in game.npcs:
+        if (dup is original
+                or dup.get("name", "").lower().strip() != merged_lower
+                or dup.get("id") == original.get("id")):
+            continue
+        dup_id = dup.get("id", "?")
+        dup_mems = dup.get("memory", [])
+        # Transfer memories
+        original.setdefault("memory", [])
+        original["memory"].extend(dup_mems)
+        # Absorb importance accumulator
+        original["importance_accumulator"] = (
+            original.get("importance_accumulator", 0)
+            + dup.get("importance_accumulator", 0)
+        )
+        # Absorb description/agenda/instinct if original is empty
+        if not original.get("description") and dup.get("description"):
+            original["description"] = dup["description"]
+        if not original.get("agenda") and dup.get("agenda"):
+            original["agenda"] = dup["agenda"]
+        if not original.get("instinct") and dup.get("instinct"):
+            original["instinct"] = dup["instinct"]
+        # Merge aliases (add dup's aliases, avoid self-aliases)
+        original.setdefault("aliases", [])
+        existing_lower = {a.lower() for a in original["aliases"]}
+        for alias in dup.get("aliases", []):
+            if (alias.lower() not in existing_lower
+                    and alias.lower() != merged_lower):
+                original["aliases"].append(alias)
+        # Prefer most recent last_location
+        if dup.get("last_location") and not original.get("last_location"):
+            original["last_location"] = dup["last_location"]
+        game.npcs.remove(dup)
+        log(f"[NPC] Absorbed duplicate '{dup.get('name', '?')}' ({dup_id}) "
+            f"into '{original['name']}' ({original.get('id', '?')}): "
+            f"{len(dup_mems)} memories transferred")
+        break  # Only one duplicate expected
+
+
 def _process_npc_details(game, json_text: str):
     """Process NPC detail updates from narrator <npc_details> tag.
     Captures invented surnames, description changes, or other facts the narrator
@@ -1386,8 +1435,15 @@ def _process_npc_details(game, json_text: str):
                     log(f"[NPC] Details update: '{old_name}' → '{new_name}' "
                         f"(surname established)")
                 else:
-                    log(f"[NPC] npc_details: name '{new_name}' too different from "
-                        f"'{old_name}' — use <npc_rename> instead", level="warning")
+                    # Treat as identity reveal: the extractor provided a valid
+                    # npc_id, so we trust the association even when names differ
+                    # completely (e.g. "Der Jungfahrer" → "Finn")
+                    log(f"[NPC] npc_details: treating '{old_name}' → '{new_name}' "
+                        f"as identity reveal (names too different for extension)")
+                    _merge_npc_identity(npc, new_name)
+                    # Check if _process_new_npcs already created a duplicate NPC
+                    # with this name earlier in the same metadata cycle
+                    _absorb_duplicate_npc(game, npc, new_name)
 
             # Replace description if provided (for significant narrative changes,
             # e.g. "combat pilot" → "retired mechanic" after character reveal)
@@ -3810,7 +3866,7 @@ def call_director(client: anthropic.Anthropic, game: GameState,
     try:
         response = _api_create_with_retry(
             client, max_retries=1,
-            model=DIRECTOR_MODEL, max_tokens=2800,
+            model=DIRECTOR_MODEL, max_tokens=3500,
             system=DIRECTOR_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
             output_config={"format": {"type": "json_schema", "schema": DIRECTOR_OUTPUT_SCHEMA}},
@@ -4751,6 +4807,16 @@ def load_game(username: str, name: str = "autosave") -> tuple[Optional[GameState
     # Clean up transient flags that should not persist across save/load
     for npc in game.npcs:
         npc.pop("_needs_reflection", None)
+    # Clean up legacy 'last_seen' field (replaced by 'last_location' in v0.9.14+)
+    for npc in game.npcs:
+        npc.pop("last_seen", None)
+    # Diagnostic: warn about NPCs with empty memories (should have at least seed memory)
+    for npc in game.npcs:
+        if (npc.get("status") in ("active", "background")
+                and not npc.get("memory")
+                and npc.get("introduced")):
+            log(f"[Load] WARNING: NPC '{npc.get('name', '?')}' ({npc.get('id', '?')}) "
+                f"has no memories — possible data loss", level="warning")
     # Sanitize NPC names: strip parenthetical annotations from older saves
     for npc in game.npcs:
         _apply_name_sanitization(npc)

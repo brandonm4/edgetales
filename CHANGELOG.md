@@ -5,6 +5,19 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.41]
+
+### Fixed
+- **NPC identity reveal via `npc_details` now triggers merge instead of rejection:** When the Metadata Extractor sends `npc_details` with a `full_name` that differs completely from the NPC's current name (e.g. `npc_id:"npc_7"` "Der Jungfahrer" → `full_name:"Finn"`), the engine now treats this as an identity reveal via `_merge_npc_identity()` instead of logging a warning and doing nothing. Previously, this created duplicate NPCs with split memory pools — the old NPC retained early memories while a newly created NPC accumulated later ones, causing the Narrator to lose context about the character's history
+- **Duplicate NPC absorption after identity reveal (`_absorb_duplicate_npc`):** New helper function that runs after `_process_npc_details` performs an identity reveal. If `_process_new_npcs` (which runs earlier in the same metadata cycle) already created a duplicate NPC with the revealed name, the function absorbs the duplicate's memories, description, agenda, instinct, and aliases into the original NPC, then removes the duplicate. Handles the specific race where the Metadata Extractor sends both `new_npcs:[{"name":"Finn"}]` and `npc_details:[{"npc_id":"npc_7","full_name":"Finn"}]` in the same response
+
+### Changed
+- **Director `max_tokens` raised from 2800 → 3500:** Log analysis showed 39 truncated NPC descriptions across 22 Director calls in a single session (avg ~1.8 per call). The truncation guard correctly rejected all of them, but the high rate indicates the 2800 budget was insufficient when the Director needs to output reflections + descriptions + guidance for multiple NPCs simultaneously. The increase matches the Narrator's 3500 budget and adds ~25% headroom for German-language output
+- **Legacy `last_seen` field cleanup in `load_game()`:** Opening-scene NPC templates sometimes included a `last_seen` field (AI-generated). This field was never used by the engine (which uses `last_location`), but persisted as dead data in savegames. Now stripped on load
+- **Empty-memory diagnostic in `load_game()`:** Active/background NPCs with `introduced=True` but no memories now trigger a `[Load] WARNING` log entry, helping detect potential data loss (every mid-game NPC should have at least a seed memory from `_process_new_npcs`)
+
+---
+
 ## [0.9.40]
 
 ### Added
