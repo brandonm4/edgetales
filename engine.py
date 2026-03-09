@@ -61,7 +61,7 @@ except ImportError:
 # CONFIGURATION
 # ===============================================================
 
-VERSION = "0.9.42"
+VERSION = "0.9.43"
 
 BRAIN_MODEL = "claude-haiku-4-5-20251001"
 NARRATOR_MODEL = "claude-sonnet-4-5-20250929"
@@ -104,7 +104,7 @@ def _creativity_seed(n: int = 3) -> str:
     if _HAS_WONDERWORDS:
         try:
             words = [_rw.word(include_parts_of_speech=["nouns", "adjectives"],
-                              word_min_length=4, word_max_length=10,
+                              word_min_length=4, word_max_length=12,
                               exclude_with_spaces=True)
                      for _ in range(n)]
             return " ".join(words)

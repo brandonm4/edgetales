@@ -161,6 +161,11 @@ _STRINGS = {
         "user.api_hint": "API Key nach Spielerauswahl in den Einstellungen hinterlegen.",
         "user.api_missing": "Bitte API Key in den Einstellungen eingeben.",
 
+        # Language Onboarding (first-time user)
+        "onboarding.title": "Willkommen!",
+        "onboarding.subtitle": "W\u00e4hle deine Sprachen \u2014 du kannst sie sp\u00e4ter in den Einstellungen \u00e4ndern.",
+        "onboarding.confirm": "Los geht\u2019s",
+
         # Sidebar — Status
         "sidebar.kid_mode": "Kindermodus",
         "sidebar.crisis": "KRISE",
@@ -468,6 +473,7 @@ _STRINGS = {
         "aria.archetype_selection": "Archetyp ausw\u00e4hlen",
         "aria.load_save": "Spielstand {name} laden",
         "aria.delete_save": "Spielstand {name} l\u00f6schen",
+        "aria.location": "Ort",
 
         # Settings
         "settings.sr_chat": "Screenreader im Chat",
@@ -505,6 +511,11 @@ _STRINGS = {
         "user.exists": 'Player "{name}" already exists.',
         "user.api_hint": "Set your API key in the settings after selecting a player.",
         "user.api_missing": "Please enter your API key in the settings.",
+
+        # Language Onboarding (first-time user)
+        "onboarding.title": "Welcome!",
+        "onboarding.subtitle": "Choose your languages \u2014 you can change them later in the settings.",
+        "onboarding.confirm": "Let\u2019s go",
 
         # Sidebar — Status
         "sidebar.kid_mode": "Kid Mode",
@@ -814,6 +825,7 @@ _STRINGS = {
         "aria.archetype_selection": "Select archetype",
         "aria.load_save": "Load save {name}",
         "aria.delete_save": "Delete save {name}",
+        "aria.location": "Location",
 
         # Settings
         "settings.sr_chat": "Screen reader in chat",

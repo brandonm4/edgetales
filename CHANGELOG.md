@@ -5,6 +5,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.43]
+
+### Added
+- **Language onboarding dialog for first-time users:** When a newly created player is selected for the first time (empty `settings.json`), a persistent modal dialog appears prompting the user to choose their UI language and narration language before entering the app. The dialog uses `aria-label` on the dialog element itself, hides the decorative globe emoji from screen readers, and leverages Quasar's built-in focus trapping. Language dropdowns show native labels ("Deutsch", "English", "Français"…) so non-default-language speakers can self-serve. Choices are saved to `settings.json` immediately, and `load_user_settings()` re-runs after confirmation to ensure all label resolutions use the chosen language
+- **Sensible defaults for new users:** The onboarding dialog sets `dice_display: 1` (Simple), `stt_enabled: true`, `whisper_size: "medium"`, and `sr_chat: true` via `setdefault()` on the new user's config
+- **ARIA on settings info icons:** All four info icons in `render_settings()` (Kid Mode, TTS, STT, Screen Reader in Chat) now have `tabindex="0"`, `role="img"`, and `aria-label` with the tooltip text. Previously these icons were invisible to screen readers and unreachable by keyboard — the tooltip explanations were hover-only
+- **Decorative emoji ARIA hiding:** Emojis that add no semantic value are now hidden from screen readers via `aria-label` overrides on their parent elements:
+  - 🎭 mask emoji on character name (sidebar + creation confirm) → screen reader reads only the name
+  - 📍 pin emoji on location line (sidebar + creation confirm) → replaced with localized prefix "Ort:" / "Location:" via new `aria.location` i18n key
+  - ⚔️ swords emoji on login page title → screen reader reads only "EdgeTales"
+- **New i18n keys:** `onboarding.title`, `onboarding.subtitle`, `onboarding.confirm` (DE + EN), `aria.location` (DE: "Ort", EN: "Location")
+
+---
+
 ## [0.9.42]
 
 ### Fixed

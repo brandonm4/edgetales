@@ -770,13 +770,15 @@ def render_sidebar_status(game: GameState, session=None) -> None:
     lang = s.get("ui_lang", DEFAULT_UI_LANG or DEFAULT_LANG) if session else L()
     kid = s.get("kid_friendly", False)
     sl = get_stat_labels(lang)
-    ui.label(f"{E['mask']} {game.player_name}").classes("text-lg font-bold")
+    _name_aria = game.player_name.replace('"', '&quot;')
+    ui.label(f"{E['mask']} {game.player_name}").classes("text-lg font-bold").props(f'aria-label="{_name_aria}"')
     ui.label(game.character_concept).classes("text-sm text-gray-400 italic")
     if kid: ui.label(f"{E['green_heart']} {t('sidebar.kid_mode', lang)}").classes("text-xs text-green-400")
     tl = get_time_labels(lang)
     t_label = tl.get(game.time_of_day, "") if game.time_of_day else ""
     t_disp = f" {E['dash']} {t_label}" if t_label else ""
-    ui.label(f"{E['pin']} {game.current_location} {E['dash']} {t('sidebar.scene', lang)} {game.scene_count}{t_disp}").classes("text-xs text-gray-400")
+    _loc_aria = f"{t('aria.location', lang)}: {game.current_location} {E['dash']} {t('sidebar.scene', lang)} {game.scene_count}{t_disp}".replace('"', '&quot;')
+    ui.label(f"{E['pin']} {game.current_location} {E['dash']} {t('sidebar.scene', lang)} {game.scene_count}{t_disp}").classes("text-xs text-gray-400").props(f'aria-label="{_loc_aria}"')
     if game.crisis_mode and not game.game_over:
         ui.label(f"{E['warn']} {t('sidebar.crisis_kid', lang) if kid else t('sidebar.crisis', lang)}").classes("text-sm text-red-400 font-bold mt-2")
     if game.game_over:
@@ -1145,13 +1147,13 @@ def render_settings() -> None:
         with ui.row().classes("w-full items-center justify-between"):
             kid_sw = ui.switch(t("settings.kid_mode", lang), value=s.get("kid_friendly",False))
             _tip = t("settings.kid_tooltip", lang)
-            with ui.icon("info_outline").classes("text-gray-400 cursor-help"):
+            with ui.icon("info_outline").classes("text-gray-400 cursor-help").props(f'tabindex="0" role="img" aria-label="{_tip}"'):
                 ui.tooltip(_tip)
         ui.separator()
         with ui.row().classes("w-full items-center justify-between"):
             tts_sw = ui.switch(t("settings.tts", lang), value=s.get("tts_enabled",False))
             _tip = t("settings.tts_tooltip", lang)
-            with ui.icon("info_outline").classes("text-gray-400 cursor-help"):
+            with ui.icon("info_outline").classes("text-gray-400 cursor-help").props(f'tabindex="0" role="img" aria-label="{_tip}"'):
                 ui.tooltip(_tip)
         tts_container = ui.column().classes("w-full gap-1")
         tts_container.bind_visibility_from(tts_sw, "value")
@@ -1246,7 +1248,7 @@ def render_settings() -> None:
         with ui.row().classes("w-full items-center justify-between"):
             stt_sw = ui.switch(t("settings.stt", lang), value=s.get("stt_enabled",False))
             _tip = t("settings.stt_tooltip", lang)
-            with ui.icon("info_outline").classes("text-gray-400 cursor-help"):
+            with ui.icon("info_outline").classes("text-gray-400 cursor-help").props(f'tabindex="0" role="img" aria-label="{_tip}"'):
                 ui.tooltip(_tip)
         wm = get_whisper_models(lang)
         whisper_display = [f"{k} {E['dash']} {v}" for k, v in wm.items()]
@@ -1260,7 +1262,7 @@ def render_settings() -> None:
         with ui.row().classes("w-full items-center justify-between"):
             sr_chat_sw = ui.switch(t("settings.sr_chat", lang), value=s.get("sr_chat", True))
             _tip = t("settings.sr_chat_tooltip", lang)
-            with ui.icon("info_outline").classes("text-gray-400 cursor-help"):
+            with ui.icon("info_outline").classes("text-gray-400 cursor-help").props(f'tabindex="0" role="img" aria-label="{_tip}"'):
                 ui.tooltip(_tip)
         ui.separator()
         dice_opts = get_dice_display_options(lang)
@@ -1639,12 +1641,14 @@ def _render_confirm():
     location=setup.get("starting_location","")
 
     # --- Character summary ---
-    ui.markdown(f"### {E['mask']} {name}")
+    _name_esc = name.replace('"', '&quot;')
+    ui.markdown(f"### {E['mask']} {name}").props(f'aria-label="{_name_esc}"')
     ui.markdown(f"*{concept}*")
     if setting_desc:
         ui.markdown(f"{setting_desc}")
     if location:
-        ui.markdown(f"{E['pin']} {location}")
+        _loc_esc = f"{t('aria.location', lang)}: {location}".replace('"', '&quot;')
+        ui.markdown(f"{E['pin']} {location}").props(f'aria-label="{_loc_esc}"')
     sl = get_stat_labels(lang)
     with ui.row().classes("gap-4 my-2"):
         for sk,slabel in sl.items():
@@ -2445,7 +2449,7 @@ async def main_page(client: Client):
         lang = L()
         with content_area:
             with ui.column().classes("w-full max-w-sm mx-auto mt-20 gap-4 items-center"):
-                ui.label(f"{E['swords']} {t('login.title', lang)}").classes("text-2xl font-bold")
+                ui.label(f"{E['swords']} {t('login.title', lang)}").classes("text-2xl font-bold").props(f'aria-label="{t("login.title", lang)}"')
                 ui.label(t("user.subtitle", lang)).classes("text-gray-400 italic")
                 ui.label(t("login.subtitle", lang)).classes("text-gray-400 text-sm")
                 code_inp = ui.input(t("login.code_label", lang), password=True, password_toggle_button=True).classes("w-full")
@@ -2519,11 +2523,50 @@ async def main_page(client: Client):
                     ui.label(f"{E['gear']} {t('user.api_hint', lang)}").classes("text-sm text-gray-400 w-96 text-center")
         _focus_element('.q-page .q-btn', delay_ms=500)
 
+    async def _show_language_onboarding(username: str):
+        """Show language selection overlay for first-time users."""
+        lang = L()
+        done = asyncio.Event()
+        with ui.dialog() as dlg, ui.card().classes("w-full max-w-sm p-6"):
+            dlg.props(f'persistent aria-label="{t("onboarding.title", lang)}"')
+            _title = t("onboarding.title", lang)
+            ui.label(f"{E['globe']} {_title}").classes("text-xl font-bold").props(f'aria-label="{_title}"')
+            ui.label(t("onboarding.subtitle", lang)).classes("text-sm").style("color: var(--text-secondary)")
+            ui.separator().classes("my-2")
+            ui_lang_labels = list(UI_LANGUAGES.keys())
+            _code_to_label = {v: k for k, v in UI_LANGUAGES.items()}
+            cur_ui = _code_to_label.get(s.get("ui_lang", DEFAULT_UI_LANG or DEFAULT_LANG), ui_lang_labels[0])
+            ui_sel = ui.select(ui_lang_labels, label=t("settings.ui_lang", lang), value=cur_ui).classes("w-full")
+            narr_sel = ui.select(list(LANGUAGES.keys()), label=t("settings.narration_lang", lang), value=s.get("narration_lang", "Deutsch")).classes("w-full")
+            async def confirm():
+                chosen_ui = UI_LANGUAGES.get(ui_sel.value, DEFAULT_LANG)
+                s["ui_lang"] = chosen_ui
+                s["narration_lang"] = narr_sel.value
+                ucfg = load_user_config(username)
+                ucfg["ui_lang"] = chosen_ui
+                ucfg["narration_lang"] = narr_sel.value
+                # Sensible defaults for new users
+                ucfg.setdefault("dice_display", 1)        # Simple
+                ucfg.setdefault("stt_enabled", True)       # STT on
+                ucfg.setdefault("whisper_size", "medium")  # Medium model
+                ucfg.setdefault("sr_chat", True)           # Screen reader in chat
+                save_user_config(username, ucfg)
+                load_user_settings(username)
+                s["user_config_loaded"] = True
+                dlg.close()
+                done.set()
+            ui.button(f"{t('onboarding.confirm', lang)} {E['arrow_r']}", on_click=confirm, color="primary").classes("w-full mt-4")
+        dlg.open()
+        await done.wait()
+
     async def _select_user(name: str):
         """Handle user selection → transition to main phase without reload."""
         s["current_user"] = name
         load_user_settings(name)
         s["user_config_loaded"] = True
+        # First-time user: show language onboarding before entering the app
+        if not load_user_config(name):
+            await _show_language_onboarding(name)
         # Auto-load autosave if it exists
         if not s.get("game"):
             loaded, hist = load_game(name, "autosave")
