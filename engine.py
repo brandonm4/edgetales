@@ -2773,8 +2773,17 @@ def _json_schema_text_format(name: str, schema: dict) -> dict:
     }
 
 
+def _clean_model_output_text(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+    text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<!--[\s\S]*?-->", "", text)
+    text = re.sub(r"<!--[\s\S]*$", "", text)
+    return text.strip()
+
+
 def _response_text(response) -> str:
-    text = getattr(response, "output_text", "") or ""
+    text = _clean_model_output_text(getattr(response, "output_text", "") or "")
     if text:
         return text
 
@@ -2783,7 +2792,7 @@ def _response_text(response) -> str:
         for content in getattr(item, "content", []) or []:
             if getattr(content, "type", "") == "output_text":
                 parts.append(getattr(content, "text", ""))
-    return "".join(parts)
+    return _clean_model_output_text("".join(parts))
 
 
 def _response_stop_reason(response) -> str:
@@ -6599,4 +6608,3 @@ def process_momentum_burn(client: ModelGateway, game: GameState,
 
     # Note: UI layer handles save_game()
     return game, narration
-
