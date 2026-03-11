@@ -131,6 +131,7 @@ from engine import (
     list_users, create_user, delete_user,
     save_game, load_game, list_saves, list_saves_with_info, delete_save, export_story_pdf,
     save_chapter_archive, load_chapter_archive, list_chapter_archives, delete_chapter_archives,
+    capture_turn_checkpoint, restore_game_state,
     get_current_act, setup_file_logging,
     call_setup_brain, start_new_game, start_new_chapter,
     process_turn, process_momentum_burn, process_correction, call_recap,
@@ -421,6 +422,8 @@ def init_session() -> None:
     s.setdefault("_turn_gen", 0)       # Incremented on save load/new game — stale response guard
     s.setdefault("turn_status_phase", "")
     s.setdefault("turn_status_detail", "")
+    s.setdefault("message_edit_index", None)
+    s.setdefault("message_edit_value", "")
     # API key: prefer server-side env var, fall back to config file
     if not s["global_config_loaded"]:
         if SERVER_API_KEY:
@@ -476,6 +479,150 @@ def _turn_status_html() -> str:
         f'<div class="turn-status-detail" style="margin-top:0.4rem; font-size:0.82rem; color: var(--text-secondary);">{detail}</div>'
         if detail
         else f'<div class="turn-status-phases" style="display:flex; flex-wrap:wrap; gap:0.4rem;">{"".join(pills)}</div>'
+    )
+
+
+def _checkpoint_capable(game: Optional[GameState]) -> bool:
+    return bool(game and getattr(game, "turn_checkpoints", None))
+
+
+def _saved_message_count(messages: list, upto: Optional[int] = None) -> int:
+    subset = messages if upto is None else messages[:upto]
+    return sum(1 for msg in subset if not msg.get("recap"))
+
+
+def _seed_initial_checkpoint_if_missing(game: Optional[GameState], messages: list) -> None:
+    if not game or getattr(game, "turn_checkpoints", None):
+        return
+    if game.scene_count <= 1 and messages:
+        capture_turn_checkpoint(game, messages)
+
+
+def _restore_to_message_boundary(game: GameState, messages: list, keep_upto: int) -> bool:
+    keep_count = _saved_message_count(messages, keep_upto)
+    checkpoints = sorted(game.turn_checkpoints or [], key=lambda cp: cp.get("message_count", 0))
+    eligible = [cp for cp in checkpoints if cp.get("message_count", 0) <= keep_count]
+    if not eligible:
+        return False
+    restore_game_state(game, eligible[-1]["game_state"])
+    return True
+
+
+def _trim_start_for_message(messages: list, index: int) -> int:
+    if index < 0 or index >= len(messages):
+        return index
+    msg = messages[index]
+    if msg.get("role") == "assistant" and index > 0 and messages[index - 1].get("scene_marker"):
+        return index - 1
+    return index
+
+
+def _find_prior_user_index(messages: list, index: int) -> Optional[int]:
+    for pos in range(index, -1, -1):
+        if messages[pos].get("role") == "user" and not messages[pos].get("correction_input"):
+            return pos
+    return None
+
+
+def _scene_number_for_message(messages: list, index: int) -> int:
+    return sum(1 for msg in messages[:index + 1] if msg.get("scene_marker"))
+
+
+def _refresh_chat_view() -> None:
+    s = S()
+    chat_container = s.get("_chat_container")
+    if chat_container is None:
+        return
+    chat_container.clear()
+    with chat_container:
+        render_chat_messages(chat_container)
+
+
+async def _save_message_edit(index: int) -> None:
+    s = S()
+    game = s.get("game")
+    messages = s.get("messages", [])
+    if index < 0 or index >= len(messages):
+        return
+    new_text = (s.get("message_edit_value") or "").strip()
+    if not new_text:
+        ui.notify("Message cannot be empty.", type="warning", position="top")
+        return
+    messages[index]["content"] = new_text
+    if messages[index].get("role") == "assistant" and game:
+        scene_no = _scene_number_for_message(messages, index)
+        if 0 < scene_no <= len(game.narration_history):
+            game.narration_history[scene_no - 1]["narration"] = new_text[:1500]
+    s["message_edit_index"] = None
+    s["message_edit_value"] = ""
+    if game:
+        save_game(game, s["current_user"], messages, s.get("active_save", "autosave"))
+    _refresh_chat_view()
+
+
+def _begin_message_edit(index: int) -> None:
+    s = S()
+    messages = s.get("messages", [])
+    if index < 0 or index >= len(messages):
+        return
+    s["message_edit_index"] = index
+    s["message_edit_value"] = messages[index].get("content", "")
+    _refresh_chat_view()
+
+
+def _cancel_message_edit() -> None:
+    s = S()
+    s["message_edit_index"] = None
+    s["message_edit_value"] = ""
+    _refresh_chat_view()
+
+
+async def _delete_message_from(index: int) -> None:
+    s = S()
+    game = s.get("game")
+    messages = s.get("messages", [])
+    if not game or index < 0 or index >= len(messages):
+        return
+    trim_start = _trim_start_for_message(messages, index)
+    if not _restore_to_message_boundary(game, messages, trim_start):
+        ui.notify("Delete is only available after checkpointed scenes.", type="warning", position="top")
+        return
+    s["messages"] = messages[:trim_start]
+    s["message_edit_index"] = None
+    s["message_edit_value"] = ""
+    if s.get("_sidebar_refresh"):
+        s["_sidebar_refresh"](game)
+    _refresh_chat_view()
+    save_game(game, s["current_user"], s["messages"], s.get("active_save", "autosave"))
+
+
+async def _redo_message_from(index: int) -> None:
+    s = S()
+    game = s.get("game")
+    messages = s.get("messages", [])
+    if not game or index < 0 or index >= len(messages):
+        return
+    user_index = _find_prior_user_index(messages, index)
+    if user_index is None:
+        ui.notify("No user prompt found to rerun.", type="warning", position="top")
+        return
+    trim_start = _trim_start_for_message(messages, user_index if messages[index].get("role") == "user" else index)
+    if not _restore_to_message_boundary(game, messages, trim_start):
+        ui.notify("Redo is only available after checkpointed scenes.", type="warning", position="top")
+        return
+    s["messages"] = messages[:trim_start] if messages[index].get("role") == "assistant" else messages[:user_index + 1]
+    s["message_edit_index"] = None
+    s["message_edit_value"] = ""
+    if s.get("_sidebar_refresh"):
+        s["_sidebar_refresh"](game)
+    _refresh_chat_view()
+    await process_player_input(
+        messages[user_index].get("content", ""),
+        s.get("_chat_container"),
+        sidebar_refresh=s.get("_sidebar_refresh"),
+        is_retry=True,
+        turn_status_row=s.get("_turn_status_row"),
+        turn_status_content=s.get("_turn_status_content"),
     )
 
 
@@ -1023,7 +1170,22 @@ def render_sidebar_actions(on_switch_user=None) -> None:
     lang = L()
     game = s.get("game")
     username = s["current_user"]
+    sidebar_refresh = s.get("_sidebar_refresh")
     ui.separator()
+    if game:
+        with ui.expansion(f"{E['globe']} {t('creation.world_truths_title', lang)}").classes("w-full"):
+            ui.label(t("creation.world_truths_hint", lang)).classes("text-xs").style("color: var(--text-secondary)")
+            wt_inp = ui.textarea(
+                placeholder=t("creation.world_truths_placeholder", lang),
+                value=getattr(game, "world_truths", ""),
+            ).classes("w-full").props("rows=4 outlined")
+            async def save_world_truths():
+                game.world_truths = wt_inp.value.strip() if wt_inp.value else ""
+                save_game(game, username, s["messages"], s.get("active_save", "autosave"))
+                if sidebar_refresh:
+                    sidebar_refresh(game)
+                ui.notify(t("settings.saved_confirm", lang), type="positive", position="top")
+            ui.button(f"{E['floppy']} {t('settings.save_btn', lang)}", on_click=save_world_truths).props("flat dense").classes("w-full")
     # Recap
     recap_status = None
     async def do_recap():
@@ -1554,6 +1716,7 @@ def render_chat_messages(container) -> Optional[str]:
     _sr_chat = s.get("sr_chat", True)
     viewing = s.get("viewing_chapter")
     messages = s.get("chapter_view_messages", []) if viewing else s.get("messages", [])
+    editing_index = s.get("message_edit_index")
     last_scene_marker_id = None
     for i, msg in enumerate(messages):
         if msg.get("scene_marker"):
@@ -1582,9 +1745,32 @@ def render_chat_messages(container) -> Optional[str]:
                     _sr_prefix = f'<span class="sr-only">{t("aria.narrator_says", lang)}</span>'
             if msg.get("corrected"):
                 ui.html(f'<div class="correction-badge" aria-label="{t("aria.correction_badge", lang)}">{t("correction.badge", lang)}</div>')
-            ui.markdown(f"{_sr_prefix}{prefix}{_clean_narration(content)}")
+            if editing_index == i and not viewing:
+                edit_box = ui.textarea(value=s.get("message_edit_value", content)).classes("w-full")
+                edit_box.props('autogrow outlined')
+                edit_box.on_value_change(lambda e: S().__setitem__("message_edit_value", e.value))
+                with ui.row().classes("w-full justify-end gap-2 mt-1"):
+                    ui.button("Save", on_click=lambda idx=i: _save_message_edit(idx)).props("flat dense").classes("text-xs")
+                    ui.button("Cancel", on_click=_cancel_message_edit).props("flat dense").classes("text-xs")
+            else:
+                ui.markdown(f"{_sr_prefix}{prefix}{_clean_narration(content)}")
             rd = msg.get("roll_data")
             if rd: render_dice_display(rd)
+            if not viewing and role in ("user", "assistant") and not msg.get("correction_input"):
+                can_rewind = _checkpoint_capable(s.get("game"))
+                with ui.row().classes("w-full justify-end gap-1 mt-1"):
+                    ui.button(icon="edit", on_click=lambda idx=i: _begin_message_edit(idx)).props(
+                        'flat dense round size=sm aria-label="Edit message"'
+                    ).classes("text-gray-500 hover:text-white").style("min-width: 28px; min-height: 28px")
+                    redo_btn = ui.button(icon="refresh", on_click=lambda idx=i: _redo_message_from(idx)).props(
+                        'flat dense round size=sm aria-label="Redo from message"'
+                    ).classes("text-gray-500 hover:text-white").style("min-width: 28px; min-height: 28px")
+                    delete_btn = ui.button(icon="delete", on_click=lambda idx=i: _delete_message_from(idx)).props(
+                        'flat dense round size=sm aria-label="Delete from message"'
+                    ).classes("text-gray-500 hover:text-white").style("min-width: 28px; min-height: 28px")
+                    if not can_rewind:
+                        redo_btn.disable()
+                        delete_btn.disable()
     return last_scene_marker_id
 
 
@@ -1735,16 +1921,21 @@ def _render_wishes():
     if "content_lines" not in creation:
         cfg=load_user_config(username);creation["content_lines"]=cfg.get("content_lines","")
     if "wishes" not in creation: creation["wishes"]=""
+    if "world_truths" not in creation: creation["world_truths"]=""
     ui.markdown(t("creation.almost_done", lang))
     ui.markdown(f"{E['star']} {t('creation.wishes_label', lang)}")
     w_inp = ui.textarea(placeholder=t("creation.wishes_placeholder", lang), value=creation.get("wishes","")).classes("w-full").props(f'aria-label="{t("creation.wishes_placeholder", lang)}"')
     ui.label(f"{E['star']} {t('creation.wishes_hint', lang)}").classes("text-xs text-gray-500")
+    ui.markdown(f"{E['globe']} {t('creation.world_truths_label', lang)}")
+    wt_inp = ui.textarea(placeholder=t("creation.world_truths_placeholder", lang), value=creation.get("world_truths","")).classes("w-full").props(f'aria-label="{t("creation.world_truths_placeholder", lang)}"')
+    ui.label(f"{E['globe']} {t('creation.world_truths_hint', lang)}").classes("text-xs text-gray-500")
     ui.markdown(f"{E['shield']} {t('creation.boundaries_label', lang)}")
     l_inp = ui.textarea(placeholder=t("creation.boundaries_placeholder", lang), value=creation.get("content_lines","")).classes("w-full").props(f'aria-label="{t("creation.boundaries_placeholder", lang)}"')
     ui.label(f"{E['shield']} {t('creation.boundaries_hint', lang)}").classes("text-xs text-gray-500")
     btn_container = ui.column().classes("w-full mt-4 gap-2")
     async def proceed():
         creation["wishes"]=w_inp.value.strip() if w_inp.value else ""
+        creation["world_truths"]=wt_inp.value.strip() if wt_inp.value else ""
         creation["content_lines"]=l_inp.value.strip() if l_inp.value else ""
         # Show spinner below button
         with btn_container:
@@ -1800,6 +1991,8 @@ def _render_confirm():
         ui.markdown(f"{E['scroll']} **{t('creation.backstory_title', lang)}:** {creation['custom_desc']}")
     if creation.get("wishes"):
         ui.markdown(f"{E['star']} **{t('creation.wishes_title', lang)}:** {creation['wishes']}")
+    if creation.get("world_truths"):
+        ui.markdown(f"{E['globe']} **{t('creation.world_truths_title', lang)}:** {creation['world_truths']}")
     if creation.get("content_lines"):
         ui.markdown(f"{E['shield']} **{t('creation.boundaries_title', lang)}:** {creation['content_lines']}")
 
@@ -1848,6 +2041,7 @@ def _render_confirm():
         sel_archetype = ui.select(arch_labels, label=t("creation.archetype", lang), value=arch_labels[arch_idx]).classes("w-full")
         ui.separator()
         edit_wishes = ui.textarea(f"{E['star']} {t('creation.wishes_title', lang)}", value=creation.get("wishes",""), placeholder=t("creation.wishes_placeholder", lang)).props("rows=2").classes("w-full")
+        edit_world_truths = ui.textarea(f"{E['globe']} {t('creation.world_truths_title', lang)}", value=creation.get("world_truths",""), placeholder=t("creation.world_truths_placeholder", lang)).props("rows=3").classes("w-full")
         edit_lines = ui.textarea(f"{E['shield']} {t('creation.boundaries_title', lang)}", value=creation.get("content_lines",""), placeholder=t("creation.boundaries_placeholder", lang)).props("rows=2").classes("w-full")
         ui.separator()
         adjust_container = ui.column().classes("w-full gap-2")
@@ -1881,6 +2075,7 @@ def _render_confirm():
             updated["custom_desc"] = edit_desc.value or ""
             updated["player_name"] = edit_name.value or ""
             updated["wishes"] = edit_wishes.value.strip() if edit_wishes.value else ""
+            updated["world_truths"] = edit_world_truths.value.strip() if edit_world_truths.value else ""
             updated["content_lines"] = edit_lines.value.strip() if edit_lines.value else ""
             with adjust_container:
                 with ui.row().classes("w-full items-center gap-3"):
@@ -1967,6 +2162,7 @@ def _render_confirm():
                     s["game"]=game;s["creation"]=None;s["active_save"]="autosave"
                     s["messages"].append({"scene_marker":t("game.scene_marker", lang, n=1, location=game.current_location)})
                     s["messages"].append({"role":"assistant","content":narration})
+                    capture_turn_checkpoint(game, s["messages"])
                     save_game(game,username,s["messages"],s["active_save"])
                     if s.get("tts_enabled",False): s["pending_tts"]=narration
                     ui.navigate.reload()
@@ -2162,6 +2358,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
         _set_turn_status("save", "Persisting the updated game state")
         if turn_status_content is not None:
             turn_status_content.content = _turn_status_html()
+        capture_turn_checkpoint(game, s["messages"])
         save_game(game,username,s["messages"],s.get("active_save","autosave"))
         _set_turn_status()
         if turn_status_row is not None:
@@ -2333,6 +2530,7 @@ def _make_chapter_action(game, chapter_msg_key: str):
                 {"scene_marker": t("game.scene_marker", lang, n=1, location=g.current_location)},
                 {"role": "assistant", "content": f"*{E['book']} {t(chapter_msg_key, lang, n=ch)}*\n\n{n}"},
             ]
+            capture_turn_checkpoint(g, s["messages"])
             save_game(g, username, s["messages"], s.get("active_save", "autosave"))
             if s.get("tts_enabled", False): s["pending_tts"] = n
             ui.navigate.reload()
@@ -2757,6 +2955,7 @@ async def main_page(client: Client):
                 s["game"] = loaded
                 s["messages"] = hist
                 s["active_save"] = "autosave"
+                _seed_initial_checkpoint_if_missing(loaded, hist)
         await _show_main_phase()
 
     async def _handle_switch_user():
@@ -2821,6 +3020,7 @@ async def main_page(client: Client):
                     render_sidebar_status(game_obj, session=_sidebar_session)
             except Exception as e:
                 log(f"[Sidebar] Refresh failed: {e}", level="warning")
+        s["_sidebar_refresh"] = _refresh_sidebar
 
         # --- Build main content ---
         content_area.clear()
@@ -2921,6 +3121,8 @@ async def main_page(client: Client):
                 )
                 with turn_status:
                     turn_status_content = ui.html(_turn_status_html()).classes("w-full")
+                s["_turn_status_row"] = turn_status
+                s["_turn_status_content"] = turn_status_content
                 with ui.row().classes("w-full items-center gap-2 rpg-input-bar").style("padding: 0.5rem 1rem"):
                     inp = ui.input(placeholder=t("game.input_placeholder", L())).classes("flex-grow").props(f'outlined dense dark aria-label="{t("game.input_placeholder", L())}"')
                     _cc = chat_container  # capture reference for closure

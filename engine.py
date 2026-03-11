@@ -2437,8 +2437,10 @@ class GameState:
     epilogue_dismissed: bool = False   # True if player chose "continue playing" instead of epilogue
     # v5.10: Backstory (canon past, preserved raw player input)
     backstory: str = ""        # Raw player-authored backstory — canon facts, NOT plot seeds
+    world_truths: str = ""     # Per-game world rules and universe constraints
     # v5.11: Director guidance (stored between turns)
     director_guidance: dict = field(default_factory=dict)  # Last DirectorGuidance output
+    turn_checkpoints: list = field(default_factory=list)  # Rewind checkpoints aligned to chat history
     # Transient — NOT in SAVE_FIELDS. Full pre-turn snapshot for ## correction flow.
     last_turn_snapshot: Optional[dict] = field(default=None, repr=False)
 
@@ -2976,6 +2978,9 @@ dialog:none
     backstory_ctx = ""
     if getattr(game, 'backstory', ''):
         backstory_ctx = f"\n<backstory>{game.backstory}</backstory>"
+    world_truths_ctx = ""
+    if getattr(game, 'world_truths', ''):
+        world_truths_ctx = f"\n<world_truths>{game.world_truths}</world_truths>"
 
     user_msg = f"""<state>
 loc:{game.current_location} | ctx:{game.current_scene_context}
@@ -2985,7 +2990,7 @@ time:{game.time_of_day or 'unspecified'} | prev_locations:{', '.join(game.locati
 <npcs>{npc_summary}</npcs>
 <clocks>{clock_summary}</clocks>
 <recent>{last_scenes}</recent>
-{_story_context_block(game)}{campaign_ctx}{backstory_ctx}{_brain_input_context(player_message)}"""
+{_story_context_block(game)}{campaign_ctx}{backstory_ctx}{world_truths_ctx}{_brain_input_context(player_message)}"""
 
     try:
         response = _api_create_with_retry(
@@ -3509,19 +3514,43 @@ def _backstory_block(game: Optional[GameState] = None) -> str:
     )
 
 
+def _world_truths_block(game: Optional[GameState] = None) -> str:
+    """Return world-truths prompt block if player defined hard setting rules."""
+    if not game:
+        return ""
+    truths = getattr(game, "world_truths", "") or ""
+    if not truths.strip():
+        return ""
+    return (
+        "<world_truths>\n"
+        "SETTING CANON — these are hard truths about how this specific universe works:\n"
+        "- Treat them as stable rules unless the player later changes them.\n"
+        "- Use them for technology limits, communications, travel, physics, factions, and metaphysics.\n"
+        "- Do NOT casually contradict them for convenience or dramatic flair.\n"
+        f"{truths}\n"
+        "</world_truths>"
+    )
+
+
 def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) -> str:
     """Build narrator system prompt with configured language."""
     lang = get_narration_lang(config)
     kf = _kid_friendly_block(config)
     cb = _content_boundaries_block(game)
     bs = _backstory_block(game)
+    wt = _world_truths_block(game)
     return f"""<role>Narrator of an immersive RPG. All output in {lang}, second person singular.</role>
-{kf}{cb}{bs}
+{kf}{cb}{bs}{wt}
 <rules>
 - NEVER mention dice, stats, numbers, or game mechanics
 - MISS: concrete failure, situation worsens, NO silver linings
 - WEAK_HIT: success at tangible cost
 - STRONG_HIT: clean success
+- RESULT PRIORITY: The roll result outranks mood. Preserve the tone of the setting, but do NOT narrate a worse mechanical outcome than the result allows.
+- WORLD TRUTHS: If <world_truths> is present, treat it as hard canon for this campaign's setting logic.
+- For STRONG_HIT, the player's objective succeeds clearly in this scene. Do not attach an immediate offsetting cost, self-inflicted setback, or "but actually things are collapsing for you right now" beat unless that cost was explicitly provided elsewhere in the prompt.
+- For WEAK_HIT, include a real cost, complication, tradeoff, or loss in the same scene.
+- For MISS, the player does not achieve the intended objective in the way they attempted it.
 - NPCs act per their disposition and memories
 - Introduce new NAMED characters through action and dialog {E['dash']} give them distinct voices and traits
 - BACKSTORY CANON: If <backstory> is present, treat it as ESTABLISHED HISTORY. People mentioned there (family, friends, rivals) are ALREADY KNOWN to the player character {E['dash']} if they appear, they recognize the player and vice versa. NEVER introduce a backstory character as a stranger or reinterpret established relationships. Backstory events ALREADY HAPPENED {E['dash']} reference them as shared memory, not new plot.
@@ -4570,13 +4599,25 @@ def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
     if roll.result == "MISS":
         clk = "".join(f' clock_triggered="{e["clock"]}:{e["trigger"]}"' for e in clock_events)
         match_hint = ' A MATCH \u2014 the situation escalates dramatically, a fateful twist makes everything worse.' if roll.match else ''
-        constraint = f'<result type="MISS"{match_tag} consequences="{",".join(consequences)}"{clk}>Concrete failure. No silver linings. Make it hurt.{match_hint}</r>'
+        constraint = (
+            f'<result type="MISS"{match_tag} consequences="{",".join(consequences)}"{clk}>'
+            f'Concrete failure. The intended objective does not succeed. No silver linings. '
+            f'Any progress must be outweighed by the setback.{match_hint}</r>'
+        )
     elif roll.result == "WEAK_HIT":
         match_hint = ' A MATCH \u2014 despite the cost, something unexpected and significant happens, a twist of fate.' if roll.match else ''
-        constraint = f'<result type="WEAK_HIT"{match_tag}>Success with tangible cost or complication.{match_hint}</r>'
+        constraint = (
+            f'<result type="WEAK_HIT"{match_tag}>'
+            f'Success with a tangible cost or complication in this same scene. '
+            f'The player gains something, but pays for it immediately.{match_hint}</r>'
+        )
     else:
         match_hint = ' A MATCH \u2014 an unexpected boon, a fateful revelation, or a dramatic advantage beyond the clean success.' if roll.match else ''
-        constraint = f'<result type="STRONG_HIT"{match_tag}>Clean success.{match_hint}</r>'
+        constraint = (
+            f'<result type="STRONG_HIT"{match_tag}>'
+            f'Clean success. The player achieves the intended objective decisively in this scene. '
+            f'Do not undercut the win with an immediate new price, self-damage, or failure beat unless the prompt explicitly supplies one.{match_hint}</r>'
+        )
 
     position_tag = f'<position level="{position}" effect="{effect}"/>'
 
@@ -4610,6 +4651,13 @@ def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
 {constraint}
 {position_tag}
 <status h="{game.health}" sp="{game.spirit}" su="{game.supply}" m="{game.momentum}"/>
+<resolution_contract>
+- Follow the <result> tag literally.
+- If result type is STRONG_HIT, end the scene with the player ahead on the stated objective.
+- If result type is WEAK_HIT, show the win and the cost together.
+- If result type is MISS, show the objective failing or backfiring.
+- Never narrate consequences harsher than the result type implies.
+</resolution_contract>
 <location>{game.current_location}</location>{loc_hist}{time_ctx}
 {npc}{npcs_section}{wl}{flags}{agency}
 {pacing}{director_block}
@@ -4975,9 +5023,53 @@ SAVE_FIELDS = [
     "epilogue_dismissed",
     # v5.10: Backstory
     "backstory",
+    "world_truths",
     # v5.11: Director guidance
     "director_guidance",
+    "turn_checkpoints",
 ]
+
+
+def _serialize_chat_messages(chat_messages: list | None) -> list:
+    raw_messages = chat_messages or []
+    return [
+        {k: v for k, v in msg.items() if k not in ("audio_bytes", "audio_format")}
+        for msg in raw_messages
+        if not msg.get("recap")
+    ]
+
+
+def _serialize_game_state(game: GameState, include_checkpoints: bool = True) -> dict:
+    state = {}
+    for key in SAVE_FIELDS:
+        if key == "turn_checkpoints" and not include_checkpoints:
+            state[key] = []
+            continue
+        state[key] = copy.deepcopy(getattr(game, key))
+    return state
+
+
+def restore_game_state(game: GameState, state: dict) -> GameState:
+    for key in SAVE_FIELDS:
+        if key in state and hasattr(game, key):
+            setattr(game, key, copy.deepcopy(state[key]))
+    return game
+
+
+def capture_turn_checkpoint(game: GameState, chat_messages: list | None = None) -> dict:
+    """Store a rewind point for the current visible transcript and game state."""
+    entry = {
+        "message_count": len(_serialize_chat_messages(chat_messages)),
+        "scene_count": game.scene_count,
+        "game_state": _serialize_game_state(game, include_checkpoints=False),
+    }
+    checkpoints = [
+        cp for cp in (game.turn_checkpoints or [])
+        if cp.get("message_count", -1) < entry["message_count"]
+    ]
+    checkpoints.append(entry)
+    game.turn_checkpoints = checkpoints
+    return entry
 
 def save_game(game: GameState, username: str, chat_messages: list = None,
               name: str = "autosave") -> Path:
@@ -5002,14 +5094,9 @@ def save_game(game: GameState, username: str, chat_messages: list = None,
     data = {"saved_at": datetime.now().isoformat()}
     data["engine_version"] = VERSION
     data["version_history"] = version_history
-    data.update({k: getattr(game, k) for k in SAVE_FIELDS})
+    data.update(_serialize_game_state(game))
     # Chat history for visual restoration (strip audio binary data and transient recaps)
-    raw_messages = chat_messages or []
-    data["chat_messages"] = [
-        {k: v for k, v in msg.items() if k not in ("audio_bytes", "audio_format")}
-        for msg in raw_messages
-        if not msg.get("recap")
-    ]
+    data["chat_messages"] = _serialize_chat_messages(chat_messages)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     log(f"[Save] Game saved: {username}/{name} (Scene {game.scene_count}, {len(data['chat_messages'])} chat msgs)")
     return path
@@ -5445,6 +5532,7 @@ def start_new_game(client: ModelGateway, creation_data: dict,
         player_wishes=creation_data.get("wishes", ""),
         content_lines=creation_data.get("content_lines", ""),
         backstory=creation_data.get("custom_desc", ""),
+        world_truths=creation_data.get("world_truths", ""),
     )
     log(f"[NewGame] Character created: {game.player_name} at {game.current_location}")
 
