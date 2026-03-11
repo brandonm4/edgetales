@@ -17,7 +17,7 @@ def _ensure_requirements():
 
     # Map: import_name → pip package name
     _REQUIRED = {
-        "anthropic":      "anthropic",
+        "openai":         "openai",
         "nicegui":        "nicegui",
         "reportlab":      "reportlab",
         "edge_tts":       "edge-tts",
@@ -113,8 +113,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-import anthropic
+import openai
 from nicegui import app, ui, Client
+from provider import create_gateway
 
 # ---------------------------------------------------------------------------
 # Engine & Voice imports
@@ -162,15 +163,41 @@ def get_voice_engine() -> VoiceEngine:
     return _voice_engine
 
 
+def get_model_gateway(api_key: str):
+    return create_gateway(
+        api_key=api_key,
+        base_url=PROVIDER_BASE_URL,
+        mode=PROVIDER_MODE,
+    )
+
+
+def _provider_allows_implicit_auth() -> bool:
+    return PROVIDER_MODE in ("chatmock", "proxy") and bool(PROVIDER_BASE_URL)
+
+
+def _model_access_configured() -> bool:
+    s = S()
+    return bool((s.get("api_key") or "").strip() or _provider_allows_implicit_auth())
+
+
 # ---------------------------------------------------------------------------
 # Server-side config: config.json → ENV override → defaults
 # ---------------------------------------------------------------------------
 
 def _load_server_config() -> dict:
     """Load server configuration with cascade: config.json → ENV override → defaults."""
+    def _first_env(*names: str) -> str:
+        for name in names:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return value
+        return ""
+
     # 1. Defaults
     cfg = {
         "api_key": "",
+        "provider_mode": "openai",
+        "provider_base_url": "",
         "invite_code": "",
         "enable_https": False,
         "ssl_certfile": "",
@@ -186,34 +213,32 @@ def _load_server_config() -> dict:
         if key in file_cfg:
             cfg[key] = file_cfg[key]
     # 3. ENV overrides config.json (for Docker, systemd, .bat, etc.)
-    env_map = {
-        "ANTHROPIC_API_KEY": "api_key",
-        "INVITE_CODE": "invite_code",
-        "ENABLE_HTTPS": "enable_https",
-        "SSL_CERTFILE": "ssl_certfile",
-        "SSL_KEYFILE": "ssl_keyfile",
-        "STORAGE_SECRET": "storage_secret",
-        "PORT": "port",
-        "DEFAULT_UI_LANG": "default_ui_lang",
-    }
-    for env_key, cfg_key in env_map.items():
-        env_val = os.environ.get(env_key, "").strip()
-        if env_val:
-            # Type coercion for non-string fields
-            if cfg_key == "enable_https":
-                cfg[cfg_key] = env_val.lower() in ("1", "true", "yes")
-            elif cfg_key == "port":
-                try:
-                    cfg[cfg_key] = int(env_val)
-                except ValueError:
-                    pass
-            else:
-                cfg[cfg_key] = env_val
+    cfg["api_key"] = _first_env("EDGETALES_PROVIDER_API_KEY", "EDGETALES_API_KEY", "OPENAI_API_KEY") or cfg["api_key"]
+    cfg["provider_mode"] = _first_env("EDGETALES_PROVIDER_MODE") or cfg["provider_mode"]
+    cfg["provider_base_url"] = _first_env("EDGETALES_PROVIDER_BASE_URL", "OPENAI_BASE_URL") or cfg["provider_base_url"]
+    cfg["invite_code"] = _first_env("INVITE_CODE") or cfg["invite_code"]
+    cfg["ssl_certfile"] = _first_env("SSL_CERTFILE") or cfg["ssl_certfile"]
+    cfg["ssl_keyfile"] = _first_env("SSL_KEYFILE") or cfg["ssl_keyfile"]
+    cfg["storage_secret"] = _first_env("STORAGE_SECRET") or cfg["storage_secret"]
+    cfg["default_ui_lang"] = _first_env("DEFAULT_UI_LANG") or cfg["default_ui_lang"]
+
+    enable_https_val = _first_env("ENABLE_HTTPS")
+    if enable_https_val:
+        cfg["enable_https"] = enable_https_val.lower() in ("1", "true", "yes")
+
+    port_val = _first_env("PORT")
+    if port_val:
+        try:
+            cfg["port"] = int(port_val)
+        except ValueError:
+            pass
     return cfg
 
 _server_cfg = _load_server_config()
 INVITE_CODE: str = _server_cfg["invite_code"]
 SERVER_API_KEY: str = _server_cfg["api_key"]
+PROVIDER_MODE: str = _server_cfg["provider_mode"]
+PROVIDER_BASE_URL: str = _server_cfg["provider_base_url"]
 ENABLE_HTTPS: bool = _server_cfg["enable_https"]
 SSL_CERTFILE: str = _server_cfg["ssl_certfile"]
 SSL_KEYFILE: str = _server_cfg["ssl_keyfile"]
@@ -223,10 +248,12 @@ _raw_ui_lang = _server_cfg.get("default_ui_lang", "").strip().lower()
 DEFAULT_UI_LANG: str = _raw_ui_lang if _raw_ui_lang in UI_LANGUAGES.values() else ""
 
 # Log config state (without secrets)
+_provider_desc = PROVIDER_MODE + (f"@{PROVIDER_BASE_URL}" if PROVIDER_BASE_URL else "")
 log(f"[Config] port={SERVER_PORT}, https={ENABLE_HTTPS}, "
+    f"provider={_provider_desc}, "
     f"invite={'set' if INVITE_CODE else 'off'}, "
     f"default_ui_lang={DEFAULT_UI_LANG or DEFAULT_LANG}, "
-    f"api_key={'ENV' if os.environ.get('ANTHROPIC_API_KEY') else ('config.json' if SERVER_API_KEY else 'not set')}")
+    f"api_key={'ENV' if any(os.environ.get(name) for name in ('EDGETALES_PROVIDER_API_KEY', 'EDGETALES_API_KEY', 'OPENAI_API_KEY')) else ('config.json' if SERVER_API_KEY else 'not set')}")
 
 # Flush deferred dependency check results into log file
 import builtins
@@ -888,13 +915,13 @@ def render_sidebar_actions(on_switch_user=None) -> None:
         nonlocal recap_status
         if s.get("processing", False):
             return
-        if s["api_key"] and game and len(game.session_log) >= 2:
+        if _model_access_configured() and game and len(game.session_log) >= 2:
             s["processing"] = True
             if recap_status:
                 recap_status.text = f"{E['scroll']} {t('actions.recap_loading', lang)}"
                 recap_status.set_visibility(True)
             try:
-                client = anthropic.Anthropic(api_key=s["api_key"])
+                client = get_model_gateway(s["api_key"])
                 config = get_engine_config()
                 recap = await asyncio.to_thread(call_recap, client, game, config)
                 # Replace any existing recap in messages
@@ -1133,7 +1160,8 @@ def render_settings() -> None:
     username = s["current_user"]
     with ui.expansion(f"{E['gear']} {t('settings.title', lang)}").classes("w-full"):
         # Only show API key input if no server-side key is configured
-        if not SERVER_API_KEY:
+        api_inp = None
+        if not SERVER_API_KEY and not _provider_allows_implicit_auth():
             api_inp = ui.input(t("settings.api_key", lang), value=s.get("api_key",""), password=True, password_toggle_button=True).classes("w-full")
             ui.separator()
         # --- UI Language ---
@@ -1274,7 +1302,7 @@ def render_settings() -> None:
         dice_sel = ui.select(dice_opts, label=t("settings.dice", lang), value=cur_dice_label).classes("w-full")
         ui.separator()
         async def save_cfg():
-            if not SERVER_API_KEY:
+            if api_inp is not None:
                 s["api_key"]=api_inp.value
                 save_global_config({"api_key":api_inp.value})
             new_ui_lang = UI_LANGUAGES.get(ui_lang_sel.value, DEFAULT_LANG)
@@ -1610,7 +1638,7 @@ def _render_wishes():
                 ui.label(t("creation.generating", lang)).classes("text-sm").style("color: var(--text-secondary)")
         await _scroll_chat_bottom()
         try:
-            client=anthropic.Anthropic(api_key=s["api_key"]);config=get_engine_config()
+            client=get_model_gateway(s["api_key"]);config=get_engine_config()
             setup=await asyncio.to_thread(call_setup_brain,client,creation,config)
             creation["setup"]=setup
             if "drafts" not in creation: creation["drafts"]=[]
@@ -1709,7 +1737,7 @@ def _render_confirm():
         ui.separator()
         adjust_container = ui.column().classes("w-full gap-2")
         async def regenerate_adjusted():
-            if not s.get("api_key", "").strip():
+            if not _model_access_configured():
                 ui.notify(t("game.invalid_api_key", lang), type="negative")
                 return
             updated = dict(creation)
@@ -1744,7 +1772,7 @@ def _render_confirm():
                     ui.spinner("dots", size="md", color="primary")
                     ui.label(t("creation.regenerating", lang)).classes("text-sm").style("color: var(--text-secondary)")
             try:
-                client = anthropic.Anthropic(api_key=s["api_key"]); config = get_engine_config()
+                client = get_model_gateway(s["api_key"]); config = get_engine_config()
                 new_setup = await asyncio.to_thread(call_setup_brain, client, updated, config)
                 if "drafts" not in updated: updated["drafts"] = []
                 updated["drafts"].append(new_setup)
@@ -1788,7 +1816,7 @@ def _render_confirm():
     with confirm_container:
         with ui.row().classes("gap-4"):
             async def start():
-                if not s.get("api_key", "").strip():
+                if not _model_access_configured():
                     ui.notify(t("game.invalid_api_key", lang), type="negative")
                     return
                 with confirm_container:
@@ -1819,7 +1847,7 @@ def _render_confirm():
                     ''', timeout=3.0)
                 await _scroll_chat_bottom()
                 try:
-                    client=anthropic.Anthropic(api_key=s["api_key"]);config=get_engine_config();username=s["current_user"]
+                    client=get_model_gateway(s["api_key"]);config=get_engine_config();username=s["current_user"]
                     game,narration=await asyncio.to_thread(start_new_game,client,creation,config,username)
                     s["game"]=game;s["creation"]=None;s["active_save"]="autosave"
                     s["messages"].append({"scene_marker":t("game.scene_marker", lang, n=1, location=game.current_location)})
@@ -1830,7 +1858,7 @@ def _render_confirm():
                 except Exception as e: ui.notify(t("creation.error", lang, error=e), type="negative")
             ui.button(f"{E['swords']} {t('creation.start', lang)}", on_click=start, color="primary").classes("text-lg px-8")
             async def reroll():
-                if not s.get("api_key", "").strip():
+                if not _model_access_configured():
                     ui.notify(t("game.invalid_api_key", lang), type="negative")
                     return
                 with confirm_container:
@@ -1839,7 +1867,7 @@ def _render_confirm():
                         ui.label(t("creation.regenerating", lang)).classes("text-sm").style("color: var(--text-secondary)")
                 await _scroll_chat_bottom()
                 try:
-                    client=anthropic.Anthropic(api_key=s["api_key"]);config=get_engine_config()
+                    client=get_model_gateway(s["api_key"]);config=get_engine_config()
                     new_setup=await asyncio.to_thread(call_setup_brain,client,creation,config)
                     updated=dict(creation)
                     updated["setup"]=new_setup;updated["step"]="confirm"
@@ -1895,7 +1923,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
             await ui.run_javascript('document.querySelectorAll("audio").forEach(a=>{a.pause();a.currentTime=0})', timeout=3.0)
         except TimeoutError:
             pass
-        client=anthropic.Anthropic(api_key=s["api_key"])
+        client=get_model_gateway(s["api_key"])
         # ## prefix → correction flow; otherwise normal turn
         if text.startswith("##"):
             if not game.last_turn_snapshot:
@@ -2025,7 +2053,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
             bp = game.story_blueprint or {}
             if game.game_over or (bp.get("story_complete") and not game.epilogue_dismissed and not game.epilogue_shown):
                 ui.navigate.reload()
-    except anthropic.AuthenticationError:
+    except openai.AuthenticationError:
         try: spinner.delete()
         except Exception: pass
         ui.notify(t("game.invalid_api_key", L()), type="negative")
@@ -2085,7 +2113,7 @@ def render_momentum_burn() -> bool:
                             ui.label(t("momentum.gathering", lang)).classes("text-sm").style("color: var(--text-secondary)")
                     await _scroll_chat_bottom()
                     config=get_engine_config();username=s["current_user"]
-                    client=anthropic.Anthropic(api_key=s["api_key"])
+                    client=get_model_gateway(s["api_key"])
                     game,narration=await asyncio.to_thread(process_momentum_burn,client,s["game"],roll,nr,bd["brain"],
                         player_words=bd.get("player_words",""),config=config,pre_snapshot=bd.get("pre_snapshot"),
                         chaos_interrupt=bd.get("chaos_interrupt"))
@@ -2117,7 +2145,7 @@ def _make_chapter_action(game, chapter_msg_key: str):
     s = S(); lang = L()
 
     async def new_ch():
-        if not s.get("api_key", "").strip():
+        if not _model_access_configured():
             ui.notify(t("game.invalid_api_key", lang), type="negative")
             return
         # Show persistent loading dialog (blocks further clicks, visible feedback)
@@ -2130,7 +2158,7 @@ def _make_chapter_action(game, chapter_msg_key: str):
         loading_dlg.open()
         try:
             config = get_engine_config(); username = s["current_user"]
-            client = anthropic.Anthropic(api_key=s["api_key"])
+            client = get_model_gateway(s["api_key"])
             g, n = await asyncio.to_thread(start_new_chapter, client, game, config, username)
             loading_dlg.close()
             # Archive the just-completed chapter's messages before replacing them
@@ -2203,7 +2231,7 @@ def render_epilogue() -> bool:
                         ui.label(t("epilogue.generating", lang)).classes("text-sm")
                     try:
                         config=get_engine_config();username=s["current_user"]
-                        client=anthropic.Anthropic(api_key=s["api_key"])
+                        client=get_model_gateway(s["api_key"])
                         g, epilogue_text = await asyncio.to_thread(generate_epilogue, client, game, config)
                         s["game"] = g
                         s["messages"].append({"scene_marker": f"{E['star']} {t('epilogue.marker', lang)}"})
@@ -2518,7 +2546,7 @@ async def main_page(client: Client):
                                     ui.button(t("user.no", lang), on_click=dlg.close)
                             dlg.open()
                         ui.button(f"{E['trash']} {t('user.remove_label', lang)}", on_click=del_user, color="red").classes("w-full mt-2")
-                if not s.get("api_key"):
+                if not _model_access_configured():
                     ui.separator().classes("my-4 w-96")
                     ui.label(f"{E['gear']} {t('user.api_hint', lang)}").classes("text-sm text-gray-400 w-96 text-center")
         _focus_element('.q-page .q-btn', delay_ms=500)
@@ -2638,7 +2666,7 @@ async def main_page(client: Client):
         content_area.clear()
         chat_container = None
         with content_area:
-            if not s.get("api_key"):
+            if not _model_access_configured():
                 ui.label(t("user.api_missing", L())).classes("text-gray-400 text-center mt-8")
                 footer.set_value(False)
                 return

@@ -238,7 +238,7 @@ NPC descriptions in the sidebar update dynamically when a character undergoes me
 ### Prerequisites
 
 - **Python 3.11** - required if you want to use Chatterbox (offline AI TTS). Python 3.12+ is fine if you skip Chatterbox and use EdgeTTS instead.
-- **A Claude API key** from [Anthropic](https://console.anthropic.com/) - EdgeTales uses the Claude API exclusively. The prompts are optimised specifically for Claude (Haiku and Sonnet). Other AI providers are not supported. API usage is charged per token by Anthropic; a typical play session costs a few cents.
+- **A compatible model endpoint** - direct OpenAI-compatible access, or the local EdgeTales proxy backed by ChatMock. The default example in this repo assumes the local proxy at `http://127.0.0.1:4000/v1`.
 
 ### Linux / macOS / Windows
 
@@ -252,7 +252,7 @@ python3 -m venv venv
 source venv/bin/activate   # Windows: venv\Scripts\activate
 
 # 3. Set up your config
-# Copy config.example.json to config.json, add your API key
+# Copy config.example.json to config.json
 
 # 4. Run — missing packages are installed automatically
 python app.py
@@ -260,7 +260,7 @@ python app.py
 
 Open your browser at **http://localhost:8080**
 
-> 💡 **That's it.** Missing packages are installed automatically on first launch. All configuration lives in `config.json` - no batch files or environment variables needed for basic use.
+> 💡 **That's it.** Missing packages are installed automatically on first launch. All configuration lives in `config.json` unless you prefer environment variables.
 
 ---
 
@@ -272,7 +272,7 @@ Simply run `python app.py`. On first launch, EdgeTales checks all required packa
 
 ```
 ⚙️  Checking dependencies ...
-   ✅ Found: anthropic (0.52.0), nicegui (2.12.0), reportlab (4.4.0), edge-tts (6.1.18),
+   ✅ Found: openai (1.x), nicegui (2.12.0), reportlab (4.4.0), edge-tts (6.1.18),
             stop-words (2018.7.23), nameparser (1.1.3), cryptography (44.0.2),
             faster-whisper (1.1.0), wonderwords (2.2.0)
    ℹ️  Optional (not installed): chatterbox-tts
@@ -286,7 +286,7 @@ If any required package is missing, it is installed automatically before the ser
 If you prefer to install everything upfront:
 
 ```bash
-pip install nicegui anthropic reportlab edge-tts stop-words nameparser cryptography faster-whisper wonderwords
+pip install nicegui openai reportlab edge-tts stop-words nameparser cryptography faster-whisper wonderwords
 ```
 
 ### Optional: Chatterbox (offline AI TTS with voice cloning)
@@ -302,7 +302,7 @@ If Chatterbox is not installed and you select it as your TTS backend in the sett
 | Package | Purpose | Notes |
 |---|---|---|
 | `nicegui` ≥ 1.4 | Web UI framework | **Required** — auto-installed |
-| `anthropic` ≥ 0.30 | Claude AI API client | **Required** — auto-installed |
+| `openai` ≥ 1.0 | OpenAI-compatible Responses API client | **Required** — auto-installed |
 | `reportlab` | PDF story export | **Required** — auto-installed |
 | `edge-tts` ≥ 6.1 | Online TTS (Microsoft Edge voices) | **Required** — auto-installed |
 | `stop-words` | NPC duplicate detection stopword filtering | **Required** — auto-installed |
@@ -323,7 +323,9 @@ EdgeTales is configured via a single `config.json` file in the project root.
 
 ```json
 {
-  "api_key": "sk-ant-api03-YOUR-KEY-HERE",
+  "api_key": "",
+  "provider_mode": "proxy",
+  "provider_base_url": "http://127.0.0.1:4000/v1",
   "invite_code": "",
   "enable_https": false,
   "storage_secret": "",
@@ -336,7 +338,9 @@ EdgeTales is configured via a single `config.json` file in the project root.
 
 | Key | Required | Default | Description |
 |---|---|---|---|
-| `api_key` | **Yes** | `""` | Your Anthropic API key |
+| `api_key` | Usually | `""` | Bearer token sent to the configured provider or proxy. Leave empty for local ChatMock mode. |
+| `provider_mode` | No | `"openai"` | `"openai"` for direct OpenAI-compatible usage, `"proxy"` for the bundled responses proxy, `"chatmock"` for direct side-by-side ChatMock access |
+| `provider_base_url` | No | `""` | Base URL for the configured provider, for example `http://127.0.0.1:4000/v1` for the bundled proxy |
 | `invite_code` | No | `""` | If set, users must enter this code before accessing the app (see below) |
 | `enable_https` | No | `false` | Set to `true` to auto-generate a self-signed TLS certificate |
 | `ssl_certfile` | No | `""` | Path to a custom SSL certificate (PEM). Overrides auto-generation |
@@ -345,7 +349,40 @@ EdgeTales is configured via a single `config.json` file in the project root.
 | `port` | No | `8080` | Server port |
 | `default_ui_lang` | No | `""` | Default UI language for new users. `"de"` = German, `"en"` = English. Empty = German |
 
-> 🔒 On Unix systems, `config.json` is automatically set to `chmod 600` (owner-only) to protect your API key.
+> 🔒 On Unix systems, `config.json` is automatically set to `chmod 600` (owner-only) to protect your provider token.
+
+### Direct OpenAI vs Local Proxy
+
+**Direct OpenAI-compatible mode:**
+```json
+{
+  "api_key": "sk-proj-YOUR-KEY-HERE",
+  "provider_mode": "openai"
+}
+```
+
+**Recommended: local EdgeTales proxy backed by ChatMock:**
+```json
+{
+  "api_key": "",
+  "provider_mode": "proxy",
+  "provider_base_url": "http://127.0.0.1:4000/v1"
+}
+```
+
+Run ChatMock locally:
+
+```bash
+python chatmock.py serve
+```
+
+Run the EdgeTales proxy against ChatMock:
+
+```bash
+python proxy_server.py --backend chatmock --upstream-base-url http://127.0.0.1:8000/v1
+```
+
+EdgeTales then talks to the proxy, and the proxy validates JSON-shaped responses and retries ChatMock if the output does not satisfy the requested schema.
 
 ### Environment Variable Overrides
 
@@ -353,7 +390,12 @@ Every config.json setting can be overridden by environment variables. This is us
 
 | Variable | Overrides |
 |---|---|
-| `ANTHROPIC_API_KEY` | `api_key` |
+| `EDGETALES_PROVIDER_API_KEY` | `api_key` |
+| `EDGETALES_API_KEY` | `api_key` |
+| `OPENAI_API_KEY` | `api_key` |
+| `EDGETALES_PROVIDER_MODE` | `provider_mode` |
+| `EDGETALES_PROVIDER_BASE_URL` | `provider_base_url` |
+| `OPENAI_BASE_URL` | `provider_base_url` |
 | `INVITE_CODE` | `invite_code` |
 | `ENABLE_HTTPS` | `enable_https` |
 | `SSL_CERTFILE` | `ssl_certfile` |
@@ -366,7 +408,7 @@ The priority order is: **Environment variable → config.json → built-in defau
 
 ### Invite Code - Protect Your API Budget
 
-If you deploy EdgeTales on your home network or share the URL with friends, you may want to prevent unknown visitors from using your Anthropic API key. Setting an `invite_code` adds a login screen where users must enter the correct code before they can access the app.
+If you deploy EdgeTales on your home network or share the URL with friends, you may want to prevent unknown visitors from using your provider token or proxy budget. Setting an `invite_code` adds a login screen where users must enter the correct code before they can access the app.
 
 When `invite_code` is empty (the default), the login screen is skipped entirely - users go straight to player selection. This is the recommended setup for purely local, single-user use.
 
@@ -377,14 +419,18 @@ The invite system includes rate limiting: after 5 failed attempts from the same 
 **Minimal - local use, no access control:**
 ```json
 {
-  "api_key": "sk-ant-api03-YOUR-KEY-HERE"
+  "api_key": "",
+  "provider_mode": "proxy",
+  "provider_base_url": "http://127.0.0.1:4000/v1"
 }
 ```
 
 **English UI by default:**
 ```json
 {
-  "api_key": "sk-ant-api03-YOUR-KEY-HERE",
+  "api_key": "",
+  "provider_mode": "proxy",
+  "provider_base_url": "http://127.0.0.1:4000/v1",
   "default_ui_lang": "en"
 }
 ```
@@ -392,7 +438,9 @@ The invite system includes rate limiting: after 5 failed attempts from the same 
 **Home server - HTTPS + invite code:**
 ```json
 {
-  "api_key": "sk-ant-api03-YOUR-KEY-HERE",
+  "api_key": "",
+  "provider_mode": "proxy",
+  "provider_base_url": "http://127.0.0.1:4000/v1",
   "invite_code": "mySecretCode",
   "enable_https": true
 }
@@ -401,7 +449,9 @@ The invite system includes rate limiting: after 5 failed attempts from the same 
 **Custom port + own certificate (e.g. Let's Encrypt):**
 ```json
 {
-  "api_key": "sk-ant-api03-YOUR-KEY-HERE",
+  "api_key": "",
+  "provider_mode": "proxy",
+  "provider_base_url": "http://127.0.0.1:4000/v1",
   "enable_https": true,
   "ssl_certfile": "/etc/letsencrypt/live/example.com/fullchain.pem",
   "ssl_keyfile": "/etc/letsencrypt/live/example.com/privkey.pem",
@@ -451,7 +501,7 @@ sudo systemctl start edgetales
 All configuration is read from `config.json` in the working directory - no environment variables needed in the service file. If you prefer to keep the API key out of config.json, you can add a single override:
 
 ```ini
-Environment=ANTHROPIC_API_KEY=sk-ant-YOUR-KEY-HERE
+Environment=EDGETALES_PROVIDER_API_KEY=proxy-local-token
 ```
 
 ---

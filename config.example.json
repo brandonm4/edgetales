@@ -1,5 +1,7 @@
 {
-  "api_key": "sk-ant-api03-YOUR-KEY-HERE",
+  "api_key": "",
+  "provider_mode": "proxy",
+  "provider_base_url": "http://127.0.0.1:4000/v1",
   "invite_code": "",  
   "enable_https": true,
   "storage_secret": "magickeyfromasnowyisland900",

@@ -18,7 +18,8 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 
-import anthropic
+import openai
+from provider import ModelGateway
 
 # PDF export
 import io
@@ -114,7 +115,7 @@ def _creativity_seed(n: int = 3) -> str:
 
 # --- Structured Output Schemas (constrained decoding, GA since Dec 2025) ---
 # These schemas guarantee valid JSON from the API — no parsing, repair, or retry needed.
-# Used with output_config={"format": {"type": "json_schema", "schema": <SCHEMA>}}
+# Used with text={"format": {"type": "json_schema", ...}}
 
 BRAIN_OUTPUT_SCHEMA = {
     "type": "object",
@@ -2761,23 +2762,52 @@ def _story_context_block(game: GameState) -> str:
 
 
 
-def _api_create_with_retry(client: anthropic.Anthropic, max_retries: int = 2, **kwargs):
-    """Wrapper around client.messages.create with retry on transient API errors.
-    Handles rate limits (429), server errors (500/502/503), and overloaded (529)
-    with exponential backoff. JSON parsing retries remain in callers."""
+def _json_schema_text_format(name: str, schema: dict) -> dict:
+    return {
+        "format": {
+            "type": "json_schema",
+            "name": name,
+            "strict": True,
+            "schema": schema,
+        }
+    }
+
+
+def _response_text(response) -> str:
+    text = getattr(response, "output_text", "") or ""
+    if text:
+        return text
+
+    parts = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", "") == "output_text":
+                parts.append(getattr(content, "text", ""))
+    return "".join(parts)
+
+
+def _response_stop_reason(response) -> str:
+    incomplete = getattr(response, "incomplete_details", None)
+    if incomplete:
+        return getattr(incomplete, "reason", "") or ""
+    return ""
+
+
+def _api_create_with_retry(client: ModelGateway, max_retries: int = 2, **kwargs):
+    """Wrapper around the provider response creation call with retry on transient API errors."""
     import time as _time
     for attempt in range(max_retries + 1):
         try:
-            return client.messages.create(**kwargs)
-        except anthropic.APIStatusError as e:
-            if attempt < max_retries and e.status_code in (429, 500, 502, 503, 529):
+            return client.create_response(**kwargs)
+        except openai.APIStatusError as e:
+            if attempt < max_retries and e.status_code in (408, 409, 429, 500, 502, 503):
                 wait = 2 ** attempt
                 log(f"[API] Error {e.status_code}, retry {attempt + 1}/{max_retries} in {wait}s",
                     level="warning")
                 _time.sleep(wait)
                 continue
             raise
-        except anthropic.APIConnectionError as e:
+        except openai.APIConnectionError as e:
             if attempt < max_retries:
                 wait = 2 ** attempt
                 log(f"[API] Connection error, retry {attempt + 1}/{max_retries} in {wait}s: {e}",
@@ -2787,7 +2817,7 @@ def _api_create_with_retry(client: anthropic.Anthropic, max_retries: int = 2, **
             raise
 
 
-def call_brain(client: anthropic.Anthropic, game: GameState, player_message: str,
+def call_brain(client: ModelGateway, game: GameState, player_message: str,
                config: Optional[EngineConfig] = None) -> dict:
     log(f"[Brain] Scene {game.scene_count + 1} | Input: {player_message[:100]}")
     def _brain_npc_line(n):
@@ -2880,11 +2910,11 @@ time:{game.time_of_day or 'unspecified'} | prev_locations:{', '.join(game.locati
     try:
         response = _api_create_with_retry(
             client, max_retries=2,
-            model=BRAIN_MODEL, max_tokens=512, system=system,
-            messages=[{"role": "user", "content": user_msg}],
-            output_config={"format": {"type": "json_schema", "schema": BRAIN_OUTPUT_SCHEMA}},
+            model=BRAIN_MODEL, max_output_tokens=512, instructions=system,
+            input=[{"role": "user", "content": user_msg}],
+            text=_json_schema_text_format("brain_output", BRAIN_OUTPUT_SCHEMA),
         )
-        result = json.loads(response.content[0].text)
+        result = json.loads(_response_text(response))
         log(f"[Brain] Result: move={result['move']}, pos={result['position']}, "
             f"effect={result['effect']}, intent={result['player_intent'][:60]}")
         return result
@@ -2899,7 +2929,7 @@ time:{game.time_of_day or 'unspecified'} | prev_locations:{', '.join(game.locati
                 "time_progression": "none"}
 
 
-def call_setup_brain(client: anthropic.Anthropic, creation_data: dict,
+def call_setup_brain(client: ModelGateway, creation_data: dict,
                      config: Optional[EngineConfig] = None) -> dict:
     """Generate character and world from creation choices."""
     _cfg = config or EngineConfig()
@@ -2940,11 +2970,11 @@ creativity_seed: {seed} (Use as loose inspiration for names, locations, and deta
     try:
         response = _api_create_with_retry(
             client, max_retries=2,
-            model=BRAIN_MODEL, max_tokens=512, system=system,
-            messages=[{"role": "user", "content": user_msg}],
-            output_config={"format": {"type": "json_schema", "schema": SETUP_BRAIN_OUTPUT_SCHEMA}},
+            model=BRAIN_MODEL, max_output_tokens=512, instructions=system,
+            input=[{"role": "user", "content": user_msg}],
+            text=_json_schema_text_format("setup_brain_output", SETUP_BRAIN_OUTPUT_SCHEMA),
         )
-        result = json.loads(response.content[0].text)
+        result = json.loads(_response_text(response))
 
         # Validate stat sum — structured outputs guarantee valid JSON + correct types,
         # but cannot enforce cross-field constraints like "all stats must total 7"
@@ -2972,7 +3002,7 @@ creativity_seed: {seed} (Use as loose inspiration for names, locations, and deta
                 "starting_location": "Unbekannter Ort", "opening_situation": "Eine Reise beginnt."}
 
 
-def call_recap(client: anthropic.Anthropic, game: GameState,
+def call_recap(client: ModelGateway, game: GameState,
                config: Optional[EngineConfig] = None) -> str:
     """Generate a 'previously on...' recap from the PLAYER'S perspective only."""
     _cfg = config or EngineConfig()
@@ -3010,8 +3040,8 @@ def call_recap(client: anthropic.Anthropic, game: GameState,
         try:
             response = _api_create_with_retry(
                 client, max_retries=1,
-                model=BRAIN_MODEL, max_tokens=1200,
-                system=f"""Recap an RPG story in {lang}. Second person singular.
+                model=BRAIN_MODEL, max_output_tokens=1200,
+                instructions=f"""Recap an RPG story in {lang}. Second person singular.
 - 4-6 sentences, atmospheric, no game mechanics
 - Do NOT use markdown headings (#). Start directly with the recap text.
 - Capture the MOOD and TONE of the genre
@@ -3021,7 +3051,7 @@ def call_recap(client: anthropic.Anthropic, game: GameState,
 - Base your recap primarily on the recent_scenes text, which is what the player actually experienced
 - If this is a campaign with multiple chapters, briefly acknowledge the character's history
 """ + _kid_friendly_block(_cfg) + _content_boundaries_block(game),
-                messages=[{"role": "user", "content":
+                input=[{"role": "user", "content":
                            f"{game.player_name}{E['dash']}{game.character_concept}\n"
                            f"genre:{game.setting_genre} tone:{game.setting_tone}\n"
                            f"world:{game.setting_description}\n"
@@ -3029,7 +3059,7 @@ def call_recap(client: anthropic.Anthropic, game: GameState,
                            f"{arc_info}{campaign_info}\nnow:{game.current_scene_context}\n"
                            f"recent_scenes:\n{recent_narrations}"}],
             )
-            return response.content[0].text
+            return _response_text(response)
         except Exception as e:
             log(f"[Recap] Attempt {attempt + 1}/3 failed: {e}", level="warning")
             if attempt < 2:
@@ -3039,7 +3069,7 @@ def call_recap(client: anthropic.Anthropic, game: GameState,
                 return f"({game.player_name} recalls the recent events...)"
 
 
-def call_story_architect(client: anthropic.Anthropic, game: GameState,
+def call_story_architect(client: ModelGateway, game: GameState,
                          structure_type: str = "3act",
                          config: Optional[EngineConfig] = None) -> dict:
     """Generate a story blueprint. Supports 3-act and Kishōtenketsu (4-act)."""
@@ -3113,11 +3143,11 @@ npcs:{npc_text}{campaign_ctx}{backstory_text}"""
     try:
         response = _api_create_with_retry(
             client, max_retries=2,
-            model=NARRATOR_MODEL, max_tokens=4000, system=system,
-            messages=[{"role": "user", "content": user_msg}],
-            output_config={"format": {"type": "json_schema", "schema": STORY_ARCHITECT_OUTPUT_SCHEMA}},
+            model=NARRATOR_MODEL, max_output_tokens=4000, instructions=system,
+            input=[{"role": "user", "content": user_msg}],
+            text=_json_schema_text_format("story_architect_output", STORY_ARCHITECT_OUTPUT_SCHEMA),
         )
-        blueprint = json.loads(response.content[0].text)
+        blueprint = json.loads(_response_text(response))
         blueprint["revealed"] = []  # Track which revelations have fired
         blueprint["structure_type"] = structure_type
         log(f"[Story] Architect succeeded: "
@@ -3447,7 +3477,7 @@ def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) 
 <style>Terse, vivid, sensory. Show, don't tell. Player co-creates the world  --  integrate new elements seamlessly.</style>"""
 
 
-def call_narrator(client: anthropic.Anthropic, prompt: str,
+def call_narrator(client: ModelGateway, prompt: str,
                   game: Optional[GameState] = None,
                   config: Optional[EngineConfig] = None) -> str:
     """Narrator call with conversation memory for style consistency."""
@@ -3466,15 +3496,15 @@ def call_narrator(client: anthropic.Anthropic, prompt: str,
 
     response = _api_create_with_retry(
         client, max_retries=3,
-        model=NARRATOR_MODEL, max_tokens=3500,
-        system=get_narrator_system(config or EngineConfig(), game),
-        messages=messages,
+        model=NARRATOR_MODEL, max_output_tokens=3500,
+        instructions=get_narrator_system(config or EngineConfig(), game),
+        input=messages,
     )
-    raw = response.content[0].text
-    stop = response.stop_reason
+    raw = _response_text(response)
+    stop = _response_stop_reason(response)
 
     # Handle truncation: clean up to last complete sentence
-    if stop == "max_tokens":
+    if stop == "max_output_tokens":
         log(f"[Narrator] WARNING: Response truncated at max_tokens ({len(raw)} chars)",
             level="warning")
         raw = _salvage_truncated_narration(raw)
@@ -3543,7 +3573,7 @@ def _salvage_truncated_narration(raw: str) -> str:
     return prose + metadata
 
 
-def call_narrator_metadata(client: anthropic.Anthropic, narration: str,
+def call_narrator_metadata(client: ModelGateway, narration: str,
                            game: GameState,
                            config: Optional[EngineConfig] = None) -> dict:
     """Extract structured metadata from narrator prose via Haiku (Two-Call pattern).
@@ -3603,15 +3633,12 @@ Extract all metadata from the narration above. Remember: {game.player_name} is t
     try:
         response = _api_create_with_retry(
             client, max_retries=2,
-            model=BRAIN_MODEL, max_tokens=2800,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
-            output_config={"format": {
-                "type": "json_schema",
-                "schema": NARRATOR_METADATA_SCHEMA,
-            }},
+            model=BRAIN_MODEL, max_output_tokens=2800,
+            instructions=system,
+            input=[{"role": "user", "content": prompt}],
+            text=_json_schema_text_format("narrator_metadata", NARRATOR_METADATA_SCHEMA),
         )
-        metadata = json.loads(response.content[0].text)
+        metadata = json.loads(_response_text(response))
         log(f"[Metadata] Extracted: {len(metadata.get('memory_updates', []))} memories, "
             f"{len(metadata.get('new_npcs', []))} new NPCs, "
             f"{len(metadata.get('deceased_npcs', []))} deceased, "
@@ -3982,7 +4009,7 @@ If a <reflect> tag has a last_reflection attribute, write a NEW insight that bui
 </task>"""
 
 
-def call_director(client: anthropic.Anthropic, game: GameState,
+def call_director(client: ModelGateway, game: GameState,
                   latest_narration: str,
                   config: Optional[EngineConfig] = None) -> dict:
     """Call the Director agent for scene analysis and story guidance.
@@ -3994,12 +4021,12 @@ def call_director(client: anthropic.Anthropic, game: GameState,
     try:
         response = _api_create_with_retry(
             client, max_retries=1,
-            model=DIRECTOR_MODEL, max_tokens=4500,
-            system=DIRECTOR_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-            output_config={"format": {"type": "json_schema", "schema": DIRECTOR_OUTPUT_SCHEMA}},
+            model=DIRECTOR_MODEL, max_output_tokens=4500,
+            instructions=DIRECTOR_SYSTEM,
+            input=[{"role": "user", "content": prompt}],
+            text=_json_schema_text_format("director_output", DIRECTOR_OUTPUT_SCHEMA),
         )
-        guidance = json.loads(response.content[0].text)
+        guidance = json.loads(_response_text(response))
 
         # Convert npc_guidance from array (schema) to dict (internal format)
         # Array format: [{"npc_id": "npc_1", "guidance": "..."}]
@@ -5297,7 +5324,7 @@ def export_story_pdf(game: GameState, messages: list, lang: str = "de") -> bytes
 # GAME LOOP
 # ===============================================================
 
-def start_new_game(client: anthropic.Anthropic, creation_data: dict,
+def start_new_game(client: ModelGateway, creation_data: dict,
                    config: Optional[EngineConfig] = None,
                    username: str = "") -> tuple[GameState, str]:
     """Create character from guided creation data, generate opening scene."""
@@ -5403,7 +5430,7 @@ def _campaign_history_block(game: GameState) -> str:
     return "\n".join(parts)
 
 
-def call_chapter_summary(client: anthropic.Anthropic, game: GameState,
+def call_chapter_summary(client: ModelGateway, game: GameState,
                           config: Optional[EngineConfig] = None) -> dict:
     """Generate a summary of the completed chapter for campaign history."""
     _cfg = config or EngineConfig()
@@ -5423,8 +5450,8 @@ def call_chapter_summary(client: anthropic.Anthropic, game: GameState,
     try:
         response = _api_create_with_retry(
             client, max_retries=1,
-            model=BRAIN_MODEL, max_tokens=1500,
-            system=f"""Summarize an RPG chapter for campaign continuity.
+            model=BRAIN_MODEL, max_output_tokens=1500,
+            instructions=f"""Summarize an RPG chapter for campaign continuity.
 - Write in {lang}
 - "title": A short evocative title for this chapter (3-6 words)
 - "summary": 3-4 sentences capturing key events, character growth, and how the chapter ended
@@ -5433,7 +5460,7 @@ def call_chapter_summary(client: anthropic.Anthropic, game: GameState,
 - "npc_evolutions": For each important NPC, project how they might have changed after the chapter's events. This is a PROJECTION for the time skip between chapters — not what happened, but what COULD plausibly have happened in the weeks/months after. Focus on relationship shifts, attitude changes, new circumstances. Only include NPCs who were meaningfully involved in the chapter.
 - "thematic_question": The core emotional/philosophical question this chapter raised but did not fully answer. This carries the vertical (emotional) narrative across chapters. Example: "Can you fix the damage caused by good intentions?" or "Is loyalty earned through competence or compassion?"
 """ + _kid_friendly_block(_cfg) + _content_boundaries_block(game),
-            messages=[{"role": "user", "content":
+            input=[{"role": "user", "content":
                        f"character:{game.player_name} {E['dash']} {game.character_concept}\n"
                        f"genre:{game.setting_genre} tone:{game.setting_tone}\n"
                        f"world:{game.setting_description}\n"
@@ -5441,9 +5468,9 @@ def call_chapter_summary(client: anthropic.Anthropic, game: GameState,
                        f"log:{log_text}\nnpcs:{npc_text}\n"
                        f"location:{game.current_location}\n"
                        f"situation:{game.current_scene_context}"}],
-            output_config={"format": {"type": "json_schema", "schema": CHAPTER_SUMMARY_OUTPUT_SCHEMA}},
+            text=_json_schema_text_format("chapter_summary", CHAPTER_SUMMARY_OUTPUT_SCHEMA),
         )
-        data = json.loads(response.content[0].text)
+        data = json.loads(_response_text(response))
         data["chapter"] = game.chapter_number
         data["scenes"] = game.scene_count
         return data
@@ -5507,7 +5534,7 @@ Write a beautiful EPILOGUE for this story (4-6 paragraphs). This is NOT a new sc
 </task>"""
 
 
-def generate_epilogue(client: anthropic.Anthropic, game: GameState,
+def generate_epilogue(client: ModelGateway, game: GameState,
                       config: Optional[EngineConfig] = None) -> tuple[GameState, str]:
     """Generate an epilogue for the completed story. Returns (game, epilogue_text)."""
     log(f"[Epilogue] Generating epilogue for {game.player_name} (chapter {game.chapter_number}, scene {game.scene_count})")
@@ -5605,7 +5632,7 @@ After narration, append invisible structured data:
 </game_data>"""
 
 
-def start_new_chapter(client: anthropic.Anthropic, game: GameState,
+def start_new_chapter(client: ModelGateway, game: GameState,
                       config: Optional[EngineConfig] = None,
                       username: str = "") -> tuple[GameState, str]:
     """Start a new chapter: keep character/world/NPCs, reset mechanics, new story arc."""
@@ -5748,7 +5775,7 @@ def start_new_chapter(client: anthropic.Anthropic, game: GameState,
     return game, narration
 
 
-def process_turn(client: anthropic.Anthropic, game: GameState,
+def process_turn(client: ModelGateway, game: GameState,
                  player_message: str,
                  config: Optional[EngineConfig] = None) -> tuple[GameState, str, Optional[RollResult], Optional[dict], Optional[dict]]:
     log(f"[Turn] Scene {game.scene_count + 1} | Player: {player_message[:100]}")
@@ -5919,7 +5946,7 @@ def process_turn(client: anthropic.Anthropic, game: GameState,
     return game, narration, roll, burn_info, director_ctx
 
 
-def run_deferred_director(client: anthropic.Anthropic, game: GameState,
+def run_deferred_director(client: ModelGateway, game: GameState,
                           director_ctx: dict):
     """Run the Director call that was deferred from process_turn.
     Called by the UI layer AFTER rendering narration for non-blocking display.
@@ -5933,7 +5960,7 @@ def run_deferred_director(client: anthropic.Anthropic, game: GameState,
         log(f"[Director] Deferred call failed gracefully: {e}", level="warning")
 
 
-def _try_call_director(client: anthropic.Anthropic, game: GameState,
+def _try_call_director(client: ModelGateway, game: GameState,
                        narration: str, config: Optional[EngineConfig],
                        roll_result: str = "", chaos_used: bool = False,
                        new_npcs_found: bool = False,
@@ -6054,7 +6081,7 @@ CORRECTION_OUTPUT_SCHEMA = {
 }
 
 
-def call_correction_brain(client: anthropic.Anthropic, game: GameState,
+def call_correction_brain(client: ModelGateway, game: GameState,
                            correction_text: str,
                            config: Optional[EngineConfig] = None) -> dict:
     """Analyse a ## correction request against the last turn snapshot.
@@ -6117,12 +6144,11 @@ npcs:
     try:
         response = _api_create_with_retry(
             client, max_retries=2,
-            model=BRAIN_MODEL, max_tokens=1500, system=system,
-            messages=[{"role": "user", "content": user_msg}],
-            output_config={"format": {"type": "json_schema",
-                                      "schema": CORRECTION_OUTPUT_SCHEMA}},
+            model=BRAIN_MODEL, max_output_tokens=1500, instructions=system,
+            input=[{"role": "user", "content": user_msg}],
+            text=_json_schema_text_format("correction_output", CORRECTION_OUTPUT_SCHEMA),
         )
-        result = json.loads(response.content[0].text)
+        result = json.loads(_response_text(response))
         log(f"[Correction] source={result['correction_source']} "
             f"reroll={result['reroll_needed']} ops={len(result['state_ops'])}")
         return result
@@ -6272,7 +6298,7 @@ def _restore_from_snapshot(game: GameState, snap: dict) -> None:
     log("[Correction] State fully restored from snapshot")
 
 
-def process_correction(client: anthropic.Anthropic, game: GameState,
+def process_correction(client: ModelGateway, game: GameState,
                         correction_text: str,
                         config: Optional[EngineConfig] = None
                         ) -> tuple[GameState, str, Optional[dict]]:
@@ -6442,7 +6468,7 @@ def process_correction(client: anthropic.Anthropic, game: GameState,
     return game, narration, director_ctx
 
 
-def process_momentum_burn(client: anthropic.Anthropic, game: GameState,
+def process_momentum_burn(client: ModelGateway, game: GameState,
                           old_roll: RollResult, new_result: str,
                           brain_data: dict, player_words: str = "",
                           config: Optional[EngineConfig] = None,
