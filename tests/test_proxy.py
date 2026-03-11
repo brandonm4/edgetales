@@ -163,6 +163,64 @@ class ProxyIntegrationTests(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
 
+    def test_chatmock_backend_prunes_extra_schema_properties(self):
+        _ChatMockHandler.requests = []
+        _ChatMockHandler.responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "arguments": "{\"ok\": true, \"items\": [1], \"event\": \"extra\", \"description\": \"extra\"}"
+                                    },
+                                    "id": "call_1",
+                                    "type": "function",
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        ]
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _ChatMockHandler)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        upstream_port = upstream.server_address[1]
+        try:
+            backend = ChatMockBackend(ProxyConfig(
+                backend="chatmock",
+                upstream_base_url=f"http://127.0.0.1:{upstream_port}/v1",
+            ))
+            payload = {
+                "model": "claude-haiku-4-5-20251001",
+                "input": [{"role": "user", "content": "return json"}],
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "demo",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "ok": {"type": "boolean"},
+                                "items": {"type": "array", "items": {"type": "integer"}},
+                            },
+                            "required": ["ok", "items"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+            }
+            response = backend.create_response(payload)
+            self.assertEqual(json.loads(response["output_text"]), {"ok": True, "items": [1]})
+            self.assertEqual(len(_ChatMockHandler.requests), 1)
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

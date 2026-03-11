@@ -123,6 +123,34 @@ def _schema_types(schema: dict) -> list[str]:
     return []
 
 
+def _prune_to_schema(value, schema: dict):
+    if not isinstance(schema, dict):
+        return value
+
+    schema_types = _schema_types(schema)
+    if value is None:
+        return None
+
+    if "object" in schema_types and isinstance(value, dict):
+        properties = schema.get("properties", {})
+        additional = schema.get("additionalProperties", True)
+        pruned = {}
+        for key, item in value.items():
+            if key in properties:
+                pruned[key] = _prune_to_schema(item, properties[key])
+            elif additional is not False:
+                pruned[key] = item
+        return pruned
+
+    if "array" in schema_types and isinstance(value, list):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            return [_prune_to_schema(item, item_schema) for item in value]
+        return value
+
+    return value
+
+
 def _validate_json_schema(value, schema: dict, path: str = "$") -> None:
     if not isinstance(schema, dict):
         return
@@ -378,6 +406,14 @@ class ChatMockBackend(ProxyBackend):
             try:
                 json_text = _extract_chatmock_schema_result(data)
                 parsed = json.loads(json_text)
+                pruned = _prune_to_schema(parsed, schema)
+                if pruned != parsed:
+                    dropped = sorted(set(parsed.keys()) - set(pruned.keys())) if isinstance(parsed, dict) and isinstance(pruned, dict) else []
+                    _log(
+                        f"{request_id} upstream=chatmock schema_pruned attempt={attempt + 1} dropped={dropped}",
+                        level="info",
+                    )
+                parsed = pruned
                 _validate_json_schema(parsed, schema)
                 _log(f"{request_id} upstream=chatmock schema_validation=ok attempt={attempt + 1}")
                 return _build_response_payload(json.dumps(parsed, ensure_ascii=False), requested_model)

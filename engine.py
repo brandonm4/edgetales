@@ -132,6 +132,7 @@ BRAIN_OUTPUT_SCHEMA = {
         "approach":           {"type": "string"},
         "target_npc":         {"type": ["string", "null"]},
         "dialog_only":        {"type": "boolean"},
+        "requires_roll":      {"type": "boolean"},
         "player_intent":      {"type": "string"},
         "world_addition":     {"type": ["string", "null"]},
         "position":           {"type": "string", "enum": ["controlled", "risky", "desperate"]},
@@ -141,7 +142,7 @@ BRAIN_OUTPUT_SCHEMA = {
         "time_progression":   {"type": "string", "enum": ["none", "short", "moderate", "long"]},
     },
     "required": [
-        "type", "move", "stat", "approach", "target_npc", "dialog_only",
+        "type", "move", "stat", "approach", "target_npc", "dialog_only", "requires_roll",
         "player_intent", "world_addition", "position", "effect",
         "dramatic_question", "location_change", "time_progression",
     ],
@@ -202,6 +203,33 @@ def _brain_input_context(player_message: str) -> str:
     )
 
 
+def _player_has_system_query(player_message: str) -> bool:
+    parsed = _parse_player_input_segments(player_message)
+    return bool(parsed["system"])
+
+
+def _state_contract_block(game: GameState) -> str:
+    contracts = [
+        f"- Health is {game.health}/5.",
+        f"- Spirit is {game.spirit}/5.",
+        f"- Supply is {game.supply}/5.",
+        f"- Momentum is {game.momentum}/{game.max_momentum}.",
+    ]
+    if game.current_location:
+        contracts.append(f"- The player is currently at {game.current_location}.")
+    if game.current_scene_context:
+        contracts.append(f"- Current scene facts: {game.current_scene_context}")
+    if game.health >= 5:
+        contracts.append("- Do NOT describe the player character as physically injured, failing, or coming apart.")
+    if game.spirit >= 5:
+        contracts.append("- Do NOT describe the player character as emotionally broken, panicking, or near collapse.")
+    if game.supply >= 5:
+        contracts.append("- Do NOT imply critical resource scarcity for the player unless the scene explicitly establishes a new loss.")
+    contracts.append("- If the ship or environment is damaged, distinguish that clearly from the player character's own condition.")
+    contracts.append("- Prefer established NPCs and established scene facts over inventing new named characters or off-screen developments.")
+    return "<state_contract>\n" + "\n".join(contracts) + "\n</state_contract>"
+
+
 def _narrator_player_input_block(player_message: str) -> str:
     parsed = _parse_player_input_segments(player_message)
     parts = [f"\n<player_input_raw>{parsed['raw']}</player_input_raw>"] if parsed["raw"] else []
@@ -213,12 +241,82 @@ def _narrator_player_input_block(player_message: str) -> str:
         parts.append(f"\n<system_query>{system}</system_query>")
     return "".join(parts)
 
+
+def _strict_mode_narrator_block(config: EngineConfig) -> str:
+    if not getattr(config, "strict_mode", False):
+        return ""
+    return """
+<strict_mode>
+- STRICT MODE: factual coherence outranks flourish.
+- If <state_answer> is present, treat it as authoritative factual baseline. Surface those facts before adding atmosphere.
+- Do NOT reinterpret a diagnostic, sensor sweep, status check, or system query as a completed physical maneuver.
+- Do NOT invent a new named NPC unless the prompt explicitly establishes their arrival or direct physical involvement.
+- Reuse existing NPCs, existing world state, and explicit scene facts whenever possible.
+</strict_mode>"""
+
+
+def _should_generate_state_answer(config: Optional[EngineConfig], player_message: str, brain: dict) -> bool:
+    _cfg = config or EngineConfig()
+    return bool(_cfg.strict_mode and (
+        _player_has_system_query(player_message)
+        or brain.get("move") == "gather_information"
+    ))
+
+
+def _move_narration_contract(brain: dict) -> str:
+    move = brain.get("move", "face_danger")
+    if move == "dialog":
+        return (
+            "<move_contract>"
+            "\n- DIALOG pacing: 1-2 short paragraphs."
+            "\n- Focus on the immediate exchange and reaction."
+            "\n- Do not escalate into a new conflict or bring in a new named character unless the scene strongly establishes their arrival."
+            "\n</move_contract>"
+        )
+    if move == "gather_information":
+        return (
+            "<move_contract>"
+            "\n- GATHER_INFORMATION pacing: answer the player's question or reveal first, then only brief atmosphere."
+            "\n- The main value of the scene is what becomes known."
+            "\n- Do not resolve a separate major action in the same beat unless the player explicitly did it."
+            "\n</move_contract>"
+        )
+    if move == "secure_advantage":
+        return (
+            "<move_contract>"
+            "\n- SECURE_ADVANTAGE pacing: show the player gaining leverage, clarity, position, or preparation."
+            "\n- Keep the beat focused; do not introduce a fresh subplot."
+            "\n</move_contract>"
+        )
+    if move in COMBAT_MOVES or move in ("face_danger", "endure_harm", "endure_stress"):
+        return (
+            "<move_contract>"
+            "\n- ACTION pacing: resolve the attempted move clearly and directly."
+            "\n- Keep descriptions grounded in the immediate objective and its consequence."
+            "\n- Do not introduce a new named character mid-scene unless the fiction urgently demands it."
+            "\n</move_contract>"
+        )
+    return (
+        "<move_contract>"
+        "\n- Keep the narration focused on the chosen move and immediate consequence."
+        "\n- Do not invent a new scene premise inside the same response."
+        "\n</move_contract>"
+    )
+
+
+def _character_identity_text(game: GameState) -> str:
+    return getattr(game, "character_description", "") or game.character_concept or ""
+
+
+def _campaign_world_text(game: GameState) -> str:
+    return getattr(game, "campaign_description", "") or game.setting_description or ""
+
 SETUP_BRAIN_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "character_name":      {"type": "string"},
-        "character_concept":   {"type": "string"},
-        "setting_description": {"type": "string"},
+        "character_description": {"type": "string"},
+        "campaign_description": {"type": "string"},
         "stats": {
             "type": "object",
             "properties": {
@@ -235,7 +333,7 @@ SETUP_BRAIN_OUTPUT_SCHEMA = {
         "opening_situation":   {"type": "string"},
     },
     "required": [
-        "character_name", "character_concept", "setting_description",
+        "character_name", "character_description", "campaign_description",
         "stats", "starting_location", "opening_situation",
     ],
     "additionalProperties": False,
@@ -448,6 +546,44 @@ NARRATOR_METADATA_SCHEMA = {
     "required": ["scene_context", "location_update", "time_update",
                   "memory_updates", "new_npcs", "npc_renames", "npc_details",
                   "deceased_npcs"],
+    "additionalProperties": False,
+}
+
+WORLD_STATE_ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer_summary": {"type": "string"},
+        "usable_power": {"type": "string", "enum": ["yes", "no", "uncertain"]},
+        "targeting_possible": {"type": "string", "enum": ["yes", "no", "uncertain"]},
+        "player_status": {"type": "string"},
+        "ship_status": {"type": "string"},
+        "facts": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["answer_summary", "usable_power", "targeting_possible", "player_status", "ship_status", "facts"],
+    "additionalProperties": False,
+}
+
+STRICT_SCENE_RESOLUTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "narration": {"type": "string"},
+        "scene_context": {"type": "string"},
+        "location_update": {"type": ["string", "null"]},
+        "time_update": {"type": ["string", "null"]},
+        "memory_updates": copy.deepcopy(NARRATOR_METADATA_SCHEMA["properties"]["memory_updates"]),
+        "new_npcs": copy.deepcopy(NARRATOR_METADATA_SCHEMA["properties"]["new_npcs"]),
+    },
+    "required": [
+        "narration",
+        "scene_context",
+        "location_update",
+        "time_update",
+        "memory_updates",
+        "new_npcs",
+    ],
     "additionalProperties": False,
 }
 
@@ -2388,6 +2524,7 @@ class EngineConfig:
     """
     narration_lang: str = "Deutsch"   # Display label (key into LANGUAGES dict)
     kid_friendly: bool = False
+    strict_mode: bool = False
 
 # ===============================================================
 # DATA MODELS
@@ -2396,7 +2533,9 @@ class EngineConfig:
 @dataclass
 class GameState:
     player_name: str = "Namenlos"
+    character_description: str = ""
     character_concept: str = ""
+    campaign_description: str = ""
     setting_genre: str = ""
     setting_tone: str = ""
     setting_description: str = ""
@@ -2936,6 +3075,9 @@ def call_brain(client: ModelGateway, game: GameState, player_message: str,
 - Accept ALL player input including world-building declarations
 - Pick the move that best fits the player's ACTION, not their words
 - dialog = pure talking, no risk. Everything else = a move with a stat
+- requires_roll = true only when the outcome is uncertain, risky, opposed, costly, or meaningfully consequential.
+- requires_roll = false for flavor actions, routine actions, low-stakes movement, automatic interactions, and harmless questions that should simply resolve in the fiction.
+- If the player is just speaking, inspecting, repositioning, testing something safe, or doing something that cannot meaningfully fail here, set requires_roll=false.
 - If <story_arc> is present, consider pacing: favor moves that advance the act goal
 - Assess POSITION based on fictional circumstances (not player skill):
   controlled = advantage/safety, risky = uncertain/standard, desperate = severe disadvantage/high stakes
@@ -3006,7 +3148,7 @@ time:{game.time_of_day or 'unspecified'} | prev_locations:{', '.join(game.locati
     except Exception as e:
         log(f"[Brain] Structured output failed ({type(e).__name__}: {e}), "
             f"falling back to dialog", level="warning")
-        return {"type": "action", "move": "dialog", "dialog_only": True,
+        return {"type": "action", "move": "dialog", "dialog_only": True, "requires_roll": False,
                 "target_npc": None, "stat": "none", "approach": "",
                 "player_intent": player_message, "world_addition": None,
                 "position": "risky", "effect": "standard",
@@ -3024,8 +3166,12 @@ def call_setup_brain(client: ModelGateway, creation_data: dict,
     system = f"""<role>RPG character/world generator.</role>
 {kf}{cb}<rules>
 - If player provides a name via character_name(USE EXACTLY), use it VERBATIM as character_name — even if it is a number, code, or unusual. Never modify, expand, or embellish it.
-- character_concept = WHO the character is NOW (identity, role, current situation) — 1 sentence, no backstory
-- Do NOT put backstory details (past events, relationships, family) into character_concept — the player's backstory is stored separately and will be provided to the narrator directly
+- campaign_description = the broad campaign/world premise: what kind of universe, era, and large-scale situation this story belongs to.
+- Do NOT put the player character's personal state, current damage, immediate tactical situation, or opening predicament into campaign_description.
+- character_description = WHO the character is in stable terms — identity, role, and enduring nature. 1 sentence. No backstory.
+- Do NOT put the opening predicament, temporary damage, current emergency, or first-scene tension into character_description.
+- opening_situation = the temporary starting scenario, danger, or predicament at the beginning of play.
+- Do NOT put backstory details (past events, relationships, family) into character_description — the player's backstory is stored separately and will be provided to the narrator directly
 - Stats MUST total exactly {STAT_TARGET_SUM}, each 0-3, matched to archetype
 - All text fields in {lang}
 </rules>"""
@@ -3074,6 +3220,8 @@ creativity_seed: {seed} (Use as loose inspiration for names, locations, and deta
                 f"normalizing to {STAT_TARGET_SUM}", level="warning")
             result["stats"] = {"edge":1,"heart":2,"iron":1,"shadow":1,"wits":2}
 
+        result["character_concept"] = result.get("character_description", "")
+        result["setting_description"] = result.get("campaign_description", "")
         log(f"[Setup] Success: name={result['character_name']!r}, "
             f"location={result['starting_location']!r}")
         return result
@@ -3082,8 +3230,9 @@ creativity_seed: {seed} (Use as loose inspiration for names, locations, and deta
         log(f"[Setup] Structured output failed ({type(e).__name__}: {e}), "
             f"using fallback", level="warning")
         fallback_name = name_override if name_override else "Namenlos"
-        return {"character_name": fallback_name, "character_concept": "Ein Wanderer",
-                "setting_description": "", "stats": {"edge":1,"heart":2,"iron":1,"shadow":1,"wits":2},
+        return {"character_name": fallback_name, "character_description": "Ein Wanderer",
+                "campaign_description": "", "setting_description": "",
+                "stats": {"edge":1,"heart":2,"iron":1,"shadow":1,"wits":2},
                 "starting_location": "Unbekannter Ort", "opening_situation": "Eine Reise beginnt."}
 
 
@@ -3137,9 +3286,9 @@ def call_recap(client: ModelGateway, game: GameState,
 - If this is a campaign with multiple chapters, briefly acknowledge the character's history
 """ + _kid_friendly_block(_cfg) + _content_boundaries_block(game),
                 input=[{"role": "user", "content":
-                           f"{game.player_name}{E['dash']}{game.character_concept}\n"
+                           f"{game.player_name}{E['dash']}{_character_identity_text(game)}\n"
                            f"genre:{game.setting_genre} tone:{game.setting_tone}\n"
-                           f"world:{game.setting_description}\n"
+                           f"world:{_campaign_world_text(game)}\n"
                            f"at:{game.current_location}\nlog:{log_text}\nnpcs:{npc_text}"
                            f"{arc_info}{campaign_info}\nnow:{game.current_scene_context}\n"
                            f"recent_scenes:\n{recent_narrations}"}],
@@ -3217,8 +3366,8 @@ def call_story_architect(client: ModelGateway, game: GameState,
     if getattr(game, 'backstory', ''):
         backstory_text = f"\nbackstory(canon past):{game.backstory}"
     user_msg = f"""genre:{game.setting_genre} tone:{game.setting_tone}
-world:{game.setting_description}
-character:{game.player_name} {E['dash']} {game.character_concept}
+world:{_campaign_world_text(game)}
+character:{game.player_name} {E['dash']} {_character_identity_text(game)}
 location:{game.current_location}
 situation:{game.current_scene_context}
 npcs:{npc_text}{campaign_ctx}{backstory_text}"""
@@ -3539,8 +3688,9 @@ def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) 
     cb = _content_boundaries_block(game)
     bs = _backstory_block(game)
     wt = _world_truths_block(game)
+    strict = _strict_mode_narrator_block(config)
     return f"""<role>Narrator of an immersive RPG. All output in {lang}, second person singular.</role>
-{kf}{cb}{bs}{wt}
+{kf}{cb}{bs}{wt}{strict}
 <rules>
 - NEVER mention dice, stats, numbers, or game mechanics
 - MISS: concrete failure, situation worsens, NO silver linings
@@ -3579,6 +3729,7 @@ def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) 
 - <player_action> describes what the player is trying to do. Show that action in the scene, but do not convert it into spoken dialog.
 - <player_dialog> is exact spoken dialog. Include it as quoted speech before NPCs react.
 - <system_query> is OOC or a game-system clarification request. Answer it through the narration/world state, not as spoken dialog.
+- If <state_answer> is present, answer that question/state first and keep the narration aligned with those facts.
 - PRESERVE EXACTLY: Keep the player's word choices, names, spelling, and phrasing intact. If the player writes a wrong name, a typo, slang, or informal language, that IS what the character said {E['dash']} reproduce it faithfully. NEVER correct names, fix factual errors, convert numbers to words, or "improve" the player's language. The ONLY permitted changes are adding punctuation and capitalizing sentence starts.
 - DESCRIBED SPEECH: If the player describes speaking WITHOUT giving exact words (e.g. "I ask him about Thornhill" or "I describe the suspect"), narrate this as INDIRECT SPEECH or brief summary {E['dash']} do NOT invent specific quoted dialog for the player character. Write "Du fragst ihn nach Thornhill" or "Du beschreibst den Verdächtigen", then show the NPC's reaction. NEVER put invented words in the player character's mouth.
 - ACTIONS: The narration MUST SHOW the player character performing the described action. You may add sensory detail and atmosphere, but the core action stays as stated and must be visible in the text.
@@ -3635,6 +3786,107 @@ def call_narrator(client: ModelGateway, prompt: str,
     # Fix Cyrillic homoglyphs (LLMs occasionally emit е instead of e, с instead of s, etc.)
     raw = _fix_cyrillic_homoglyphs(raw)
     return raw
+
+
+def call_world_state_answer(client: ModelGateway, game: GameState, brain: dict,
+                            player_message: str,
+                            config: Optional[EngineConfig] = None) -> dict:
+    """Produce a structured state answer for diagnostics/system-query turns."""
+    _cfg = config or EngineConfig()
+    lang = get_narration_lang(_cfg)
+    prompt = f"""<state>
+location:{game.current_location}
+scene_context:{game.current_scene_context}
+health:{game.health}/5 spirit:{game.spirit}/5 supply:{game.supply}/5 momentum:{game.momentum}/{game.max_momentum}
+</state>
+<intent>{brain.get('player_intent', '')}</intent>
+{_brain_input_context(player_message)}
+Answer the player's information request and immediate operational state.
+- Stay concrete and literal.
+- Distinguish the player character's own condition from the ship's condition.
+- facts should be short factual bullet-sized lines in {lang}.
+"""
+    response = _api_create_with_retry(
+        client, max_retries=2,
+        model=BRAIN_MODEL, max_output_tokens=500,
+        instructions="You are a strict RPG state analyst. Return only structured state facts. Do not narrate beyond what is requested.",
+        input=[{"role": "user", "content": prompt}],
+        text=_json_schema_text_format("world_state_answer", WORLD_STATE_ANSWER_SCHEMA),
+    )
+    return json.loads(_response_text(response))
+
+
+def _maybe_call_state_answer(client: ModelGateway, game: GameState, brain: dict,
+                             player_message: str,
+                             config: Optional[EngineConfig] = None) -> Optional[dict]:
+    if not _should_generate_state_answer(config, player_message, brain):
+        return None
+
+
+def _strict_resolution_prompt(base_prompt: str, brain: dict, state_answer: Optional[dict] = None) -> str:
+    extra = [
+        _move_narration_contract(brain),
+        "<strict_resolution_rules>",
+        "- Return narration plus only the minimal canon updates justified by the scene.",
+        "- Prefer zero new NPCs. Only add one if the scene clearly establishes a physically present new arrival.",
+        "- If the player asked a question or performed information-gathering, the narration must answer it plainly before flourish.",
+        "- scene_context should be one short factual summary of the new immediate situation.",
+        "- memory_updates should only be for NPCs physically present or directly participating.",
+        "- Keep narration concise and grounded.",
+        "</strict_resolution_rules>",
+    ]
+    if state_answer:
+        extra.extend([
+            "<authoritative_state>",
+            f"<answer_summary>{state_answer.get('answer_summary', '')}</answer_summary>",
+            "</authoritative_state>",
+        ])
+    return base_prompt + "\n" + "\n".join(extra)
+
+
+def _normalize_strict_scene_resolution(data: dict) -> dict:
+    result = {
+        "narration": data.get("narration", "") or "",
+        "scene_context": data.get("scene_context", "") or "",
+        "location_update": data.get("location_update"),
+        "time_update": data.get("time_update"),
+        "memory_updates": data.get("memory_updates", []) or [],
+        "new_npcs": data.get("new_npcs", []) or [],
+        "npc_renames": [],
+        "npc_details": [],
+        "deceased_npcs": [],
+    }
+    if len(result["new_npcs"]) > 1:
+        result["new_npcs"] = result["new_npcs"][:1]
+    return result
+
+
+def call_strict_scene_resolution(client: ModelGateway, game: GameState, prompt: str,
+                                 brain: dict,
+                                 state_answer: Optional[dict] = None,
+                                 config: Optional[EngineConfig] = None) -> dict:
+    _cfg = config or EngineConfig()
+    instructions = get_narrator_system(_cfg, game) + """
+<output_mode>
+- Return ONLY JSON matching the requested schema.
+- The narration field is the exact player-visible prose.
+- Do not include markdown fences, XML tags, or commentary outside JSON.
+</output_mode>"""
+    response = _api_create_with_retry(
+        client, max_retries=2,
+        model=NARRATOR_MODEL, max_output_tokens=3500,
+        instructions=instructions,
+        input=[{"role": "user", "content": _strict_resolution_prompt(prompt, brain, state_answer)}],
+        text=_json_schema_text_format("strict_scene_resolution", STRICT_SCENE_RESOLUTION_SCHEMA),
+    )
+    return _normalize_strict_scene_resolution(json.loads(_response_text(response)))
+    try:
+        answer = call_world_state_answer(client, game, brain, player_message, config)
+        log(f"[StateAnswer] Summary: {answer.get('answer_summary', '')[:120]}")
+        return answer
+    except Exception as e:
+        log(f"[StateAnswer] Failed ({type(e).__name__}: {e})", level="warning")
+        return None
 
 
 def _salvage_truncated_narration(raw: str) -> str:
@@ -3760,6 +4012,56 @@ Extract all metadata from the narration above. Remember: {game.player_name} is t
         return {"scene_context": "", "location_update": None, "time_update": None,
                 "memory_updates": [], "new_npcs": [], "npc_renames": [], "npc_details": [],
                 "deceased_npcs": []}
+
+
+def _sanitize_metadata_for_strict_mode(game: GameState, metadata: dict) -> dict:
+    """Clamp metadata updates for less-inventive backends like ChatMock."""
+    existing_ids = {n.get("id") for n in game.npcs}
+    sanitized = {
+        "scene_context": metadata.get("scene_context", ""),
+        "location_update": metadata.get("location_update"),
+        "time_update": metadata.get("time_update"),
+        "memory_updates": [],
+        "new_npcs": [],
+        "npc_renames": [],
+        "npc_details": [],
+        "deceased_npcs": [],
+    }
+    for update in metadata.get("memory_updates", []) or []:
+        npc_id = update.get("npc_id")
+        if npc_id in existing_ids:
+            sanitized["memory_updates"].append(update)
+    for npc in metadata.get("new_npcs", []) or []:
+        desc = (npc.get("description") or "").strip()
+        name = (npc.get("name") or "").strip()
+        if name and desc and len(desc) >= 12:
+            sanitized["new_npcs"].append({
+                "name": name,
+                "description": desc,
+                "disposition": npc.get("disposition", "neutral") or "neutral",
+            })
+            break
+    return sanitized
+
+
+def _run_scene_narration(client: ModelGateway, game: GameState, prompt: str,
+                         brain: dict,
+                         state_answer: Optional[dict],
+                         scene_present_ids: set,
+                         config: Optional[EngineConfig]) -> tuple[str, dict]:
+    _cfg = config or EngineConfig()
+    if _cfg.strict_mode:
+        resolution = call_strict_scene_resolution(client, game, prompt, brain, state_answer, _cfg)
+        narration = parse_narrator_response(game, resolution.get("narration", ""))
+        metadata = _sanitize_metadata_for_strict_mode(game, resolution)
+        _apply_narrator_metadata(game, metadata, scene_present_ids=scene_present_ids)
+        return narration, metadata
+
+    raw = call_narrator(client, prompt, game, _cfg)
+    narration = parse_narrator_response(game, raw)
+    metadata = call_narrator_metadata(client, narration, game, _cfg)
+    _apply_narrator_metadata(game, metadata, scene_present_ids=scene_present_ids)
+    return narration, metadata
 
 
 def _resolve_slug_refs(game: GameState, mem_updates: list, fresh_npcs: list):
@@ -4290,8 +4592,8 @@ def build_new_game_prompt(game: GameState) -> str:
     seed = _creativity_seed()
     log(f"[Narrator] Opening creativity_seed={seed!r}")
     return f"""<scene type="opening">
-<world genre="{game.setting_genre}" tone="{game.setting_tone}">{game.setting_description}</world>
-<character name="{game.player_name}">{game.character_concept}</character>
+<world genre="{game.setting_genre}" tone="{game.setting_tone}">{_campaign_world_text(game)}</world>
+<character name="{game.player_name}">{_character_identity_text(game)}</character>
 <location>{game.current_location}</location>{loc_hist}{time_ctx}
 <situation>{game.current_scene_context}</situation>{crisis}
 {story}</scene>
@@ -4479,6 +4781,7 @@ def _npcs_present_string(game: GameState) -> str:
 
 
 def build_dialog_prompt(game: GameState, brain: dict, player_words: str = "",
+                        state_answer: Optional[dict] = None,
                         chaos_interrupt: Optional[str] = None,
                         activated_npcs: list = None, mentioned_npcs: list = None,
                         config: Optional[EngineConfig] = None) -> str:
@@ -4526,6 +4829,20 @@ def build_dialog_prompt(game: GameState, brain: dict, player_words: str = "",
     pacing = _pacing_block(game, chaos_interrupt, brain.get("dramatic_question", ""))
     time_ctx = f'\n<time>{game.time_of_day}</time>' if game.time_of_day else ""
     loc_hist = f'\n<prev_locations>{", ".join(game.location_history[-3:])}</prev_locations>' if game.location_history else ""
+    state_contract = "\n" + _state_contract_block(game)
+    state_answer_block = ""
+    if state_answer:
+        facts = "\n".join(f"- {fact}" for fact in state_answer.get("facts", []))
+        state_answer_block = (
+            "\n<state_answer>"
+            f"\n<answer_summary>{state_answer.get('answer_summary', '')}</answer_summary>"
+            f"\n<usable_power>{state_answer.get('usable_power', 'uncertain')}</usable_power>"
+            f"\n<targeting_possible>{state_answer.get('targeting_possible', 'uncertain')}</targeting_possible>"
+            f"\n<player_status>{state_answer.get('player_status', '')}</player_status>"
+            f"\n<ship_status>{state_answer.get('ship_status', '')}</ship_status>"
+            f"\n<facts>\n{facts}\n</facts>"
+            "\n</state_answer>"
+        )
 
     # Director guidance injection
     director_block = ""
@@ -4537,9 +4854,10 @@ def build_dialog_prompt(game: GameState, brain: dict, player_words: str = "",
             director_block += f'\n<npc_note for="{npc_id}">{guidance}</npc_note>'
 
     return f"""<scene type="dialog" n="{game.scene_count}">
-<world genre="{game.setting_genre}" tone="{game.setting_tone}">{game.setting_description}</world>
-<character name="{game.player_name}">{game.character_concept}</character>
+<world genre="{game.setting_genre}" tone="{game.setting_tone}">{_campaign_world_text(game)}</world>
+<character name="{game.player_name}">{_character_identity_text(game)}</character>
 <intent>{brain.get('player_intent', '')}</intent>{pw}
+{state_contract}{state_answer_block}
 <location>{game.current_location}</location>{loc_hist}{time_ctx}
 {npc}{npcs_section}{wl}{crisis}
 {pacing}{director_block}
@@ -4550,6 +4868,7 @@ def build_dialog_prompt(game: GameState, brain: dict, player_words: str = "",
 def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
                         consequences: list, clock_events: list, npc_agency: list,
                         player_words: str = "",
+                        state_answer: Optional[dict] = None,
                         chaos_interrupt: Optional[str] = None,
                         activated_npcs: list = None, mentioned_npcs: list = None,
                         config: Optional[EngineConfig] = None) -> str:
@@ -4635,6 +4954,20 @@ def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
     pacing = _pacing_block(game, chaos_interrupt, brain.get("dramatic_question", ""))
     time_ctx = f'\n<time>{game.time_of_day}</time>' if game.time_of_day else ""
     loc_hist = f'\n<prev_locations>{", ".join(game.location_history[-3:])}</prev_locations>' if game.location_history else ""
+    state_contract = "\n" + _state_contract_block(game)
+    state_answer_block = ""
+    if state_answer:
+        facts = "\n".join(f"- {fact}" for fact in state_answer.get("facts", []))
+        state_answer_block = (
+            "\n<state_answer>"
+            f"\n<answer_summary>{state_answer.get('answer_summary', '')}</answer_summary>"
+            f"\n<usable_power>{state_answer.get('usable_power', 'uncertain')}</usable_power>"
+            f"\n<targeting_possible>{state_answer.get('targeting_possible', 'uncertain')}</targeting_possible>"
+            f"\n<player_status>{state_answer.get('player_status', '')}</player_status>"
+            f"\n<ship_status>{state_answer.get('ship_status', '')}</ship_status>"
+            f"\n<facts>\n{facts}\n</facts>"
+            "\n</state_answer>"
+        )
 
     # Director guidance injection
     director_block = ""
@@ -4645,12 +4978,13 @@ def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
             director_block += f'\n<npc_note for="{npc_id}">{guidance}</npc_note>'
 
     return f"""<scene type="action" n="{game.scene_count}">
-<world genre="{game.setting_genre}" tone="{game.setting_tone}">{game.setting_description}</world>
-<character name="{game.player_name}">{game.character_concept}</character>
+<world genre="{game.setting_genre}" tone="{game.setting_tone}">{_campaign_world_text(game)}</world>
+<character name="{game.player_name}">{_character_identity_text(game)}</character>
 <intent>{brain.get('player_intent', '')} ({brain.get('approach', '')})</intent>{pw}
 {constraint}
 {position_tag}
 <status h="{game.health}" sp="{game.spirit}" su="{game.supply}" m="{game.momentum}"/>
+{state_contract}{state_answer_block}
 <resolution_contract>
 - Follow the <result> tag literally.
 - If result type is STRONG_HIT, end the scene with the player ahead on the stated objective.
@@ -4663,6 +4997,71 @@ def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
 {pacing}{director_block}
 {_story_context_block(game)}</scene>
 <task>2-4 paragraphs of immersive narration. If <director_guidance> is present, follow its narrative direction while maintaining your creative voice.</task>"""
+
+
+def build_no_roll_action_prompt(game: GameState, brain: dict,
+                                player_words: str = "",
+                                state_answer: Optional[dict] = None,
+                                chaos_interrupt: Optional[str] = None,
+                                activated_npcs: list = None, mentioned_npcs: list = None,
+                                config: Optional[EngineConfig] = None) -> str:
+    _cfg = config or EngineConfig()
+    context_text = f"{player_words} {brain.get('player_intent') or ''} {game.current_scene_context or ''}"
+    target_id = brain.get("target_npc")
+    _present_ids = set()
+    if target_id:
+        t = _find_npc(game, target_id)
+        if t:
+            _present_ids.add(t.get("id"))
+    if activated_npcs:
+        _present_ids.update(n.get("id") for n in activated_npcs if n.get("id"))
+
+    npc = _npc_block(game, target_id, context_text=context_text,
+                     present_npc_ids=_present_ids)
+    if activated_npcs is not None:
+        activated_block = _activated_npcs_block(activated_npcs, target_id, game,
+                                                context_text, present_npc_ids=_present_ids)
+        exclude_ids = {n.get("id") for n in activated_npcs}
+        if target_id:
+            t = _find_npc(game, target_id)
+            if t:
+                exclude_ids.add(t.get("id"))
+        known_str = _known_npcs_string(mentioned_npcs or [], game, exclude_ids)
+        npcs_section = ""
+        if activated_block:
+            npcs_section += f"\n{activated_block}"
+        npcs_section += f"\n<known_npcs>{known_str}</known_npcs>"
+    else:
+        npcs_section = f"\n<npcs_present>{_npcs_present_string(game)}</npcs_present>"
+
+    wl = f'\n<world_add>{brain.get("world_addition", "")}</world_add>' if brain.get("world_addition") else ""
+    pw = _narrator_player_input_block(player_words)
+    pacing = _pacing_block(game, chaos_interrupt, brain.get("dramatic_question", ""))
+    time_ctx = f'\n<time>{game.time_of_day}</time>' if game.time_of_day else ""
+    loc_hist = f'\n<prev_locations>{", ".join(game.location_history[-3:])}</prev_locations>' if game.location_history else ""
+    state_contract = "\n" + _state_contract_block(game)
+    state_answer_block = ""
+    if state_answer:
+        facts = "\n".join(f"- {fact}" for fact in state_answer.get("facts", []))
+        state_answer_block = (
+            "\n<state_answer>"
+            f"\n<answer_summary>{state_answer.get('answer_summary', '')}</answer_summary>"
+            f"\n<player_status>{state_answer.get('player_status', '')}</player_status>"
+            f"\n<ship_status>{state_answer.get('ship_status', '')}</ship_status>"
+            f"\n<facts>\n{facts}\n</facts>"
+            "\n</state_answer>"
+        )
+    return f"""<scene type="no_roll_action" n="{game.scene_count}">
+<world genre="{game.setting_genre}" tone="{game.setting_tone}">{_campaign_world_text(game)}</world>
+<character name="{game.player_name}">{_character_identity_text(game)}</character>
+<intent>{brain.get('player_intent', '')} ({brain.get('approach', '')})</intent>{pw}
+<resolution>NO ROLL. The action is routine, safe, or purely expressive. Resolve it naturally without treating it as a risky move.</resolution>
+{state_contract}{state_answer_block}
+<location>{game.current_location}</location>{loc_hist}{time_ctx}
+{npc}{npcs_section}{wl}
+{pacing}
+{_story_context_block(game)}</scene>
+<task>1-3 paragraphs. Show the player's action clearly. Keep the response grounded and low-stakes. Do not invent a failure, cost, or major escalation unless the prompt explicitly establishes one.</task>"""
 
 
 # ===============================================================
@@ -5005,7 +5404,7 @@ def _apply_memory_updates(game: GameState, json_text: str):
 # ===============================================================
 
 SAVE_FIELDS = [
-    "player_name", "character_concept", "setting_genre", "setting_tone",
+    "player_name", "character_description", "character_concept", "campaign_description", "setting_genre", "setting_tone",
     "setting_description", "edge", "heart", "iron", "shadow", "wits",
     "health", "spirit", "supply", "momentum", "max_momentum", "scene_count",
     "current_location", "current_scene_context", "npcs", "clocks",
@@ -5411,13 +5810,13 @@ def export_story_pdf(game: GameState, messages: list, lang: str = "de") -> bytes
                               styles["Ornament"]))
     elements.append(Spacer(1, 6 * mm))
 
-    if game.character_concept:
+    if _character_identity_text(game):
         elements.append(Paragraph(
-            esc(_clean_for_export(game.character_concept)), styles["CharInfo"]))
+            esc(_clean_for_export(_character_identity_text(game))), styles["CharInfo"]))
         elements.append(Spacer(1, 3 * mm))
-    if game.setting_description:
+    if _campaign_world_text(game):
         elements.append(Paragraph(
-            esc(_clean_for_export(game.setting_description)), styles["CharInfo"]))
+            esc(_clean_for_export(_campaign_world_text(game))), styles["CharInfo"]))
         elements.append(Spacer(1, 3 * mm))
     if game.current_location:
         loc = _t("export.location", lang)
@@ -5516,7 +5915,9 @@ def start_new_game(client: ModelGateway, creation_data: dict,
 
     game = GameState(
         player_name=setup.get("character_name", "Namenlos"),
+        character_description=setup.get("character_description", setup.get("character_concept", "")),
         character_concept=setup.get("character_concept", ""),
+        campaign_description=setup.get("campaign_description", setup.get("setting_description", "")),
         setting_genre=genre,
         setting_tone=tone,
         setting_description=setup.get("setting_description", ""),
@@ -5631,9 +6032,9 @@ def call_chapter_summary(client: ModelGateway, game: GameState,
 - "thematic_question": The core emotional/philosophical question this chapter raised but did not fully answer. This carries the vertical (emotional) narrative across chapters. Example: "Can you fix the damage caused by good intentions?" or "Is loyalty earned through competence or compassion?"
 """ + _kid_friendly_block(_cfg) + _content_boundaries_block(game),
             input=[{"role": "user", "content":
-                       f"character:{game.player_name} {E['dash']} {game.character_concept}\n"
+                       f"character:{game.player_name} {E['dash']} {_character_identity_text(game)}\n"
                        f"genre:{game.setting_genre} tone:{game.setting_tone}\n"
-                       f"world:{game.setting_description}\n"
+                       f"world:{_campaign_world_text(game)}\n"
                        f"conflict:{conflict}\n"
                        f"log:{log_text}\nnpcs:{npc_text}\n"
                        f"location:{game.current_location}\n"
@@ -5682,8 +6083,8 @@ def build_epilogue_prompt(game: GameState) -> str:
     )
 
     return f"""<scene type="epilogue">
-<world genre="{game.setting_genre}" tone="{game.setting_tone}">{game.setting_description}</world>
-<character name="{game.player_name}">{game.character_concept}</character>
+<world genre="{game.setting_genre}" tone="{game.setting_tone}">{_campaign_world_text(game)}</world>
+<character name="{game.player_name}">{_character_identity_text(game)}</character>
 <location>{game.current_location}</location>
 <situation>{game.current_scene_context}</situation>
 <conflict>{conflict}</conflict>
@@ -5777,8 +6178,8 @@ def build_new_chapter_prompt(game: GameState) -> str:
     log(f"[Narrator] Chapter {game.chapter_number} opening creativity_seed={seed!r}")
 
     return f"""<scene type="chapter_opening" chapter="{game.chapter_number}">
-<world genre="{game.setting_genre}" tone="{game.setting_tone}">{game.setting_description}</world>
-<character name="{game.player_name}">{game.character_concept}</character>
+<world genre="{game.setting_genre}" tone="{game.setting_tone}">{_campaign_world_text(game)}</world>
+<character name="{game.player_name}">{_character_identity_text(game)}</character>
 <location>{game.current_location}</location>{time_ctx}
 <situation>{game.current_scene_context}</situation>
 {campaign}
@@ -5981,41 +6382,57 @@ def process_turn(client: ModelGateway, game: GameState,
 
     # Check chaos interrupt (before scene processing)
     chaos_interrupt = check_chaos_interrupt(game)
+    state_answer = _maybe_call_state_answer(client, game, brain, player_message, config)
 
-    # Dialog
-    if brain.get("dialog_only") or brain.get("move") == "dialog":
+    # Dialog / no-roll action
+    if brain.get("dialog_only") or brain.get("move") == "dialog" or not brain.get("requires_roll", True):
         game.scene_count += 1
-        prompt = build_dialog_prompt(game, brain, player_words=player_message,
-                                     chaos_interrupt=chaos_interrupt,
-                                     activated_npcs=activated_npcs,
-                                     mentioned_npcs=mentioned_npcs,
-                                     config=config)
+        if brain.get("dialog_only") or brain.get("move") == "dialog":
+            prompt = build_dialog_prompt(game, brain, player_words=player_message,
+                                         state_answer=state_answer,
+                                         chaos_interrupt=chaos_interrupt,
+                                         activated_npcs=activated_npcs,
+                                         mentioned_npcs=mentioned_npcs,
+                                         config=config)
+            result_tag = "dialog"
+            move_tag = brain.get("move", "dialog")
+            scene_type = "interrupt" if chaos_interrupt else "breather"
+            prompt_summary = f"Dialog: {brain.get('player_intent', player_message)[:80]}"
+        else:
+            prompt = build_no_roll_action_prompt(game, brain, player_words=player_message,
+                                                 state_answer=state_answer,
+                                                 chaos_interrupt=chaos_interrupt,
+                                                 activated_npcs=activated_npcs,
+                                                 mentioned_npcs=mentioned_npcs,
+                                                 config=config)
+            result_tag = "no_roll"
+            move_tag = brain.get("move", "world_shaping")
+            scene_type = "interrupt" if chaos_interrupt else "breather"
+            prompt_summary = f"No-roll: {brain.get('player_intent', player_message)[:80]}"
         if progress_callback:
             progress_callback("narrate")
-        raw = call_narrator(client, prompt, game, config)
-        narration = parse_narrator_response(game, raw)
+        narration, metadata = _run_scene_narration(
+            client, game, prompt, brain, state_answer, _scene_present_ids, config
+        )
         if game.last_turn_snapshot is not None:
             game.last_turn_snapshot["narration"] = narration
         if progress_callback:
             progress_callback("metadata")
-        metadata = call_narrator_metadata(client, narration, game, config)
-        _apply_narrator_metadata(game, metadata, scene_present_ids=_scene_present_ids)
         # Mark first pending revelation as used (narrator was instructed to weave it in)
         if pending_revs:
             mark_revelation_used(game, pending_revs[0]["id"])
         # Record pacing
-        scene_type = "interrupt" if chaos_interrupt else "breather"
         record_scene_intensity(game, scene_type)
         game.narration_history.append({
-            "prompt_summary": f"Dialog: {brain.get('player_intent', player_message)[:80]}",
+            "prompt_summary": prompt_summary,
             "narration": narration[:MAX_NARRATION_CHARS],
         })
         if len(game.narration_history) > MAX_NARRATION_HISTORY:
             game.narration_history = game.narration_history[-MAX_NARRATION_HISTORY:]
         game.session_log.append({"scene": game.scene_count,
                                  "summary": brain.get("player_intent", player_message),
-                                 "move": brain.get("move", "dialog"),
-                                 "result": "dialog", "consequences": [], "clock_events": [],
+                                 "move": move_tag,
+                                 "result": result_tag, "consequences": [], "clock_events": [],
                                  "dramatic_question": brain.get("dramatic_question", ""),
                                  "chaos_interrupt": chaos_interrupt,
                                  "npc_activation": npc_activation_debug})
@@ -6026,7 +6443,7 @@ def process_turn(client: ModelGateway, game: GameState,
 
         # Director — deferred to UI layer for non-blocking display
         director_ctx = None
-        director_reason = _should_call_director(game, roll_result="dialog",
+        director_reason = _should_call_director(game, roll_result=result_tag,
                                   chaos_used=bool(chaos_interrupt),
                                   new_npcs_found=bool(metadata.get("new_npcs")),
                                   revelation_used=bool(pending_revs))
@@ -6069,19 +6486,19 @@ def process_turn(client: ModelGateway, game: GameState,
     consequences, clock_events = apply_consequences(game, roll, brain)
     npc_agency = check_npc_agency(game)
     prompt = build_action_prompt(game, brain, roll, consequences, clock_events, npc_agency,
-                                player_words=player_message, chaos_interrupt=chaos_interrupt,
+                                player_words=player_message, state_answer=state_answer,
+                                chaos_interrupt=chaos_interrupt,
                                 activated_npcs=activated_npcs, mentioned_npcs=mentioned_npcs,
                                 config=config)
     if progress_callback:
         progress_callback("narrate")
-    raw = call_narrator(client, prompt, game, config)
-    narration = parse_narrator_response(game, raw)
+    narration, metadata = _run_scene_narration(
+        client, game, prompt, brain, state_answer, _scene_present_ids, config
+    )
     if game.last_turn_snapshot is not None:
         game.last_turn_snapshot["narration"] = narration
     if progress_callback:
         progress_callback("metadata")
-    metadata = call_narrator_metadata(client, narration, game, config)
-    _apply_narrator_metadata(game, metadata, scene_present_ids=_scene_present_ids)
     # Update chaos factor based on result
     update_chaos_factor(game, roll.result)
     # Record pacing
@@ -6516,8 +6933,9 @@ def process_correction(client: ModelGateway, game: GameState,
             progress_callback("resolve")
         brain = call_brain(client, game, corrected_input, _cfg)
         _apply_brain_location_time(game, brain)
+        state_answer = _maybe_call_state_answer(client, game, brain, corrected_input, _cfg)
 
-        if analysis.get("reroll_needed") and brain.get("stat", "none") != "none":
+        if analysis.get("reroll_needed") and brain.get("stat", "none") != "none" and brain.get("requires_roll", True):
             # Full action path with new roll
             game.scene_count += 1
             stat_name = brain.get("stat", "wits")
@@ -6527,16 +6945,24 @@ def process_correction(client: ModelGateway, game: GameState,
             npc_agency = check_npc_agency(game)
             activated_npcs, mentioned_npcs, _ = activate_npcs_for_prompt(game, brain, corrected_input)
             prompt = build_action_prompt(game, brain, roll, consequences, clock_events, npc_agency,
-                                         player_words=corrected_input, config=_cfg,
+                                         player_words=corrected_input, state_answer=state_answer,
+                                         config=_cfg,
                                          activated_npcs=activated_npcs, mentioned_npcs=mentioned_npcs)
         else:
-            # Dialog / intent-only path — no new roll
+            # Dialog / no-roll / intent-only path — no new roll
             roll = None
             game.scene_count += 1
             activated_npcs, mentioned_npcs, _ = activate_npcs_for_prompt(game, brain, corrected_input)
-            prompt = build_dialog_prompt(game, brain, player_words=corrected_input,
-                                         activated_npcs=activated_npcs,
-                                         mentioned_npcs=mentioned_npcs, config=_cfg)
+            if brain.get("dialog_only") or brain.get("move") == "dialog":
+                prompt = build_dialog_prompt(game, brain, player_words=corrected_input,
+                                             state_answer=state_answer,
+                                             activated_npcs=activated_npcs,
+                                             mentioned_npcs=mentioned_npcs, config=_cfg)
+            else:
+                prompt = build_no_roll_action_prompt(game, brain, player_words=corrected_input,
+                                                     state_answer=state_answer,
+                                                     activated_npcs=activated_npcs,
+                                                     mentioned_npcs=mentioned_npcs, config=_cfg)
 
     # Step 2b: state_error → patch state in-place, no re-roll
     # IMPORTANT: do NOT call apply_consequences() here — consequences from the
@@ -6546,6 +6972,7 @@ def process_correction(client: ModelGateway, game: GameState,
         roll = snap.get("roll")           # keep original roll (may be None for dialog)
         brain = snap.get("brain") or {}   # keep original brain output
         _apply_correction_ops(game, analysis.get("state_ops", []))
+        state_answer = _maybe_call_state_answer(client, game, brain, snap.get("player_input", ""), _cfg)
         activated_npcs, mentioned_npcs, _ = activate_npcs_for_prompt(
             game, brain, snap.get("player_input", ""))
         # Read original consequences from session_log for prompt-building only
@@ -6555,12 +6982,20 @@ def process_correction(client: ModelGateway, game: GameState,
             clock_events = _last_log.get("clock_events", [])
             npc_agency = check_npc_agency(game)
             prompt = build_action_prompt(game, brain, roll, consequences, clock_events, npc_agency,
-                                         player_words=snap.get("player_input", ""), config=_cfg,
+                                         player_words=snap.get("player_input", ""), state_answer=state_answer,
+                                         config=_cfg,
                                          activated_npcs=activated_npcs, mentioned_npcs=mentioned_npcs)
         else:
-            prompt = build_dialog_prompt(game, brain, player_words=snap.get("player_input", ""),
-                                         activated_npcs=activated_npcs,
-                                         mentioned_npcs=mentioned_npcs, config=_cfg)
+            if brain.get("dialog_only") or brain.get("move") == "dialog":
+                prompt = build_dialog_prompt(game, brain, player_words=snap.get("player_input", ""),
+                                             state_answer=state_answer,
+                                             activated_npcs=activated_npcs,
+                                             mentioned_npcs=mentioned_npcs, config=_cfg)
+            else:
+                prompt = build_no_roll_action_prompt(game, brain, player_words=snap.get("player_input", ""),
+                                                     state_answer=state_answer,
+                                                     activated_npcs=activated_npcs,
+                                                     mentioned_npcs=mentioned_npcs, config=_cfg)
 
     # Step 3: Narrator rewrite — inject correction context
     correction_tag = (
@@ -6570,10 +7005,12 @@ def process_correction(client: ModelGateway, game: GameState,
     )
     prompt = prompt + correction_tag
 
+    _scene_present_ids = {n["id"] for n in activated_npcs}
     if progress_callback:
         progress_callback("narrate")
-    raw = call_narrator(client, prompt, game, _cfg)
-    narration = parse_narrator_response(game, raw)
+    narration, metadata = _run_scene_narration(
+        client, game, prompt, brain, state_answer, _scene_present_ids, _cfg
+    )
 
     # Update snapshot with rewritten narration so a follow-up ## works correctly
     if game.last_turn_snapshot is not None:
@@ -6583,11 +7020,8 @@ def process_correction(client: ModelGateway, game: GameState,
             game.last_turn_snapshot["roll"] = roll
 
     # Step 4: Metadata extraction (new NPCs, memories etc. from rewritten scene)
-    _scene_present_ids = {n["id"] for n in activated_npcs}
     if progress_callback:
         progress_callback("metadata")
-    metadata = call_narrator_metadata(client, narration, game, _cfg)
-    _apply_narrator_metadata(game, metadata, scene_present_ids=_scene_present_ids)
 
     # Step 5: Update session_log / narration_history
     intent = brain.get("player_intent", snap.get("player_input", ""))[:80]
@@ -6760,17 +7194,17 @@ def process_momentum_burn(client: ModelGateway, game: GameState,
     consequences, clock_events = apply_consequences(game, upgraded, brain_data)
     # Re-run NPC activation for the re-narrated scene
     activated_npcs, mentioned_npcs, _ = activate_npcs_for_prompt(game, brain_data, player_words)
+    state_answer = _maybe_call_state_answer(client, game, brain_data, player_words, config)
     prompt = build_action_prompt(game, brain_data, upgraded, consequences, clock_events, [],
-                                player_words=player_words, chaos_interrupt=chaos_interrupt,
+                                player_words=player_words, state_answer=state_answer,
+                                chaos_interrupt=chaos_interrupt,
                                 activated_npcs=activated_npcs, mentioned_npcs=mentioned_npcs,
                                 config=config)
     prompt = prompt.replace('<task>', '<momentum_burn>Character digs deep, turns the tide.</momentum_burn>\n<task>')
-
-    raw = call_narrator(client, prompt, game, config)
-    narration = parse_narrator_response(game, raw)
-    metadata = call_narrator_metadata(client, narration, game, config)
     _scene_present_ids = {n["id"] for n in activated_npcs}
-    _apply_narrator_metadata(game, metadata, scene_present_ids=_scene_present_ids)
+    narration, metadata = _run_scene_narration(
+        client, game, prompt, brain_data, state_answer, _scene_present_ids, config
+    )
 
     # Update chaos after burn (new result counts)
     update_chaos_factor(game, new_result)

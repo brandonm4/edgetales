@@ -443,14 +443,14 @@ _TURN_STATUS_PHASES = [
 ]
 
 
-def _set_turn_status(phase: str = "", detail: str = "") -> None:
-    s = S()
+def _set_turn_status(phase: str = "", detail: str = "", session: Optional[dict] = None) -> None:
+    s = session or S()
     s["turn_status_phase"] = phase
     s["turn_status_detail"] = detail
 
 
-def _turn_status_html() -> str:
-    s = S()
+def _turn_status_html(session: Optional[dict] = None) -> str:
+    s = session or S()
     phase = s.get("turn_status_phase", "")
     detail = s.get("turn_status_detail", "")
     phase_index = {key: idx for idx, (key, _) in enumerate(_TURN_STATUS_PHASES)}
@@ -508,6 +508,13 @@ def _restore_to_message_boundary(game: GameState, messages: list, keep_upto: int
     return True
 
 
+def _has_prior_checkpoint_for_boundary(game: Optional[GameState], messages: list, keep_upto: int) -> bool:
+    if not game or not getattr(game, "turn_checkpoints", None):
+        return False
+    keep_count = _saved_message_count(messages, keep_upto)
+    return any(cp.get("message_count", 0) <= keep_count for cp in (game.turn_checkpoints or []))
+
+
 def _trim_start_for_message(messages: list, index: int) -> int:
     if index < 0 or index >= len(messages):
         return index
@@ -524,12 +531,25 @@ def _find_prior_user_index(messages: list, index: int) -> Optional[int]:
     return None
 
 
+def _can_rewind_message(game: Optional[GameState], messages: list, index: int) -> bool:
+    if not game or index < 0 or index >= len(messages):
+        return False
+    user_index = _find_prior_user_index(messages, index)
+    if user_index is None:
+        return False
+    trim_start = _trim_start_for_message(
+        messages,
+        user_index if messages[index].get("role") == "user" else index,
+    )
+    return _has_prior_checkpoint_for_boundary(game, messages, trim_start)
+
+
 def _scene_number_for_message(messages: list, index: int) -> int:
     return sum(1 for msg in messages[:index + 1] if msg.get("scene_marker"))
 
 
-def _refresh_chat_view() -> None:
-    s = S()
+def _refresh_chat_view(session: Optional[dict] = None) -> None:
+    s = session or S()
     chat_container = s.get("_chat_container")
     if chat_container is None:
         return
@@ -538,8 +558,8 @@ def _refresh_chat_view() -> None:
         render_chat_messages(chat_container)
 
 
-async def _save_message_edit(index: int) -> None:
-    s = S()
+async def _save_message_edit(index: int, session: Optional[dict] = None) -> None:
+    s = session or S()
     game = s.get("game")
     messages = s.get("messages", [])
     if index < 0 or index >= len(messages):
@@ -557,28 +577,28 @@ async def _save_message_edit(index: int) -> None:
     s["message_edit_value"] = ""
     if game:
         save_game(game, s["current_user"], messages, s.get("active_save", "autosave"))
-    _refresh_chat_view()
+    _refresh_chat_view(s)
 
 
-def _begin_message_edit(index: int) -> None:
-    s = S()
+def _begin_message_edit(index: int, session: Optional[dict] = None) -> None:
+    s = session or S()
     messages = s.get("messages", [])
     if index < 0 or index >= len(messages):
         return
     s["message_edit_index"] = index
     s["message_edit_value"] = messages[index].get("content", "")
-    _refresh_chat_view()
+    _refresh_chat_view(s)
 
 
-def _cancel_message_edit() -> None:
-    s = S()
+def _cancel_message_edit(session: Optional[dict] = None) -> None:
+    s = session or S()
     s["message_edit_index"] = None
     s["message_edit_value"] = ""
-    _refresh_chat_view()
+    _refresh_chat_view(s)
 
 
-async def _delete_message_from(index: int) -> None:
-    s = S()
+async def _delete_message_from(index: int, session: Optional[dict] = None) -> None:
+    s = session or S()
     game = s.get("game")
     messages = s.get("messages", [])
     if not game or index < 0 or index >= len(messages):
@@ -592,12 +612,12 @@ async def _delete_message_from(index: int) -> None:
     s["message_edit_value"] = ""
     if s.get("_sidebar_refresh"):
         s["_sidebar_refresh"](game)
-    _refresh_chat_view()
+    _refresh_chat_view(s)
     save_game(game, s["current_user"], s["messages"], s.get("active_save", "autosave"))
 
 
-async def _redo_message_from(index: int) -> None:
-    s = S()
+async def _redo_message_from(index: int, session: Optional[dict] = None) -> None:
+    s = session or S()
     game = s.get("game")
     messages = s.get("messages", [])
     if not game or index < 0 or index >= len(messages):
@@ -623,13 +643,21 @@ async def _redo_message_from(index: int) -> None:
         is_retry=True,
         turn_status_row=s.get("_turn_status_row"),
         turn_status_content=s.get("_turn_status_content"),
+        session=s,
     )
 
 
-def get_engine_config() -> EngineConfig:
-    s = S()
+def get_engine_config(session: Optional[dict] = None) -> EngineConfig:
+    s = session or S()
     # Pass display label directly — get_narration_lang() converts to English name
-    return EngineConfig(narration_lang=s.get("narration_lang", "Deutsch"), kid_friendly=s.get("kid_friendly", False))
+    strict_mode = PROVIDER_MODE == "chatmock" or (
+        PROVIDER_MODE == "proxy" and EMBEDDED_PROXY_BACKEND == "chatmock"
+    )
+    return EngineConfig(
+        narration_lang=s.get("narration_lang", "Deutsch"),
+        kid_friendly=s.get("kid_friendly", False),
+        strict_mode=strict_mode,
+    )
 
 
 def get_voice_config() -> VoiceConfig:
@@ -1061,7 +1089,7 @@ def render_sidebar_status(game: GameState, session=None) -> None:
     sl = get_stat_labels(lang)
     _name_aria = game.player_name.replace('"', '&quot;')
     ui.label(f"{E['mask']} {game.player_name}").classes("text-lg font-bold").props(f'aria-label="{_name_aria}"')
-    ui.label(game.character_concept).classes("text-sm text-gray-400 italic")
+    ui.label(getattr(game, "character_description", "") or game.character_concept).classes("text-sm text-gray-400 italic")
     if kid: ui.label(f"{E['green_heart']} {t('sidebar.kid_mode', lang)}").classes("text-xs text-green-400")
     tl = get_time_labels(lang)
     t_label = tl.get(game.time_of_day, "") if game.time_of_day else ""
@@ -1748,29 +1776,33 @@ def render_chat_messages(container) -> Optional[str]:
             if editing_index == i and not viewing:
                 edit_box = ui.textarea(value=s.get("message_edit_value", content)).classes("w-full")
                 edit_box.props('autogrow outlined')
-                edit_box.on_value_change(lambda e: S().__setitem__("message_edit_value", e.value))
+                edit_box.on_value_change(lambda e, session=s: session.__setitem__("message_edit_value", e.value))
                 with ui.row().classes("w-full justify-end gap-2 mt-1"):
-                    ui.button("Save", on_click=lambda idx=i: _save_message_edit(idx)).props("flat dense").classes("text-xs")
-                    ui.button("Cancel", on_click=_cancel_message_edit).props("flat dense").classes("text-xs")
+                    ui.button("Save", on_click=lambda idx=i, session=s: _save_message_edit(idx, session)).props("flat dense").classes("text-xs")
+                    ui.button("Cancel", on_click=lambda session=s: _cancel_message_edit(session)).props("flat dense").classes("text-xs")
             else:
                 ui.markdown(f"{_sr_prefix}{prefix}{_clean_narration(content)}")
             rd = msg.get("roll_data")
             if rd: render_dice_display(rd)
             if not viewing and role in ("user", "assistant") and not msg.get("correction_input"):
                 can_rewind = _checkpoint_capable(s.get("game"))
+                can_rewind_here = _can_rewind_message(s.get("game"), messages, i)
                 with ui.row().classes("w-full justify-end gap-1 mt-1"):
-                    ui.button(icon="edit", on_click=lambda idx=i: _begin_message_edit(idx)).props(
-                        'flat dense round size=sm aria-label="Edit message"'
+                    ui.button(icon="edit", on_click=lambda idx=i, session=s: _begin_message_edit(idx, session)).props(
+                        'flat dense round size=sm aria-label="Edit message" title="Edit this message"'
                     ).classes("text-gray-500 hover:text-white").style("min-width: 28px; min-height: 28px")
-                    redo_btn = ui.button(icon="refresh", on_click=lambda idx=i: _redo_message_from(idx)).props(
-                        'flat dense round size=sm aria-label="Redo from message"'
-                    ).classes("text-gray-500 hover:text-white").style("min-width: 28px; min-height: 28px")
-                    delete_btn = ui.button(icon="delete", on_click=lambda idx=i: _delete_message_from(idx)).props(
-                        'flat dense round size=sm aria-label="Delete from message"'
-                    ).classes("text-gray-500 hover:text-white").style("min-width: 28px; min-height: 28px")
-                    if not can_rewind:
+                    redo_btn = ui.button(icon="undo", on_click=lambda idx=i, session=s: _redo_message_from(idx, session)).props(
+                        'flat dense round size=sm aria-label="Redo from this turn" title="Delete this turn and rerun from here"'
+                    ).classes("text-amber-400 hover:text-amber-200").style("min-width: 28px; min-height: 28px")
+                    delete_btn = ui.button(icon="delete", on_click=lambda idx=i, session=s: _delete_message_from(idx, session)).props(
+                        'flat dense round size=sm aria-label="Delete from this turn" title="Delete this turn and everything after it"'
+                    ).classes("text-red-400 hover:text-red-200").style("min-width: 28px; min-height: 28px")
+                    if not can_rewind_here:
                         redo_btn.disable()
                         delete_btn.disable()
+                        if can_rewind:
+                            redo_btn.props('title="No earlier checkpoint exists before this turn"')
+                            delete_btn.props('title="No earlier checkpoint exists before this turn"')
     return last_scene_marker_id
 
 
@@ -1969,10 +2001,12 @@ def _render_confirm():
     setup = drafts[selected_idx]
     creation["setup"] = setup  # keep in sync
 
-    name=setup.get("character_name","?");concept=setup.get("character_concept","?")
+    name=setup.get("character_name","?")
+    concept=setup.get("character_description", setup.get("character_concept","?"))
     stats=setup.get("stats",{})
-    setting_desc=setup.get("setting_description","")
+    setting_desc=setup.get("campaign_description", setup.get("setting_description",""))
     location=setup.get("starting_location","")
+    opening_situation = setup.get("opening_situation", "")
 
     # --- Character summary ---
     _name_esc = name.replace('"', '&quot;')
@@ -1983,6 +2017,8 @@ def _render_confirm():
     if location:
         _loc_esc = f"{t('aria.location', lang)}: {location}".replace('"', '&quot;')
         ui.markdown(f"{E['pin']} {location}").props(f'aria-label="{_loc_esc}"')
+    if opening_situation:
+        ui.markdown(f"{E['spark']} **{t('creation.starting_scene_title', lang)}:** {opening_situation}")
     sl = get_stat_labels(lang)
     with ui.row().classes("gap-4 my-2"):
         for sk,slabel in sl.items():
@@ -2108,7 +2144,7 @@ def _render_confirm():
                 i = vi + offset
                 is_selected = (i == selected_idx)
                 d_name = draft.get("character_name","?")
-                d_concept = draft.get("character_concept","?")
+                d_concept = draft.get("character_description", draft.get("character_concept","?"))
                 if len(d_concept) > 60: d_concept = d_concept[:57] + "..."
                 def pick_draft(idx=i):
                     creation["selected_draft"] = idx
@@ -2198,17 +2234,19 @@ def _render_confirm():
 
 async def process_player_input(text: str, chat_container, sidebar_container=None,
                                sidebar_refresh=None, is_retry: bool = False,
-                               turn_status_row=None, turn_status_content=None) -> None:
-    s=S();game=s.get("game")
+                               turn_status_row=None, turn_status_content=None,
+                               session: Optional[dict] = None) -> None:
+    s = session or S()
+    game=s.get("game")
     if not game or not text.strip(): return
     # Double-send guard: prevent concurrent processing
     if s.get("processing", False):
         ui.notify(t("game.still_processing", L()), type="warning", position="top")
         return
     s["processing"] = True
-    _set_turn_status("brain", "Preparing request")
+    _set_turn_status("brain", "Preparing request", s)
     turn_gen = s.get("_turn_gen", 0)  # Capture generation to detect save-switch during processing
-    config=get_engine_config();username=s["current_user"]
+    config=get_engine_config(s);username=s["current_user"]
     # On retry, the message is already in s["messages"] and rendered — don't duplicate
     if not is_retry:
         _is_corr_input = text.startswith("##")
@@ -2227,7 +2265,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
                 ui.markdown(f"{_sr_prefix}{display_text}")
     try:
         if turn_status_content is not None:
-            turn_status_content.content = _turn_status_html()
+            turn_status_content.content = _turn_status_html(s)
         if turn_status_row is not None:
             turn_status_row.classes(remove="hidden")
         with chat_container:
@@ -2255,7 +2293,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
             if not game.last_turn_snapshot:
                 try: spinner.delete()
                 except Exception: pass
-                _set_turn_status()
+                _set_turn_status(session=s)
                 if turn_status_row is not None:
                     turn_status_row.classes(add="hidden")
                 ui.notify(t("correction.no_snapshot", L()), type="warning", position="top")
@@ -2275,7 +2313,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
             log(f"[Turn] Discarding stale response (gen {turn_gen} → {s.get('_turn_gen', 0)})")
             try: spinner.delete()
             except Exception: pass
-            _set_turn_status()
+            _set_turn_status(session=s)
             if turn_status_row is not None:
                 turn_status_row.classes(add="hidden")
             return
@@ -2355,12 +2393,12 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
         if scroll_target_id:
             await _scroll_to_element(scroll_target_id)
         # Save after rendering — player sees narration immediately, save doesn't block display
-        _set_turn_status("save", "Persisting the updated game state")
+        _set_turn_status("save", "Persisting the updated game state", s)
         if turn_status_content is not None:
-            turn_status_content.content = _turn_status_html()
+            turn_status_content.content = _turn_status_html(s)
         capture_turn_checkpoint(game, s["messages"])
         save_game(game,username,s["messages"],s.get("active_save","autosave"))
-        _set_turn_status()
+        _set_turn_status(session=s)
         if turn_status_row is not None:
             turn_status_row.classes(add="hidden")
         # Fire Director in background — doesn't block narration display
@@ -2395,14 +2433,14 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
     except openai.AuthenticationError:
         try: spinner.delete()
         except Exception: pass
-        _set_turn_status()
+        _set_turn_status(session=s)
         if turn_status_row is not None:
             turn_status_row.classes(add="hidden")
         ui.notify(t("game.invalid_api_key", L()), type="negative")
     except Exception as e:
         try: spinner.delete()
         except Exception: pass
-        _set_turn_status()
+        _set_turn_status(session=s)
         if turn_status_row is not None:
             turn_status_row.classes(add="hidden")
         # Show inline retry button in chat instead of just a toast notification
@@ -2434,7 +2472,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
         if s.get("_turn_gen", 0) == turn_gen:
             s["processing"] = False
         if not s.get("processing", False):
-            _set_turn_status()
+            _set_turn_status(session=s)
             if turn_status_row is not None:
                 turn_status_row.classes(add="hidden")
 
