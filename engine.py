@@ -61,7 +61,7 @@ except ImportError:
 # CONFIGURATION
 # ===============================================================
 
-VERSION = "0.9.45"
+VERSION = "0.9.46"
 
 BRAIN_MODEL = "claude-haiku-4-5-20251001"
 NARRATOR_MODEL = "claude-sonnet-4-5-20250929"
@@ -3551,6 +3551,7 @@ def call_narrator_metadata(client: anthropic.Anthropic, narration: str,
     lang = get_narration_lang(config or EngineConfig())
 
     # Build compact NPC reference list for the extractor
+    # Include location + short description to help disambiguate similar names
     npc_refs = []
     for n in game.npcs:
         if n.get("status") not in ("active", "background", "deceased"):
@@ -3560,6 +3561,14 @@ def call_narrator_metadata(client: anthropic.Anthropic, narration: str,
             entry += f' (aka {", ".join(n["aliases"])})'
         if n.get("status") == "deceased":
             entry += ' [DECEASED]'
+        # Location hint for spatial disambiguation
+        npc_loc = n.get("last_location", "")
+        if npc_loc:
+            entry += f' [at:{npc_loc}]'
+        # Short description for identity disambiguation
+        desc = n.get("description", "")
+        if desc:
+            entry += f' — {desc[:60]}'
         npc_refs.append(entry)
 
     system = f"""You are a metadata extractor for an RPG engine. Analyze the narration and extract game state changes.
@@ -3578,6 +3587,7 @@ new_npcs: ONLY for characters who are PHYSICALLY PRESENT in the scene AND active
 If a NAMED person is mentioned in dialog but a DIFFERENT unnamed person is physically present, create the NPC for the PHYSICAL person with their own appropriate name/description — do NOT assign the mentioned person's name to the physical person's description.
 description must be a PHYSICAL/ROLE description (appearance, occupation, species), NOT what they did in this scene.
 memory_updates: for EACH NPC who participated in or witnessed this scene. Use their npc_id from the known list. NEVER create memory_updates for the player character. NEVER create memory_updates for NPCs marked [DECEASED] or for absent characters — only for NPCs physically present and alive in the scene.
+NPC DISAMBIGUATION: The known_npcs list shows each NPC's last known location [at:...] and a short description. When the narration uses a name or descriptor that could match multiple NPCs, prefer the NPC whose location matches <current_location> or who is described as being physically present. An NPC [at:FarAwayPlace] is unlikely to appear at <current_location> without the narration explicitly describing their arrival.
 about_npc (in memory_updates): If the memory is primarily ABOUT ANOTHER NPC (not the player), set about_npc to that other NPC's npc_id. Examples: NPC A is told something about NPC B → memory on A with about_npc=B's id. NPC A witnesses NPC B doing something → memory on A with about_npc=B's id. If the memory is about the player or a general event, set about_npc to null.
 IMPORTANT: If the player directly tells an NPC something about another NPC (gossip, warning, lie, compliment, romantic suggestion), this MUST be captured as its own memory_update with about_npc set — even if other events also happened to that NPC in the same scene. An NPC can have multiple memories per scene if distinctly different events occurred.
 deceased_npcs: list NPCs (by npc_id) whose death is DEPICTED BY THE NARRATOR as it happens — they collapse, are killed, stop breathing, etc. in the narrative prose.
@@ -3781,6 +3791,11 @@ Think like a showrunner, not a writer:
 - How do NPCs feel about EACH OTHER, not just the player? NPC-to-NPC dynamics
   (alliances, rivalries, attraction, distrust) create a living world.
 
+IMPORTANT: NPCs may have aliases (listed as "aka" in the NPC list or "aliases" in
+reflect tags). All aliases refer to the SAME character — treat them as one person.
+Memories may use any of the NPC's names interchangeably. When writing reflections,
+use the NPC's current primary name consistently.
+
 For NPC reflections: Synthesize their accumulated memories into a higher-level
 insight about how they view the player character. Write in the story language.
 Focus on relationship evolution, not event recaps. If an NPC's memories show
@@ -3871,8 +3886,14 @@ def build_director_prompt(game: GameState, latest_narration: str,
         needs_profile = ""
         if not n.get("agenda", "").strip() or not n.get("instinct", "").strip():
             needs_profile = ' needs_profile="true"'
+        # Include aliases so Director knows all names for this NPC
+        alias_attr = ""
+        if n.get("aliases"):
+            escaped_aliases = ", ".join(n["aliases"]).replace('"', '&quot;')
+            alias_attr = f' aliases="{escaped_aliases}"'
         reflection_blocks.append(
-            f'<reflect npc_id="{n.get("id","")}" name="{n.get("name","")}" '
+            f'<reflect npc_id="{n.get("id","")}" name="{n.get("name","")}"'
+            f'{alias_attr} '
             f'disposition="{n.get("disposition","")}" bond="{n.get("bond",0)}" '
             f'description="{npc_desc}"{prev_ref_text}{prev_tone_text}{needs_profile}>'
             f'{mem_text}</reflect>'
@@ -3907,11 +3928,14 @@ def build_director_prompt(game: GameState, latest_narration: str,
                 f'{transition_trigger}</transition_trigger>'
             )
 
-    # Active NPC overview (include descriptions so Director stays consistent with narrative)
+    # Active NPC overview (include descriptions and aliases so Director stays consistent)
+    def _director_npc_line(n):
+        aka = f' aka {", ".join(n["aliases"])}' if n.get("aliases") else ""
+        desc = f' | {n["description"][:80]}' if n.get("description") else ""
+        return (f'- {n["name"]}({n.get("id","")}){aka} {n["disposition"]} '
+                f'B{n.get("bond",0)} status={n.get("status","active")}{desc}')
     npc_overview = "\n".join(
-        f'- {n["name"]}({n.get("id","")}) {n["disposition"]} B{n.get("bond",0)} '
-        f'status={n.get("status","active")}'
-        f'{" | " + n["description"][:80] if n.get("description") else ""}'
+        _director_npc_line(n)
         for n in game.npcs
         if n.get("status") in ("active", "background")
     ) or "(none)"
@@ -3970,7 +3994,7 @@ def call_director(client: anthropic.Anthropic, game: GameState,
     try:
         response = _api_create_with_retry(
             client, max_retries=1,
-            model=DIRECTOR_MODEL, max_tokens=3500,
+            model=DIRECTOR_MODEL, max_tokens=4500,
             system=DIRECTOR_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
             output_config={"format": {"type": "json_schema", "schema": DIRECTOR_OUTPUT_SCHEMA}},
@@ -4919,13 +4943,32 @@ def load_game(username: str, name: str = "autosave") -> tuple[Optional[GameState
     # Clean up legacy 'last_seen' field (replaced by 'last_location' in v0.9.14+)
     for npc in game.npcs:
         npc.pop("last_seen", None)
-    # Diagnostic: warn about NPCs with empty memories (should have at least seed memory)
+    # Repair: generate seed memory for NPCs that have none (older saves, data loss)
     for npc in game.npcs:
         if (npc.get("status") in ("active", "background")
                 and not npc.get("memory")
                 and npc.get("introduced")):
-            log(f"[Load] WARNING: NPC '{npc.get('name', '?')}' ({npc.get('id', '?')}) "
-                f"has no memories — possible data loss", level="warning")
+            desc = npc.get("description", "")
+            seed_event = desc or f"{npc.get('name', 'Unknown')} appeared"
+            disp = npc.get("disposition", "neutral")
+            _disp_to_emotion = {
+                "hostile": "hostile", "distrustful": "suspicious",
+                "neutral": "neutral", "friendly": "curious", "loyal": "trusting",
+            }
+            seed_emotion = _disp_to_emotion.get(disp, "neutral")
+            seed_imp, seed_debug = score_importance(seed_emotion, seed_event, debug=True)
+            seed_imp = max(seed_imp, 3)
+            npc.setdefault("memory", [])
+            npc["memory"].append({
+                "scene": 0,
+                "event": seed_event,
+                "emotional_weight": seed_emotion,
+                "importance": seed_imp,
+                "type": "observation",
+                "_score_debug": f"load-repair seed | {seed_debug}",
+            })
+            log(f"[Load] Repaired empty memory for '{npc.get('name', '?')}' "
+                f"({npc.get('id', '?')}) — added seed from description")
     # Sanitize NPC names: strip parenthetical annotations from older saves
     for npc in game.npcs:
         _apply_name_sanitization(npc)

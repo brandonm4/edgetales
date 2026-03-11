@@ -5,6 +5,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.46]
+
+### Fixed
+- **Director split-personality reflections — aliases now visible in Director prompts:** The Director prompt (`build_director_prompt()`) showed NPC names but not aliases. When an NPC had been renamed (e.g. "Der gepanzerte Soldat" → aliases "Grevik", "Der gepanzerte Verhandler"), memories referencing the alias names appeared as if they were about a different person. The Director wrote reflections treating one NPC as two — e.g. *"Der gepanzerte Soldat scheitert gegen Greviks Verzweiflung"*. These contradictory reflections then permanently polluted the memory pool. **Three-part fix:** (1) NPC overview list now includes `aka ...` for NPCs with aliases. (2) `<reflect>` tags now carry an `aliases="..."` attribute. (3) `DIRECTOR_SYSTEM` prompt contains explicit instruction: aliases = same character, use primary name consistently
+- **Metadata Extractor NPC disambiguation — location + description in reference list:** The Extractor's `<known_npcs>` reference list only showed `npc_id=Name`. When multiple NPCs had similar names or descriptions (e.g. "Der Einäugige" the barkeeper vs a soldier described as "Einäugiger Soldat"), the Extractor could misattribute memories to the wrong NPC. Now the reference list includes `[at:Location]` and a short description (`— desc[:60]`) per NPC, plus a new `NPC DISAMBIGUATION` instruction that tells the Extractor to prefer NPCs whose location matches `<current_location>`. Complements the existing code-level spatial guard in `_description_match_existing_npc()`
+- **Empty-memory NPC repair on load (backward compat):** `load_game()` previously only logged a warning for active/background NPCs with no memories. Now generates a seed memory from the NPC's description + disposition (same logic as `_process_new_npcs()` seed memory, importance ≥ 3). Fixes NPCs from older saves (pre-seed-memory) or data loss scenarios. Log entry: `[Load] Repaired empty memory for '...'`
+
+### Changed
+- **Director `max_tokens` raised from 3500 → 4500:** Log analysis of a 20-scene German session showed systematic truncation when the Director generated 3+ simultaneous NPC reflections with description updates. The `_is_complete_description()` guard correctly rejected all truncated descriptions, but the high rejection rate (39 truncations in 22 calls in an earlier session at 2800, still frequent at 3500) indicated insufficient budget. 4500 provides ~29% headroom over the previous value. Haiku cost impact negligible (~$0.0001/call increase)
+
+---
+
 ## [0.9.45]
 
 ### Fixed
