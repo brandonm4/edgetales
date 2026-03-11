@@ -112,6 +112,7 @@ from datetime import datetime
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import openai
 from nicegui import app, ui, Client
@@ -154,6 +155,7 @@ from voice import VoiceConfig, VoiceEngine
 # Global singleton
 # ---------------------------------------------------------------------------
 _voice_engine: Optional[VoiceEngine] = None
+_embedded_proxy_server = None
 
 
 def get_voice_engine() -> VoiceEngine:
@@ -198,6 +200,11 @@ def _load_server_config() -> dict:
         "api_key": "",
         "provider_mode": "openai",
         "provider_base_url": "",
+        "embedded_proxy_enable": True,
+        "embedded_proxy_backend": "chatmock",
+        "embedded_proxy_upstream_base_url": "http://127.0.0.1:8000/v1",
+        "embedded_proxy_upstream_api_key": "",
+        "embedded_proxy_client_api_key": "",
         "invite_code": "",
         "enable_https": False,
         "ssl_certfile": "",
@@ -216,6 +223,10 @@ def _load_server_config() -> dict:
     cfg["api_key"] = _first_env("EDGETALES_PROVIDER_API_KEY", "EDGETALES_API_KEY", "OPENAI_API_KEY") or cfg["api_key"]
     cfg["provider_mode"] = _first_env("EDGETALES_PROVIDER_MODE") or cfg["provider_mode"]
     cfg["provider_base_url"] = _first_env("EDGETALES_PROVIDER_BASE_URL", "OPENAI_BASE_URL") or cfg["provider_base_url"]
+    cfg["embedded_proxy_backend"] = _first_env("EDGETALES_PROXY_BACKEND") or cfg["embedded_proxy_backend"]
+    cfg["embedded_proxy_upstream_base_url"] = _first_env("EDGETALES_PROXY_UPSTREAM_BASE_URL") or cfg["embedded_proxy_upstream_base_url"]
+    cfg["embedded_proxy_upstream_api_key"] = _first_env("EDGETALES_PROXY_UPSTREAM_API_KEY") or cfg["embedded_proxy_upstream_api_key"]
+    cfg["embedded_proxy_client_api_key"] = _first_env("EDGETALES_PROXY_CLIENT_API_KEY") or cfg["embedded_proxy_client_api_key"]
     cfg["invite_code"] = _first_env("INVITE_CODE") or cfg["invite_code"]
     cfg["ssl_certfile"] = _first_env("SSL_CERTFILE") or cfg["ssl_certfile"]
     cfg["ssl_keyfile"] = _first_env("SSL_KEYFILE") or cfg["ssl_keyfile"]
@@ -225,6 +236,10 @@ def _load_server_config() -> dict:
     enable_https_val = _first_env("ENABLE_HTTPS")
     if enable_https_val:
         cfg["enable_https"] = enable_https_val.lower() in ("1", "true", "yes")
+
+    embedded_proxy_enable_val = _first_env("EDGETALES_EMBEDDED_PROXY_ENABLE")
+    if embedded_proxy_enable_val:
+        cfg["embedded_proxy_enable"] = embedded_proxy_enable_val.lower() in ("1", "true", "yes")
 
     port_val = _first_env("PORT")
     if port_val:
@@ -239,6 +254,11 @@ INVITE_CODE: str = _server_cfg["invite_code"]
 SERVER_API_KEY: str = _server_cfg["api_key"]
 PROVIDER_MODE: str = _server_cfg["provider_mode"]
 PROVIDER_BASE_URL: str = _server_cfg["provider_base_url"]
+EMBEDDED_PROXY_ENABLE: bool = _server_cfg["embedded_proxy_enable"]
+EMBEDDED_PROXY_BACKEND: str = _server_cfg["embedded_proxy_backend"]
+EMBEDDED_PROXY_UPSTREAM_BASE_URL: str = _server_cfg["embedded_proxy_upstream_base_url"]
+EMBEDDED_PROXY_UPSTREAM_API_KEY: str = _server_cfg["embedded_proxy_upstream_api_key"]
+EMBEDDED_PROXY_CLIENT_API_KEY: str = _server_cfg["embedded_proxy_client_api_key"]
 ENABLE_HTTPS: bool = _server_cfg["enable_https"]
 SSL_CERTFILE: str = _server_cfg["ssl_certfile"]
 SSL_KEYFILE: str = _server_cfg["ssl_keyfile"]
@@ -254,6 +274,45 @@ log(f"[Config] port={SERVER_PORT}, https={ENABLE_HTTPS}, "
     f"invite={'set' if INVITE_CODE else 'off'}, "
     f"default_ui_lang={DEFAULT_UI_LANG or DEFAULT_LANG}, "
     f"api_key={'ENV' if any(os.environ.get(name) for name in ('EDGETALES_PROVIDER_API_KEY', 'EDGETALES_API_KEY', 'OPENAI_API_KEY')) else ('config.json' if SERVER_API_KEY else 'not set')}")
+
+
+def _maybe_start_embedded_proxy() -> None:
+    global _embedded_proxy_server
+    if _embedded_proxy_server is not None:
+        return
+    if PROVIDER_MODE != "proxy" or not EMBEDDED_PROXY_ENABLE or not PROVIDER_BASE_URL:
+        return
+
+    parsed = urlparse(PROVIDER_BASE_URL)
+    host = parsed.hostname
+    port = parsed.port
+    path = parsed.path.rstrip("/")
+    if not host or not port or path != "/v1":
+        log(f"[Proxy] Embedded proxy skipped: unsupported provider_base_url={PROVIDER_BASE_URL}", level="warning")
+        return
+
+    try:
+        from proxy_server import ProxyConfig, build_backend, set_logger, start_server
+
+        set_logger(log)
+        _embedded_proxy_server = start_server(
+            host,
+            port,
+            build_backend(ProxyConfig(
+                backend=EMBEDDED_PROXY_BACKEND,
+                client_api_key=EMBEDDED_PROXY_CLIENT_API_KEY,
+                upstream_api_key=EMBEDDED_PROXY_UPSTREAM_API_KEY,
+                upstream_base_url=EMBEDDED_PROXY_UPSTREAM_BASE_URL,
+            )),
+        )
+        log(
+            f"[Proxy] Embedded proxy started on http://{host}:{port} "
+            f"backend={EMBEDDED_PROXY_BACKEND} upstream={EMBEDDED_PROXY_UPSTREAM_BASE_URL}"
+        )
+    except OSError as exc:
+        log(f"[Proxy] Embedded proxy not started on {host}:{port}: {exc}", level="warning")
+    except Exception as exc:
+        log(f"[Proxy] Embedded proxy startup failed: {exc}", level="warning")
 
 # Flush deferred dependency check results into log file
 import builtins
@@ -2997,6 +3056,9 @@ if _ssl_kwargs:
     log(f"[SSL] HTTPS enabled on port {SERVER_PORT}")
 else:
     _proto = "http"
+
+setup_file_logging()
+_maybe_start_embedded_proxy()
 
 ui.run(
     title="EdgeTales",

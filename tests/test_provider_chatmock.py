@@ -97,7 +97,8 @@ class ChatMockProviderTests(unittest.TestCase):
         self.assertEqual(json.loads(response.output_text)["ok"], True)
         req = _CaptureHandler.requests[0]
         self.assertEqual(req["payload"]["model"], "gpt-5.1-codex-mini")
-        self.assertIn("Return only valid JSON", req["payload"]["messages"][0]["content"])
+        self.assertEqual(req["payload"]["tools"][0]["function"]["name"], "submit_result")
+        self.assertEqual(req["payload"]["tool_choice"], "auto")
 
 
 if __name__ == "__main__":

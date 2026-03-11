@@ -121,7 +121,7 @@ class ProxyIntegrationTests(unittest.TestCase):
         _ChatMockHandler.requests = []
         _ChatMockHandler.responses = [
             {"choices": [{"message": {"content": "not json"}}]},
-            {"choices": [{"message": {"content": "{\"ok\": true, \"items\": [1]}"}}]},
+            {"choices": [{"message": {"content": "<think>done</think>", "tool_calls": [{"function": {"arguments": "{\"ok\": true, \"items\": [1]}"}, "id": "call_1", "type": "function"}]}}]},
         ]
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), _ChatMockHandler)
         thread = threading.Thread(target=upstream.serve_forever, daemon=True)
@@ -156,6 +156,8 @@ class ProxyIntegrationTests(unittest.TestCase):
             self.assertEqual(json.loads(response["output_text"])["ok"], True)
             self.assertEqual(len(_ChatMockHandler.requests), 2)
             self.assertEqual(_ChatMockHandler.requests[0]["model"], "gpt-5.1-codex-mini")
+            self.assertEqual(_ChatMockHandler.requests[0]["tools"][0]["function"]["name"], "submit_result")
+            self.assertEqual(_ChatMockHandler.requests[1]["tool_choice"], "auto")
             self.assertIn("Previous attempt failed validation", _ChatMockHandler.requests[1]["messages"][0]["content"])
         finally:
             upstream.shutdown()

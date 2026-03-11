@@ -83,6 +83,7 @@ class ModelGateway:
         return messages
 
     def _extract_json_text(self, text: str) -> str:
+        text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text, flags=re.IGNORECASE).strip()
         fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
         if fenced:
             return fenced.group(1).strip()
@@ -100,10 +101,21 @@ class ModelGateway:
         fmt = text_cfg.get("format") if isinstance(text_cfg, dict) else None
         schema = fmt.get("schema") if isinstance(fmt, dict) and fmt.get("type") == "json_schema" else None
         url = self.config.base_url.rstrip("/") + "/chat/completions"
-        payload = json.dumps({
+        upstream_payload = {
             "model": self._chatmock_model_name(kwargs.get("model", "")),
             "messages": self._chatmock_messages(kwargs.get("instructions", ""), kwargs.get("input", []), schema),
-        }).encode("utf-8")
+        }
+        if schema:
+            upstream_payload["tools"] = [{
+                "type": "function",
+                "function": {
+                    "name": "submit_result",
+                    "description": "Submit the JSON result",
+                    "parameters": schema,
+                },
+            }]
+            upstream_payload["tool_choice"] = "auto"
+        payload = json.dumps(upstream_payload).encode("utf-8")
         req = request.Request(
             url,
             data=payload,
@@ -118,6 +130,10 @@ class ModelGateway:
         message = (((data.get("choices") or [{}])[0]).get("message") or {})
         content = message.get("content") or ""
         if schema:
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                fn = (tool_calls[0].get("function") or {}) if isinstance(tool_calls[0], dict) else {}
+                content = fn.get("arguments") or content
             content = self._extract_json_text(content)
         return SimpleNamespace(
             output_text=content,

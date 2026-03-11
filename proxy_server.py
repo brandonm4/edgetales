@@ -23,12 +23,28 @@ import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+from urllib import error as urlerror
 from urllib import request
 
 try:
     import openai
 except ImportError:
     openai = None
+
+
+_LOGGER = None
+
+
+def set_logger(logger_func) -> None:
+    global _LOGGER
+    _LOGGER = logger_func
+
+
+def _log(msg: str, level: str = "info") -> None:
+    if _LOGGER is not None:
+        _LOGGER(f"[Proxy] {msg}", level=level)
+        return
+    print(f"[Proxy] {msg}")
 
 
 def _extract_input_text(payload: dict) -> str:
@@ -86,6 +102,7 @@ def _extract_schema(payload: dict) -> Optional[dict]:
 
 
 def _extract_json_text(text: str) -> str:
+    text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text, flags=re.IGNORECASE).strip()
     fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
     if fenced:
         return fenced.group(1).strip()
@@ -196,6 +213,32 @@ def _chatmock_messages(payload: dict, schema: Optional[dict], prior_error: str =
     return messages
 
 
+def _chatmock_tools(schema: Optional[dict]):
+    if not schema:
+        return None
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_result",
+                "description": "Submit the JSON result",
+                "parameters": schema,
+            },
+        }
+    ]
+
+
+def _extract_chatmock_schema_result(data: dict) -> str:
+    message = (((data.get("choices") or [{}])[0]).get("message") or {})
+    tool_calls = message.get("tool_calls") or []
+    if tool_calls:
+        fn = (tool_calls[0].get("function") or {}) if isinstance(tool_calls[0], dict) else {}
+        arguments = fn.get("arguments")
+        if isinstance(arguments, str) and arguments.strip():
+            return arguments.strip()
+    return _extract_json_text(message.get("content") or "")
+
+
 def _build_response_payload(output_text: str, model: str, *, incomplete_reason: Optional[str] = None) -> dict:
     payload = {
         "id": f"resp_{uuid.uuid4().hex}",
@@ -236,7 +279,7 @@ class ProxyConfig:
 class ProxyBackend:
     client_api_key: str = ""
 
-    def create_response(self, payload: dict) -> dict:
+    def create_response(self, payload: dict, request_id: str = "") -> dict:
         raise NotImplementedError
 
 
@@ -244,7 +287,7 @@ class MockBackend(ProxyBackend):
     def __init__(self, client_api_key: str = ""):
         self.client_api_key = client_api_key
 
-    def create_response(self, payload: dict) -> dict:
+    def create_response(self, payload: dict, request_id: str = "") -> dict:
         model = payload.get("model", "mock-model")
         text_cfg = payload.get("text") or {}
         fmt = text_cfg.get("format") if isinstance(text_cfg, dict) else None
@@ -267,7 +310,8 @@ class OpenAIBackend(ProxyBackend):
             raise RuntimeError("openai package is required for the upstream openai backend")
         self._client = openai.OpenAI(**kwargs)
 
-    def create_response(self, payload: dict) -> dict:
+    def create_response(self, payload: dict, request_id: str = "") -> dict:
+        _log(f"{request_id} upstream=openai create_response model={payload.get('model')!r}")
         response = self._client.responses.create(**payload)
         if hasattr(response, "model_dump"):
             return response.model_dump(mode="json")
@@ -290,19 +334,32 @@ class ChatMockBackend(ProxyBackend):
             },
             method="POST",
         )
-        with request.urlopen(req) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with request.urlopen(req) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urlerror.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"ChatMock HTTP {exc.code}: {body[:1200]}")
 
-    def create_response(self, payload: dict) -> dict:
+    def create_response(self, payload: dict, request_id: str = "") -> dict:
         requested_model = payload.get("model", "gpt-5")
         schema = _extract_schema(payload)
         last_error = ""
         last_content = ""
         for attempt in range(self.max_retries + 1):
+            _log(
+                f"{request_id} upstream=chatmock attempt={attempt + 1}/{self.max_retries + 1} "
+                f"model={requested_model!r} schema={'yes' if schema else 'no'}",
+                level="info",
+            )
             upstream_payload = {
                 "model": _chatmock_model_name(requested_model),
                 "messages": _chatmock_messages(payload, schema, last_error, last_content),
             }
+            tools = _chatmock_tools(schema)
+            if tools:
+                upstream_payload["tools"] = tools
+                upstream_payload["tool_choice"] = "auto"
             data = self._post_chat_completion(upstream_payload)
             message = (((data.get("choices") or [{}])[0]).get("message") or {})
             content = message.get("content") or ""
@@ -310,12 +367,18 @@ class ChatMockBackend(ProxyBackend):
                 return _build_response_payload(content, requested_model)
             last_content = content
             try:
-                json_text = _extract_json_text(content)
+                json_text = _extract_chatmock_schema_result(data)
                 parsed = json.loads(json_text)
                 _validate_json_schema(parsed, schema)
+                _log(f"{request_id} upstream=chatmock schema_validation=ok attempt={attempt + 1}")
                 return _build_response_payload(json.dumps(parsed, ensure_ascii=False), requested_model)
             except Exception as exc:
                 last_error = str(exc)
+                _log(
+                    f"{request_id} upstream=chatmock schema_validation=failed "
+                    f"attempt={attempt + 1} error={last_error} content={content[:300]!r}",
+                    level="warning",
+                )
                 if attempt == self.max_retries:
                     raise RuntimeError(f"ChatMock schema validation failed after {self.max_retries + 1} attempts: {last_error}")
         raise RuntimeError("ChatMock schema validation failed")
@@ -357,22 +420,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._write_json(404, {"error": "not_found"})
             return
 
+        request_id = f"req_{uuid.uuid4().hex[:8]}"
         try:
             if self.expected_api_key:
                 auth_header = self.headers.get("Authorization", "")
                 expected_header = f"Bearer {self.expected_api_key}"
                 if auth_header != expected_header:
+                    _log(f"{request_id} auth=failed remote={self.client_address[0]} path={self.path}", level="warning")
                     self._write_json(401, {"error": {"message": "Invalid proxy API key", "type": "authentication_error"}})
                     return
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
             payload = json.loads(raw.decode("utf-8"))
-            response = self.backend.create_response(payload)
+            _log(
+                f"{request_id} inbound path={self.path} backend={type(self.backend).__name__} "
+                f"model={payload.get('model')!r} schema={'yes' if _extract_schema(payload) else 'no'} "
+                f"input_chars={len(_extract_input_text(payload))}",
+            )
+            response = self.backend.create_response(payload, request_id=request_id)
+            _log(f"{request_id} completed status=200")
             self._write_json(200, response)
         except Exception as exc:
             if openai is not None and isinstance(exc, openai.AuthenticationError):
+                _log(f"{request_id} upstream_auth_error={exc}", level="warning")
                 self._write_json(401, {"error": {"message": str(exc), "type": "authentication_error"}})
                 return
+            _log(f"{request_id} failed error={type(exc).__name__}: {exc}", level="warning")
             self._write_json(500, {"error": {"message": str(exc), "type": "proxy_error"}})
 
 

@@ -326,6 +326,9 @@ EdgeTales is configured via a single `config.json` file in the project root.
   "api_key": "",
   "provider_mode": "proxy",
   "provider_base_url": "http://127.0.0.1:4000/v1",
+  "embedded_proxy_enable": true,
+  "embedded_proxy_backend": "chatmock",
+  "embedded_proxy_upstream_base_url": "http://127.0.0.1:8000/v1",
   "invite_code": "",
   "enable_https": false,
   "storage_secret": "",
@@ -341,6 +344,9 @@ EdgeTales is configured via a single `config.json` file in the project root.
 | `api_key` | Usually | `""` | Bearer token sent to the configured provider or proxy. Leave empty for local ChatMock mode. |
 | `provider_mode` | No | `"openai"` | `"openai"` for direct OpenAI-compatible usage, `"proxy"` for the bundled responses proxy, `"chatmock"` for direct side-by-side ChatMock access |
 | `provider_base_url` | No | `""` | Base URL for the configured provider, for example `http://127.0.0.1:4000/v1` for the bundled proxy |
+| `embedded_proxy_enable` | No | `true` | Auto-start the bundled proxy inside `app.py` when `provider_mode` is `"proxy"` |
+| `embedded_proxy_backend` | No | `"chatmock"` | Upstream backend used by the embedded proxy |
+| `embedded_proxy_upstream_base_url` | No | `"http://127.0.0.1:8000/v1"` | Base URL for the upstream service the embedded proxy talks to |
 | `invite_code` | No | `""` | If set, users must enter this code before accessing the app (see below) |
 | `enable_https` | No | `false` | Set to `true` to auto-generate a self-signed TLS certificate |
 | `ssl_certfile` | No | `""` | Path to a custom SSL certificate (PEM). Overrides auto-generation |
@@ -376,13 +382,13 @@ Run ChatMock locally:
 python chatmock.py serve
 ```
 
-Run the EdgeTales proxy against ChatMock:
+Then start EdgeTales normally:
 
 ```bash
-python proxy_server.py --backend chatmock --upstream-base-url http://127.0.0.1:8000/v1
+python app.py
 ```
 
-EdgeTales then talks to the proxy, and the proxy validates JSON-shaped responses and retries ChatMock if the output does not satisfy the requested schema.
+`app.py` now auto-starts the bundled proxy in-process, and that proxy validates JSON-shaped responses and retries ChatMock if the output does not satisfy the requested schema.
 
 ### Environment Variable Overrides
 
