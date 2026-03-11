@@ -419,6 +419,8 @@ def init_session() -> None:
     s.setdefault("global_config_loaded", False)
     s.setdefault("processing", False)  # Double-send guard
     s.setdefault("_turn_gen", 0)       # Incremented on save load/new game — stale response guard
+    s.setdefault("turn_status_phase", "")
+    s.setdefault("turn_status_detail", "")
     # API key: prefer server-side env var, fall back to config file
     if not s["global_config_loaded"]:
         if SERVER_API_KEY:
@@ -427,6 +429,54 @@ def init_session() -> None:
             gcfg = load_global_config()
             s["api_key"] = gcfg.get("api_key", "")
         s["global_config_loaded"] = True
+
+
+_TURN_STATUS_PHASES = [
+    ("brain", "Analyze input"),
+    ("resolve", "Resolve move"),
+    ("narrate", "Generate response"),
+    ("metadata", "Update world"),
+    ("save", "Save game"),
+]
+
+
+def _set_turn_status(phase: str = "", detail: str = "") -> None:
+    s = S()
+    s["turn_status_phase"] = phase
+    s["turn_status_detail"] = detail
+
+
+def _turn_status_html() -> str:
+    s = S()
+    phase = s.get("turn_status_phase", "")
+    detail = s.get("turn_status_detail", "")
+    phase_index = {key: idx for idx, (key, _) in enumerate(_TURN_STATUS_PHASES)}
+    current_idx = phase_index.get(phase, -1)
+    pills = []
+    for idx, (key, label) in enumerate(_TURN_STATUS_PHASES):
+        state = "pending"
+        icon = "○"
+        style = "opacity:0.45; border-color: rgba(255,255,255,0.08);"
+        if current_idx > idx:
+            state = "done"
+            icon = "✓"
+            style = "opacity:0.9; border-color: rgba(74,222,128,0.35); color: #bbf7d0;"
+        elif current_idx == idx:
+            state = "active"
+            icon = "●"
+            style = "opacity:1; border-color: rgba(96,165,250,0.45); color: #dbeafe; background: rgba(96,165,250,0.08);"
+        pills.append(
+            f'<span class="turn-phase {state}" style="display:inline-flex; align-items:center; gap:0.35rem; '
+            f'padding:0.2rem 0.55rem; border:1px solid; border-radius:999px; font-size:0.78rem; '
+            f'white-space:nowrap; {style}">{icon} {label}</span>'
+        )
+    detail_html = f'<div class="turn-status-detail">{detail}</div>' if detail else ""
+    return (
+        f'<div class="turn-status-phases" style="display:flex; flex-wrap:wrap; gap:0.4rem;">{"".join(pills)}</div>'
+        f'<div class="turn-status-detail" style="margin-top:0.4rem; font-size:0.82rem; color: var(--text-secondary);">{detail}</div>'
+        if detail
+        else f'<div class="turn-status-phases" style="display:flex; flex-wrap:wrap; gap:0.4rem;">{"".join(pills)}</div>'
+    )
 
 
 def get_engine_config() -> EngineConfig:
@@ -516,21 +566,25 @@ def build_roll_data(roll: RollResult, consequences=None, clock_events=None, brai
 
 
 # Scroll helpers — documentElement is the scroll container
-async def _scroll_chat_bottom(delay_ms: int = 0) -> None:
+async def _scroll_chat_bottom(delay_ms: int = 0, client_obj: Optional[Client] = None) -> None:
     """Scroll to bottom of page (instant by default for DOM forcing)."""
     try:
-        await ui.run_javascript(f'''
+        runner = client_obj.run_javascript if client_obj is not None else ui.run_javascript
+        await runner(f'''
             setTimeout(() => {{
                 document.documentElement.scrollTo({{top: document.documentElement.scrollHeight}});
             }}, {delay_ms or 10});
         ''', timeout=3.0)
     except TimeoutError:
         pass
+    except RuntimeError as e:
+        log(f"[UI] Skipping scroll after DOM teardown: {e}", level="warning")
 
-async def _scroll_to_element(element_id: str) -> None:
+async def _scroll_to_element(element_id: str, client_obj: Optional[Client] = None) -> None:
     """Scroll smoothly so element is near top of viewport."""
     try:
-        await ui.run_javascript(f'''
+        runner = client_obj.run_javascript if client_obj is not None else ui.run_javascript
+        await runner(f'''
             setTimeout(() => {{
                 const el = document.getElementById("{element_id}");
                 if (el) el.scrollIntoView({{behavior: "smooth", block: "start"}});
@@ -538,6 +592,8 @@ async def _scroll_to_element(element_id: str) -> None:
         ''', timeout=3.0)
     except TimeoutError:
         pass
+    except RuntimeError as e:
+        log(f"[UI] Skipping element scroll after DOM teardown: {e}", level="warning")
 
 
 def render_audio_player(audio_bytes: bytes, fmt: str = "audio/mp3", autoplay: bool = False) -> None:
@@ -1945,7 +2001,8 @@ def _render_confirm():
 # ===============================================================
 
 async def process_player_input(text: str, chat_container, sidebar_container=None,
-                               sidebar_refresh=None, is_retry: bool = False) -> None:
+                               sidebar_refresh=None, is_retry: bool = False,
+                               turn_status_row=None, turn_status_content=None) -> None:
     s=S();game=s.get("game")
     if not game or not text.strip(): return
     # Double-send guard: prevent concurrent processing
@@ -1953,6 +2010,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
         ui.notify(t("game.still_processing", L()), type="warning", position="top")
         return
     s["processing"] = True
+    _set_turn_status("brain", "Preparing request")
     turn_gen = s.get("_turn_gen", 0)  # Capture generation to detect save-switch during processing
     config=get_engine_config();username=s["current_user"]
     # On retry, the message is already in s["messages"] and rendered — don't duplicate
@@ -1972,6 +2030,10 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
                 _sr_prefix = f'<span class="sr-only">{t("aria.player_says", L())}</span>' if s.get("sr_chat", True) else ""
                 ui.markdown(f"{_sr_prefix}{display_text}")
     try:
+        if turn_status_content is not None:
+            turn_status_content.content = _turn_status_html()
+        if turn_status_row is not None:
+            turn_status_row.classes(remove="hidden")
         with chat_container:
             spinner=ui.spinner("dots", size="lg")
             spinner.props('role="status" aria-label="%s"' % t("aria.loading", L()))
@@ -1983,28 +2045,43 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
         except TimeoutError:
             pass
         client=get_model_gateway(s["api_key"])
+        def _progress(phase: str):
+            detail_map = {
+                "brain": "Reading your input and current scene state",
+                "resolve": "Choosing the move and resolving conditions",
+                "narrate": "Writing the scene response",
+                "metadata": "Updating NPCs, memories, and scene state",
+            }
+            s["turn_status_phase"] = phase
+            s["turn_status_detail"] = detail_map.get(phase, "")
         # ## prefix → correction flow; otherwise normal turn
         if text.startswith("##"):
             if not game.last_turn_snapshot:
                 try: spinner.delete()
                 except Exception: pass
+                _set_turn_status()
+                if turn_status_row is not None:
+                    turn_status_row.classes(add="hidden")
                 ui.notify(t("correction.no_snapshot", L()), type="warning", position="top")
                 s["processing"] = False
                 return
             correction_text = text[2:].strip()
             game,narration,director_ctx=await asyncio.to_thread(
-                process_correction,client,game,correction_text,config)
+                process_correction,client,game,correction_text,config,_progress)
             roll,burn_info=None,None
             _is_correction=True
         else:
             game,narration,roll,burn_info,director_ctx=await asyncio.to_thread(
-                process_turn,client,game,text,config)
+                process_turn,client,game,text,config,_progress)
             _is_correction=False
         # Staleness check: if user loaded a different save during processing, discard result
         if s.get("_turn_gen", 0) != turn_gen:
             log(f"[Turn] Discarding stale response (gen {turn_gen} → {s.get('_turn_gen', 0)})")
             try: spinner.delete()
             except Exception: pass
+            _set_turn_status()
+            if turn_status_row is not None:
+                turn_status_row.classes(add="hidden")
             return
         s["game"]=game
         spinner.delete()
@@ -2082,7 +2159,13 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
         if scroll_target_id:
             await _scroll_to_element(scroll_target_id)
         # Save after rendering — player sees narration immediately, save doesn't block display
+        _set_turn_status("save", "Persisting the updated game state")
+        if turn_status_content is not None:
+            turn_status_content.content = _turn_status_html()
         save_game(game,username,s["messages"],s.get("active_save","autosave"))
+        _set_turn_status()
+        if turn_status_row is not None:
+            turn_status_row.classes(add="hidden")
         # Fire Director in background — doesn't block narration display
         if director_ctx:
             _dc=director_ctx; _g=game; _u=username; _s=s; _gen=turn_gen
@@ -2115,14 +2198,22 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
     except openai.AuthenticationError:
         try: spinner.delete()
         except Exception: pass
+        _set_turn_status()
+        if turn_status_row is not None:
+            turn_status_row.classes(add="hidden")
         ui.notify(t("game.invalid_api_key", L()), type="negative")
     except Exception as e:
         try: spinner.delete()
         except Exception: pass
+        _set_turn_status()
+        if turn_status_row is not None:
+            turn_status_row.classes(add="hidden")
         # Show inline retry button in chat instead of just a toast notification
         _retry_text = text  # capture for closure
         _retry_cc = chat_container
         _retry_sr = sidebar_refresh
+        _retry_status_row = turn_status_row
+        _retry_status_content = turn_status_content
         with chat_container:
             retry_row = ui.row().classes("w-full items-center gap-2 py-1 px-3").style(
                 "background: rgba(255,80,80,0.1); border: 1px solid rgba(255,80,80,0.3); "
@@ -2132,10 +2223,11 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
             with retry_row:
                 err_short = str(e)[:120]
                 ui.label(f"{E['warn']} {err_short}").classes("text-xs text-red-300 flex-grow").style("word-break: break-word")
-                async def _do_retry(rr=retry_row, rt=_retry_text, rc=_retry_cc, rs=_retry_sr):
+                async def _do_retry(rr=retry_row, rt=_retry_text, rc=_retry_cc, rs=_retry_sr, tsr=_retry_status_row, tsc=_retry_status_content):
                     try: rr.delete()
                     except Exception: pass
-                    await process_player_input(rt, rc, sidebar_refresh=rs, is_retry=True)
+                    await process_player_input(rt, rc, sidebar_refresh=rs, is_retry=True,
+                                               turn_status_row=tsr, turn_status_content=tsc)
                 ui.button(icon="refresh", on_click=_do_retry).props(f'flat dense round aria-label="{t("aria.retry", L())}"').classes(
                     "text-red-300 hover:text-white"
                 ).style("min-width: 40px; min-height: 40px").tooltip(t("game.retry_tooltip", L()))
@@ -2144,6 +2236,10 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
         # (prevents stale task's finally from clearing a newer task's flag)
         if s.get("_turn_gen", 0) == turn_gen:
             s["processing"] = False
+        if not s.get("processing", False):
+            _set_turn_status()
+            if turn_status_row is not None:
+                turn_status_row.classes(add="hidden")
 
 
 def render_momentum_burn() -> bool:
@@ -2491,13 +2587,13 @@ async def main_page(client: Client):
         drawer_content = ui.column().classes("w-full")
 
     # Accessibility: hide main content from screen readers when drawer overlays (mobile < 768px)
-    drawer.on('show', lambda: ui.run_javascript('''
+    drawer.on('show', lambda: client.run_javascript('''
         if (window.innerWidth < 768) {
             document.querySelector('.q-page')?.setAttribute('aria-hidden','true');
             document.querySelector('.q-footer')?.setAttribute('aria-hidden','true');
         }
     '''))
-    drawer.on('hide', lambda: ui.run_javascript('''
+    drawer.on('hide', lambda: client.run_javascript('''
         document.querySelector('.q-page')?.removeAttribute('aria-hidden');
         document.querySelector('.q-footer')?.removeAttribute('aria-hidden');
     '''))
@@ -2520,7 +2616,7 @@ async def main_page(client: Client):
 
     def _focus_element(css_selector: str, delay_ms: int = 400):
         """Move keyboard/screen-reader focus to the first matching element after a short delay."""
-        ui.run_javascript(f'''
+        client.run_javascript(f'''
             setTimeout(() => {{
                 const el = document.querySelector('{css_selector}');
                 if (el) {{ el.focus(); }}
@@ -2675,16 +2771,21 @@ async def main_page(client: Client):
 
     async def _show_main_phase():
         """Phase 3: Main app with drawer, footer, chat."""
+        async def _run_client_js(code: str, timeout: float = 3.0) -> None:
+            try:
+                await client.run_javascript(code, timeout=timeout)
+            except TimeoutError:
+                pass
+            except RuntimeError as e:
+                log(f"[UI] Skipping client JS after DOM teardown: {e}", level="warning")
+
         if not s.get("user_config_loaded"):
             load_user_settings(s["current_user"])
             s["user_config_loaded"] = True
 
         # Accessibility: update HTML lang + skeleton ARIA labels to match user's UI language
         _user_lang = L()
-        try:
-            await ui.run_javascript(f'document.documentElement.lang="{_user_lang}"', timeout=3.0)
-        except TimeoutError:
-            pass
+        await _run_client_js(f'document.documentElement.lang="{_user_lang}"')
         # Re-set skeleton ARIA labels (were set at build time with default language)
         _hamburger_btn.props(f'aria-label="{t("aria.menu_open", _user_lang)}"')
         drawer.props(f'aria-label="{t("aria.sidebar", _user_lang)}"')
@@ -2761,15 +2862,15 @@ async def main_page(client: Client):
                 if not viewing_chapter:
                     if render_momentum_burn():
                         footer.set_value(False)
-                        await _scroll_chat_bottom(delay_ms=300)
+                        await _scroll_chat_bottom(delay_ms=300, client_obj=client)
                         return
                     if render_game_over():
                         footer.set_value(False)
-                        await _scroll_chat_bottom(delay_ms=300)
+                        await _scroll_chat_bottom(delay_ms=300, client_obj=client)
                         return
                     if render_epilogue():
                         footer.set_value(False)
-                        await _scroll_chat_bottom(delay_ms=300)
+                        await _scroll_chat_bottom(delay_ms=300, client_obj=client)
                         return
 
                     game = s.get("game"); creation = s.get("creation")
@@ -2803,7 +2904,7 @@ async def main_page(client: Client):
                     ui.button(f"{t('chapters.back', L())}", icon="arrow_back", on_click=_exit_view_footer).props("flat dense no-caps").classes("text-sm")
             footer.set_value(True)
             # Trigger footer alignment (same as normal footer)
-            ui.run_javascript('setTimeout(() => { window._rpgAlignFooter && window._rpgAlignFooter(); }, 200)')
+            await _run_client_js('setTimeout(() => { window._rpgAlignFooter && window._rpgAlignFooter(); }, 200)')
         elif game and not game.game_over and chat_container:
             footer_content.clear()
             with footer_content:
@@ -2812,6 +2913,14 @@ async def main_page(client: Client):
                 stt_status.props('role="status" aria-live="polite"')
                 with stt_status:
                     stt_status_content = ui.html("").style("display: inline")
+                turn_status = ui.row().classes("rpg-input-bar hidden w-full items-center")
+                turn_status.props('role="status" aria-live="polite"')
+                turn_status.style(
+                    "padding: 0.45rem 1rem; margin-top: 0.35rem; border: 1px solid var(--border-light); "
+                    "border-radius: 12px; background: rgba(255,255,255,0.03)"
+                )
+                with turn_status:
+                    turn_status_content = ui.html(_turn_status_html()).classes("w-full")
                 with ui.row().classes("w-full items-center gap-2 rpg-input-bar").style("padding: 0.5rem 1rem"):
                     inp = ui.input(placeholder=t("game.input_placeholder", L())).classes("flex-grow").props(f'outlined dense dark aria-label="{t("game.input_placeholder", L())}"')
                     _cc = chat_container  # capture reference for closure
@@ -2820,7 +2929,10 @@ async def main_page(client: Client):
                         txt=inp.value
                         if txt and txt.strip():
                             inp.value=""
-                            await process_player_input(txt.strip(), _cc, sidebar_refresh=_sr)
+                            await process_player_input(
+                                txt.strip(), _cc, sidebar_refresh=_sr,
+                                turn_status_row=turn_status, turn_status_content=turn_status_content,
+                            )
                     inp.on("keydown.enter", send)
                     # --- STT Microphone button ---
                     if s.get("stt_enabled", False):
@@ -2831,7 +2943,7 @@ async def main_page(client: Client):
                     ui.button(icon="send", on_click=send).props(f'flat dense aria-label="{t("aria.send_message", L())}"').classes("text-gray-400 hover:text-white").style("border: 1px solid var(--border-light); border-radius: 8px; min-width: 44px; height: 44px")
             footer.set_value(True)
             # Dynamically align footer input bar with page content
-            ui.run_javascript('''
+            await _run_client_js('''
                 window._rpgAlignFooter = function() {
                     const pageCol = document.querySelector('.q-page .max-w-4xl');
                     const inputBars = document.querySelectorAll('.rpg-input-bar');
@@ -2866,9 +2978,9 @@ async def main_page(client: Client):
             footer.set_value(False)
 
         # Two-step scroll: bottom first (forces DOM render), then up to last scene marker
-        await _scroll_chat_bottom(delay_ms=300)
+        await _scroll_chat_bottom(delay_ms=300, client_obj=client)
         if last_scene_id:
-            await _scroll_to_element(last_scene_id)
+            await _scroll_to_element(last_scene_id, client_obj=client)
 
         # Process pending TTS (from game start / new chapter / momentum burn that triggered reload)
         pending = s.pop("pending_tts", None)
@@ -2877,7 +2989,7 @@ async def main_page(client: Client):
 
         # Accessibility: move focus to the most relevant interactive element
         # Priority: footer input (game active) → creation buttons → creation input → card buttons
-        ui.run_javascript('''
+        await _run_client_js('''
             setTimeout(() => {
                 const targets = [
                     '.q-footer input',

@@ -114,14 +114,13 @@ def _extract_json_text(text: str) -> str:
     return text.strip()
 
 
-def _normalize_schema_type(schema: dict):
+def _schema_types(schema: dict) -> list[str]:
     schema_type = schema.get("type")
     if isinstance(schema_type, list):
-        non_null = [t for t in schema_type if t != "null"]
-        if not non_null:
-            return "null"
-        return non_null[0]
-    return schema_type
+        return [t for t in schema_type if isinstance(t, str)]
+    if isinstance(schema_type, str):
+        return [schema_type]
+    return []
 
 
 def _validate_json_schema(value, schema: dict, path: str = "$") -> None:
@@ -131,8 +130,14 @@ def _validate_json_schema(value, schema: dict, path: str = "$") -> None:
     if "enum" in schema and value not in schema["enum"]:
         raise ValueError(f"{path}: expected one of {schema['enum']}, got {value!r}")
 
-    schema_type = _normalize_schema_type(schema)
-    if schema_type == "object":
+    schema_types = _schema_types(schema)
+    if value is None:
+        if "null" in schema_types:
+            return
+        if schema_types:
+            raise ValueError(f"{path}: expected {' or '.join(schema_types)}")
+
+    if "object" in schema_types:
         if not isinstance(value, dict):
             raise ValueError(f"{path}: expected object")
         properties = schema.get("properties", {})
@@ -149,7 +154,7 @@ def _validate_json_schema(value, schema: dict, path: str = "$") -> None:
                 _validate_json_schema(value[key], subschema, f"{path}.{key}")
         return
 
-    if schema_type == "array":
+    if "array" in schema_types:
         if not isinstance(value, list):
             raise ValueError(f"{path}: expected array")
         item_schema = schema.get("items")
@@ -158,16 +163,20 @@ def _validate_json_schema(value, schema: dict, path: str = "$") -> None:
                 _validate_json_schema(item, item_schema, f"{path}[{index}]")
         return
 
-    if schema_type == "string" and not isinstance(value, str):
-        raise ValueError(f"{path}: expected string")
-    elif schema_type == "integer" and not (isinstance(value, int) and not isinstance(value, bool)):
-        raise ValueError(f"{path}: expected integer")
-    elif schema_type == "number" and not ((isinstance(value, int) or isinstance(value, float)) and not isinstance(value, bool)):
-        raise ValueError(f"{path}: expected number")
-    elif schema_type == "boolean" and not isinstance(value, bool):
-        raise ValueError(f"{path}: expected boolean")
-    elif schema_type == "null" and value is not None:
-        raise ValueError(f"{path}: expected null")
+    matches = False
+    for schema_type in schema_types:
+        if schema_type == "string" and isinstance(value, str):
+            matches = True
+        elif schema_type == "integer" and isinstance(value, int) and not isinstance(value, bool):
+            matches = True
+        elif schema_type == "number" and (isinstance(value, int) or isinstance(value, float)) and not isinstance(value, bool):
+            matches = True
+        elif schema_type == "boolean" and isinstance(value, bool):
+            matches = True
+        elif schema_type == "null" and value is None:
+            matches = True
+    if schema_types and not matches:
+        raise ValueError(f"{path}: expected {' or '.join(schema_types)}")
 
 
 def _chatmock_model_name(model: str) -> str:

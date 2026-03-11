@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import openai
 from provider import ModelGateway
@@ -147,6 +147,71 @@ BRAIN_OUTPUT_SCHEMA = {
     ],
     "additionalProperties": False,
 }
+
+
+def _parse_player_input_segments(player_message: str) -> dict:
+    """Split player input into action, quoted dialog, and |system/OOC| spans."""
+    raw = player_message or ""
+    spoken_parts = []
+    system_parts = []
+    action_parts = []
+    last = 0
+
+    for match in re.finditer(r'\|([^|]+)\||"([^"]+)"', raw):
+        start, end = match.span()
+        if start > last:
+            plain = raw[last:start].strip()
+            if plain:
+                action_parts.append(plain)
+        if match.group(1) is not None:
+            system_parts.append(match.group(1).strip())
+        elif match.group(2) is not None:
+            spoken_parts.append(match.group(2).strip())
+        last = end
+
+    if last < len(raw):
+        plain = raw[last:].strip()
+        if plain:
+            action_parts.append(plain)
+
+    return {
+        "raw": raw,
+        "action": " ".join(p for p in action_parts if p).strip(),
+        "spoken": spoken_parts,
+        "system": system_parts,
+    }
+
+
+def _brain_input_context(player_message: str) -> str:
+    parsed = _parse_player_input_segments(player_message)
+    spoken = "\n".join(f"- {part}" for part in parsed["spoken"]) or "(none)"
+    system = "\n".join(f"- {part}" for part in parsed["system"]) or "(none)"
+    action = parsed["action"] or "(none)"
+    return (
+        "<input_format>\n"
+        "- Unquoted text describes attempted action or intent.\n"
+        '- \"quoted text\" is exact in-world dialog spoken by the player character.\n'
+        "- |pipe text| is OOC or a game-system question/request for clarification.\n"
+        "</input_format>\n"
+        "<parsed_input>\n"
+        f"<raw>{parsed['raw']}</raw>\n"
+        f"<action>{action}</action>\n"
+        f"<spoken>\n{spoken}\n</spoken>\n"
+        f"<system_queries>\n{system}\n</system_queries>\n"
+        "</parsed_input>"
+    )
+
+
+def _narrator_player_input_block(player_message: str) -> str:
+    parsed = _parse_player_input_segments(player_message)
+    parts = [f"\n<player_input_raw>{parsed['raw']}</player_input_raw>"] if parsed["raw"] else []
+    if parsed["action"]:
+        parts.append(f"\n<player_action>{parsed['action']}</player_action>")
+    for spoken in parsed["spoken"]:
+        parts.append(f"\n<player_dialog>{spoken}</player_dialog>")
+    for system in parsed["system"]:
+        parts.append(f"\n<system_query>{system}</system_query>")
+    return "".join(parts)
 
 SETUP_BRAIN_OUTPUT_SCHEMA = {
     "type": "object",
@@ -2877,6 +2942,12 @@ def call_brain(client: ModelGateway, game: GameState, player_message: str,
 - Formulate a DRAMATIC QUESTION that this scene must answer (1 sentence, yes/no answerable)
 """ + lang_rules + """
 - Assess time_progression: does this action take significant time? "none"=same moment, "short"=minutes, "moderate"=hours, "long"=half a day or more
+- player_intent must faithfully restate the player's immediate intended action, preserving actor, target, and purpose. Do not rewrite it into a different objective.
+- If the player asks for a diagnostic, status check, scan, or other question about current state, treat that as information-gathering first unless the input clearly says the action already happens regardless.
+- If the input contains a conditional follow-up (for example "if so ..."), resolve the condition first in player_intent and move choice rather than assuming the follow-up already succeeded.
+- target_npc is only for the entity the player is acting toward. Do not confuse the target with a tool, power source, or desired outcome.
+- |pipe text| is OOC or a system query to the game engine. Use it to interpret the request and answer it in play, but do not treat it as spoken dialog.
+- "quoted text" is spoken aloud by the player character; unquoted text is not spoken unless context makes that unavoidable.
 </rules>
 <moves>
 face_danger:edge|heart|iron|shadow|wits
@@ -2914,7 +2985,7 @@ time:{game.time_of_day or 'unspecified'} | prev_locations:{', '.join(game.locati
 <npcs>{npc_summary}</npcs>
 <clocks>{clock_summary}</clocks>
 <recent>{last_scenes}</recent>
-{_story_context_block(game)}{campaign_ctx}{backstory_ctx}<input>{player_message}</input>"""
+{_story_context_block(game)}{campaign_ctx}{backstory_ctx}{_brain_input_context(player_message)}"""
 
     try:
         response = _api_create_with_retry(
@@ -3475,8 +3546,10 @@ def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) 
 - PURE PROSE ONLY: Output ONLY narrative text. No JSON, no XML tags, no metadata, no code blocks, no markdown formatting (no *italics*, no **bold**, no # headings). Use typographic emphasis through word choice, sentence rhythm, and punctuation instead. Your entire response is visible to the player.
 </rules>
 <player_authorship>
-- The PLAYER IS the character. If <player_words> is provided, these are CANONICAL.
-- DIALOG: The narration MUST SHOW the player character speaking. Include their words as quoted dialog in the scene (with speech tags/body language). The player's speech MUST appear in the text BEFORE NPCs react to it.
+- The PLAYER IS the character. If player input tags are provided, they are CANONICAL.
+- <player_action> describes what the player is trying to do. Show that action in the scene, but do not convert it into spoken dialog.
+- <player_dialog> is exact spoken dialog. Include it as quoted speech before NPCs react.
+- <system_query> is OOC or a game-system clarification request. Answer it through the narration/world state, not as spoken dialog.
 - PRESERVE EXACTLY: Keep the player's word choices, names, spelling, and phrasing intact. If the player writes a wrong name, a typo, slang, or informal language, that IS what the character said {E['dash']} reproduce it faithfully. NEVER correct names, fix factual errors, convert numbers to words, or "improve" the player's language. The ONLY permitted changes are adding punctuation and capitalizing sentence starts.
 - DESCRIBED SPEECH: If the player describes speaking WITHOUT giving exact words (e.g. "I ask him about Thornhill" or "I describe the suspect"), narrate this as INDIRECT SPEECH or brief summary {E['dash']} do NOT invent specific quoted dialog for the player character. Write "Du fragst ihn nach Thornhill" or "Du beschreibst den Verdächtigen", then show the NPC's reaction. NEVER put invented words in the player character's mouth.
 - ACTIONS: The narration MUST SHOW the player character performing the described action. You may add sensory detail and atmosphere, but the core action stays as stated and must be visible in the text.
@@ -4420,7 +4493,7 @@ def build_dialog_prompt(game: GameState, brain: dict, player_words: str = "",
     wa = brain.get("world_addition", "")
     wl = f'\n<world_add>{wa}</world_add>' if wa else ""
     crisis = '\n<crisis/>' if game.crisis_mode else ""
-    pw = f'\n<player_words>{player_words}</player_words>' if player_words else ""
+    pw = _narrator_player_input_block(player_words)
     pacing = _pacing_block(game, chaos_interrupt, brain.get("dramatic_question", ""))
     time_ctx = f'\n<time>{game.time_of_day}</time>' if game.time_of_day else ""
     loc_hist = f'\n<prev_locations>{", ".join(game.location_history[-3:])}</prev_locations>' if game.location_history else ""
@@ -4488,7 +4561,7 @@ def build_action_prompt(game: GameState, brain: dict, roll: RollResult,
 
     wa = brain.get("world_addition", "")
     wl = f'\n<world_add>{wa}</world_add>' if wa else ""
-    pw = f'\n<player_words>{player_words}</player_words>' if player_words else ""
+    pw = _narrator_player_input_block(player_words)
 
     position = brain.get("position", "risky")
     effect = brain.get("effect", "standard")
@@ -5786,8 +5859,11 @@ def start_new_chapter(client: ModelGateway, game: GameState,
 
 def process_turn(client: ModelGateway, game: GameState,
                  player_message: str,
-                 config: Optional[EngineConfig] = None) -> tuple[GameState, str, Optional[RollResult], Optional[dict], Optional[dict]]:
+                 config: Optional[EngineConfig] = None,
+                 progress_callback: Optional[Callable[[str], None]] = None) -> tuple[GameState, str, Optional[RollResult], Optional[dict], Optional[dict]]:
     log(f"[Turn] Scene {game.scene_count + 1} | Player: {player_message[:100]}")
+    if progress_callback:
+        progress_callback("brain")
 
     # Snapshot BEFORE any mutation — used by ## correction flow and burn
     game.last_turn_snapshot = _build_turn_snapshot(game)
@@ -5795,6 +5871,8 @@ def process_turn(client: ModelGateway, game: GameState,
 
     brain = call_brain(client, game, player_message, config)
     game.last_turn_snapshot["brain"] = dict(brain)
+    if progress_callback:
+        progress_callback("resolve")
 
     # Reactivate background NPC if Brain targets one
     tid = brain.get("target_npc")
@@ -5824,10 +5902,14 @@ def process_turn(client: ModelGateway, game: GameState,
                                      activated_npcs=activated_npcs,
                                      mentioned_npcs=mentioned_npcs,
                                      config=config)
+        if progress_callback:
+            progress_callback("narrate")
         raw = call_narrator(client, prompt, game, config)
         narration = parse_narrator_response(game, raw)
         if game.last_turn_snapshot is not None:
             game.last_turn_snapshot["narration"] = narration
+        if progress_callback:
+            progress_callback("metadata")
         metadata = call_narrator_metadata(client, narration, game, config)
         _apply_narrator_metadata(game, metadata, scene_present_ids=_scene_present_ids)
         # Mark first pending revelation as used (narrator was instructed to weave it in)
@@ -5902,10 +5984,14 @@ def process_turn(client: ModelGateway, game: GameState,
                                 player_words=player_message, chaos_interrupt=chaos_interrupt,
                                 activated_npcs=activated_npcs, mentioned_npcs=mentioned_npcs,
                                 config=config)
+    if progress_callback:
+        progress_callback("narrate")
     raw = call_narrator(client, prompt, game, config)
     narration = parse_narrator_response(game, raw)
     if game.last_turn_snapshot is not None:
         game.last_turn_snapshot["narration"] = narration
+    if progress_callback:
+        progress_callback("metadata")
     metadata = call_narrator_metadata(client, narration, game, config)
     _apply_narrator_metadata(game, metadata, scene_present_ids=_scene_present_ids)
     # Update chaos factor based on result
@@ -6309,7 +6395,8 @@ def _restore_from_snapshot(game: GameState, snap: dict) -> None:
 
 def process_correction(client: ModelGateway, game: GameState,
                         correction_text: str,
-                        config: Optional[EngineConfig] = None
+                        config: Optional[EngineConfig] = None,
+                        progress_callback: Optional[Callable[[str], None]] = None
                         ) -> tuple[GameState, str, Optional[dict]]:
     """Handle a ## correction request.
     Returns (game, rewritten_narration, director_ctx).
@@ -6326,6 +6413,8 @@ def process_correction(client: ModelGateway, game: GameState,
     _cfg = config or EngineConfig()
 
     # Step 1: Analyse the correction
+    if progress_callback:
+        progress_callback("brain")
     analysis = call_correction_brain(client, game, correction_text, _cfg)
     source = analysis["correction_source"]
 
@@ -6335,6 +6424,8 @@ def process_correction(client: ModelGateway, game: GameState,
         corrected_input = analysis.get("corrected_input") or snap.get("player_input", "")
 
         # Re-run Brain with the corrected input interpretation
+        if progress_callback:
+            progress_callback("resolve")
         brain = call_brain(client, game, corrected_input, _cfg)
         _apply_brain_location_time(game, brain)
 
@@ -6391,6 +6482,8 @@ def process_correction(client: ModelGateway, game: GameState,
     )
     prompt = prompt + correction_tag
 
+    if progress_callback:
+        progress_callback("narrate")
     raw = call_narrator(client, prompt, game, _cfg)
     narration = parse_narrator_response(game, raw)
 
@@ -6403,6 +6496,8 @@ def process_correction(client: ModelGateway, game: GameState,
 
     # Step 4: Metadata extraction (new NPCs, memories etc. from rewritten scene)
     _scene_present_ids = {n["id"] for n in activated_npcs}
+    if progress_callback:
+        progress_callback("metadata")
     metadata = call_narrator_metadata(client, narration, game, _cfg)
     _apply_narrator_metadata(game, metadata, scene_present_ids=_scene_present_ids)
 
