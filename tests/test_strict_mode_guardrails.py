@@ -3,6 +3,11 @@ import unittest
 from engine import (
     EngineConfig,
     GameState,
+    _format_state_answer_text,
+    _relevant_established_facts,
+    _sanitize_established_facts,
+    _upsert_established_facts,
+    _is_pure_system_query_turn,
     _move_narration_contract,
     _normalize_strict_scene_resolution,
     RollResult,
@@ -144,6 +149,69 @@ class StrictModeGuardrailTests(unittest.TestCase):
         prompt = build_no_roll_action_prompt(game, brain, player_words="I pan the sensors across the tug.")
         self.assertIn("NO ROLL", prompt)
         self.assertIn("routine, safe, or purely expressive", prompt)
+
+    def test_pure_system_query_detection(self):
+        self.assertTrue(_is_pure_system_query_turn(
+            "|System Analysis - Do I have any drones capable of space flight?|"
+        ))
+        self.assertFalse(_is_pure_system_query_turn(
+            'I check the panel. |Do I have any drones capable of space flight?|'
+        ))
+
+    def test_state_answer_text_formats_as_direct_answer(self):
+        text = _format_state_answer_text({
+            "answer_summary": "You have no active external repair drones on standby.",
+            "facts": [
+                "Two maintenance drones remain inside the hull.",
+                "No salvage or EVA-capable drones are currently powered for flight.",
+            ],
+        })
+        self.assertIn("You have no active external repair drones on standby.", text)
+        self.assertIn("- Two maintenance drones remain inside the hull.", text)
+
+    def test_established_facts_upsert_and_relevance(self):
+        game = GameState(established_facts=[
+            {
+                "subject": "ship_drones",
+                "category": "maintenance_drones_active",
+                "value": "two internal maintenance drones confirmed",
+                "confidence": "high",
+                "source": "opening_scene",
+                "scene_established": 1,
+            }
+        ])
+        _upsert_established_facts(game, [
+            {
+                "subject": "ship_drones",
+                "category": "external_repair_drones",
+                "value": "none confirmed spaceworthy",
+                "confidence": "medium",
+                "source": "system_query_inference",
+                "scene_established": 6,
+            }
+        ])
+        relevant = _relevant_established_facts(game, "Do I have repair drones capable of space flight?")
+        self.assertEqual(len(game.established_facts), 2)
+        self.assertTrue(any(f["category"] == "external_repair_drones" for f in relevant))
+
+    def test_sanitize_established_facts_discards_incomplete_entries(self):
+        facts = _sanitize_established_facts([
+            {
+                "subject": "ship_repairs",
+                "category": "repair_activity",
+                "value": "internal drones are actively patching and scavenging",
+                "confidence": "high",
+                "source": "scene_resolution",
+                "scene_established": 7,
+            },
+            {
+                "subject": "",
+                "category": "sensor_status",
+                "value": "improved",
+            },
+        ], scene_count=7, source="scene_resolution")
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(facts[0]["category"], "repair_activity")
 
 
 if __name__ == "__main__":

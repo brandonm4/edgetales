@@ -208,6 +208,11 @@ def _player_has_system_query(player_message: str) -> bool:
     return bool(parsed["system"])
 
 
+def _is_pure_system_query_turn(player_message: str) -> bool:
+    parsed = _parse_player_input_segments(player_message)
+    return bool(parsed["system"] and not parsed["action"] and not parsed["spoken"])
+
+
 def _state_contract_block(game: GameState) -> str:
     contracts = [
         f"- Health is {game.health}/5.",
@@ -566,6 +571,32 @@ WORLD_STATE_ANSWER_SCHEMA = {
     "additionalProperties": False,
 }
 
+ESTABLISHED_FACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subject": {"type": "string"},
+        "category": {"type": "string"},
+        "value": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "source": {"type": "string"},
+        "scene_established": {"type": "integer"},
+    },
+    "required": ["subject", "category", "value", "confidence", "source", "scene_established"],
+    "additionalProperties": False,
+}
+
+SYSTEM_QUERY_RESOLUTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer_summary": {"type": "string"},
+        "facts": {"type": "array", "items": {"type": "string"}},
+        "resolved_from_profile": {"type": "boolean"},
+        "established_facts": {"type": "array", "items": ESTABLISHED_FACT_SCHEMA},
+    },
+    "required": ["answer_summary", "facts", "resolved_from_profile", "established_facts"],
+    "additionalProperties": False,
+}
+
 STRICT_SCENE_RESOLUTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -575,6 +606,7 @@ STRICT_SCENE_RESOLUTION_SCHEMA = {
         "time_update": {"type": ["string", "null"]},
         "memory_updates": copy.deepcopy(NARRATOR_METADATA_SCHEMA["properties"]["memory_updates"]),
         "new_npcs": copy.deepcopy(NARRATOR_METADATA_SCHEMA["properties"]["new_npcs"]),
+        "established_facts": {"type": "array", "items": ESTABLISHED_FACT_SCHEMA},
     },
     "required": [
         "narration",
@@ -583,6 +615,7 @@ STRICT_SCENE_RESOLUTION_SCHEMA = {
         "time_update",
         "memory_updates",
         "new_npcs",
+        "established_facts",
     ],
     "additionalProperties": False,
 }
@@ -2579,6 +2612,7 @@ class GameState:
     world_truths: str = ""     # Per-game world rules and universe constraints
     # v5.11: Director guidance (stored between turns)
     director_guidance: dict = field(default_factory=dict)  # Last DirectorGuidance output
+    established_facts: list = field(default_factory=list)  # Lazily established world/system facts
     turn_checkpoints: list = field(default_factory=list)  # Rewind checkpoints aligned to chat history
     # Transient — NOT in SAVE_FIELDS. Full pre-turn snapshot for ## correction flow.
     last_turn_snapshot: Optional[dict] = field(default=None, repr=False)
@@ -3794,16 +3828,35 @@ def call_world_state_answer(client: ModelGateway, game: GameState, brain: dict,
     """Produce a structured state answer for diagnostics/system-query turns."""
     _cfg = config or EngineConfig()
     lang = get_narration_lang(_cfg)
+    recent = "\n".join(
+        f"- Scene {s.get('scene')}: {s.get('rich_summary') or s.get('summary')}"
+        for s in game.session_log[-4:]
+    ) or "(none)"
+    npc_refs = "\n".join(
+        f"- {n.get('name','?')}: {n.get('description','')}"
+        for n in game.npcs if n.get("status") in ("active", "background")
+    ) or "(none)"
+    campaign = _campaign_world_text(game)
     prompt = f"""<state>
 location:{game.current_location}
 scene_context:{game.current_scene_context}
 health:{game.health}/5 spirit:{game.spirit}/5 supply:{game.supply}/5 momentum:{game.momentum}/{game.max_momentum}
 </state>
+<campaign>{campaign}</campaign>
+<backstory>{getattr(game, 'backstory', '') or '(none)'}</backstory>
+<known_npcs>
+{npc_refs}
+</known_npcs>
+<recent_scenes>
+{recent}
+</recent_scenes>
 <intent>{brain.get('player_intent', '')}</intent>
 {_brain_input_context(player_message)}
 Answer the player's information request and immediate operational state.
 - Stay concrete and literal.
 - Distinguish the player character's own condition from the ship's condition.
+- Use established canon from backstory, recent scenes, and known entities when answering asset/inventory/status questions.
+- If the answer is uncertain, say what is known, what is missing, and make the uncertainty explicit instead of saying nothing useful.
 - facts should be short factual bullet-sized lines in {lang}.
 """
     response = _api_create_with_retry(
@@ -3821,6 +3874,109 @@ def _maybe_call_state_answer(client: ModelGateway, game: GameState, brain: dict,
                              config: Optional[EngineConfig] = None) -> Optional[dict]:
     if not _should_generate_state_answer(config, player_message, brain):
         return None
+    try:
+        answer = call_world_state_answer(client, game, brain, player_message, config)
+        log(f"[StateAnswer] Summary: {answer.get('answer_summary', '')[:120]}")
+        return answer
+    except Exception as e:
+        log(f"[StateAnswer] Failed ({type(e).__name__}: {e})", level="warning")
+        return None
+
+
+def _fact_key(entry: dict) -> tuple[str, str]:
+    return ((entry.get("subject") or "").strip().lower(),
+            (entry.get("category") or "").strip().lower())
+
+
+def _relevant_established_facts(game: GameState, query_text: str, limit: int = 10) -> list[dict]:
+    facts = getattr(game, "established_facts", []) or []
+    if not facts:
+        return []
+    words = set(re.findall(r"[a-zA-Z0-9_]{3,}", (query_text or "").lower()))
+    if not words:
+        return facts[:limit]
+    ranked = []
+    for fact in facts:
+        hay = " ".join(str(fact.get(k, "")) for k in ("subject", "category", "value", "source")).lower()
+        overlap = sum(1 for w in words if w in hay)
+        if overlap:
+            ranked.append((overlap, fact))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [fact for _, fact in ranked[:limit]] or facts[:limit]
+
+
+def _upsert_established_facts(game: GameState, new_facts: list[dict]) -> None:
+    existing = { _fact_key(entry): dict(entry) for entry in (getattr(game, "established_facts", []) or []) }
+    for fact in new_facts or []:
+        key = _fact_key(fact)
+        if not key[0] and not key[1]:
+            continue
+        existing[key] = dict(fact)
+    game.established_facts = list(existing.values())
+
+
+def _sanitize_established_facts(facts: list[dict], scene_count: int, source: str) -> list[dict]:
+    sanitized = []
+    for fact in facts or []:
+        subject = (fact.get("subject") or "").strip()
+        category = (fact.get("category") or "").strip()
+        value = (fact.get("value") or "").strip()
+        if not subject or not category or not value:
+            continue
+        sanitized.append({
+            "subject": subject,
+            "category": category,
+            "value": value,
+            "confidence": fact.get("confidence") if fact.get("confidence") in ("low", "medium", "high") else "medium",
+            "source": (fact.get("source") or source).strip() or source,
+            "scene_established": int(fact.get("scene_established") or scene_count or 0),
+        })
+    return sanitized[:4]
+
+
+def call_system_query_resolution(client: ModelGateway, game: GameState, player_message: str,
+                                 config: Optional[EngineConfig] = None) -> dict:
+    _cfg = config or EngineConfig()
+    lang = get_narration_lang(_cfg)
+    relevant_facts = _relevant_established_facts(game, player_message)
+    fact_block = "\n".join(
+        f"- {f.get('subject')} | {f.get('category')} | {f.get('value')} | confidence={f.get('confidence')} | source={f.get('source')}"
+        for f in relevant_facts
+    ) or "(none)"
+    recent = "\n".join(
+        f"- Scene {s.get('scene')}: {s.get('rich_summary') or s.get('summary')}"
+        for s in game.session_log[-4:]
+    ) or "(none)"
+    prompt = f"""<campaign>{_campaign_world_text(game)}</campaign>
+<character>{_character_identity_text(game)}</character>
+<backstory>{getattr(game, 'backstory', '') or '(none)'}</backstory>
+<scene_context>{game.current_scene_context}</scene_context>
+<location>{game.current_location}</location>
+<relevant_established_facts>
+{fact_block}
+</relevant_established_facts>
+<recent_scenes>
+{recent}
+</recent_scenes>
+{_brain_input_context(player_message)}
+Answer the player's pure system query in {lang}.
+- If the relevant established facts already answer the question, use them and set resolved_from_profile=true.
+- If they do not fully answer it, infer the minimum plausible answer from canon and recent scenes, set resolved_from_profile=false, and return 1-4 newly established facts.
+- New facts must be generic and reusable. Example categories: drone_spaceworthy, repair_drones_active, external_comms_online, turrets_operational.
+- Do not advance the scene or invent a new event. This is analysis, not narration.
+- Be direct and useful; uncertainty is allowed, but avoid empty non-answers.
+"""
+    response = _api_create_with_retry(
+        client, max_retries=2,
+        model=BRAIN_MODEL, max_output_tokens=700,
+        instructions="You are a strict RPG systems analyst. Resolve questions from existing canon first, then infer minimally and persist reusable facts. Return only structured JSON.",
+        input=[{"role": "user", "content": prompt}],
+        text=_json_schema_text_format("system_query_resolution", SYSTEM_QUERY_RESOLUTION_SCHEMA),
+    )
+    data = json.loads(_response_text(response))
+    if data.get("established_facts"):
+        _upsert_established_facts(game, data["established_facts"])
+    return data
 
 
 def _strict_resolution_prompt(base_prompt: str, brain: dict, state_answer: Optional[dict] = None) -> str:
@@ -3832,6 +3988,9 @@ def _strict_resolution_prompt(base_prompt: str, brain: dict, state_answer: Optio
         "- If the player asked a question or performed information-gathering, the narration must answer it plainly before flourish.",
         "- scene_context should be one short factual summary of the new immediate situation.",
         "- memory_updates should only be for NPCs physically present or directly participating.",
+        "- established_facts should capture durable new truths created or confirmed by this scene. Use 0-4 facts.",
+        "- For meaningful successes, especially STRONG_HIT, establish concrete lasting facts rather than only rephrasing the old status quo.",
+        "- Facts must be generic and queryable later. Good categories look like: repair_activity, sensor_coverage, internal_damage_state, drone_availability, external_comms_state, alliance_status.",
         "- Keep narration concise and grounded.",
         "</strict_resolution_rules>",
     ]
@@ -3852,12 +4011,15 @@ def _normalize_strict_scene_resolution(data: dict) -> dict:
         "time_update": data.get("time_update"),
         "memory_updates": data.get("memory_updates", []) or [],
         "new_npcs": data.get("new_npcs", []) or [],
+        "established_facts": data.get("established_facts", []) or [],
         "npc_renames": [],
         "npc_details": [],
         "deceased_npcs": [],
     }
     if len(result["new_npcs"]) > 1:
         result["new_npcs"] = result["new_npcs"][:1]
+    if len(result["established_facts"]) > 4:
+        result["established_facts"] = result["established_facts"][:4]
     return result
 
 
@@ -3880,13 +4042,14 @@ def call_strict_scene_resolution(client: ModelGateway, game: GameState, prompt: 
         text=_json_schema_text_format("strict_scene_resolution", STRICT_SCENE_RESOLUTION_SCHEMA),
     )
     return _normalize_strict_scene_resolution(json.loads(_response_text(response)))
-    try:
-        answer = call_world_state_answer(client, game, brain, player_message, config)
-        log(f"[StateAnswer] Summary: {answer.get('answer_summary', '')[:120]}")
-        return answer
-    except Exception as e:
-        log(f"[StateAnswer] Failed ({type(e).__name__}: {e})", level="warning")
-        return None
+
+
+def _format_state_answer_text(answer: dict) -> str:
+    summary = (answer.get("answer_summary") or "").strip()
+    facts = [f.strip() for f in (answer.get("facts") or []) if str(f).strip()]
+    lines = [summary] if summary else []
+    lines.extend(f"- {fact}" for fact in facts)
+    return "\n".join(lines).strip() or "(No clear system information is available.)"
 
 
 def _salvage_truncated_narration(raw: str) -> str:
@@ -4023,6 +4186,11 @@ def _sanitize_metadata_for_strict_mode(game: GameState, metadata: dict) -> dict:
         "time_update": metadata.get("time_update"),
         "memory_updates": [],
         "new_npcs": [],
+        "established_facts": _sanitize_established_facts(
+            metadata.get("established_facts", []),
+            game.scene_count,
+            "scene_resolution",
+        ),
         "npc_renames": [],
         "npc_details": [],
         "deceased_npcs": [],
@@ -4054,6 +4222,8 @@ def _run_scene_narration(client: ModelGateway, game: GameState, prompt: str,
         resolution = call_strict_scene_resolution(client, game, prompt, brain, state_answer, _cfg)
         narration = parse_narrator_response(game, resolution.get("narration", ""))
         metadata = _sanitize_metadata_for_strict_mode(game, resolution)
+        if metadata.get("established_facts"):
+            _upsert_established_facts(game, metadata["established_facts"])
         _apply_narrator_metadata(game, metadata, scene_present_ids=scene_present_ids)
         return narration, metadata
 
@@ -5425,6 +5595,7 @@ SAVE_FIELDS = [
     "world_truths",
     # v5.11: Director guidance
     "director_guidance",
+    "established_facts",
     "turn_checkpoints",
 ]
 
@@ -6351,6 +6522,27 @@ def process_turn(client: ModelGateway, game: GameState,
                  config: Optional[EngineConfig] = None,
                  progress_callback: Optional[Callable[[str], None]] = None) -> tuple[GameState, str, Optional[RollResult], Optional[dict], Optional[dict]]:
     log(f"[Turn] Scene {game.scene_count + 1} | Player: {player_message[:100]}")
+    if _is_pure_system_query_turn(player_message):
+        if progress_callback:
+            progress_callback("brain")
+        try:
+            answer = call_system_query_resolution(client, game, player_message, config)
+            narration = _format_state_answer_text(answer)
+            log(f"[Turn] Pure system query resolved without scene advance")
+            return game, narration, None, None, None
+        except Exception as e:
+            log(f"[Turn] Pure system query fallback ({type(e).__name__}: {e})", level="warning")
+            pseudo_brain = {
+                "player_intent": "Answer the player's system query.",
+                "move": "gather_information",
+                "target_npc": None,
+            }
+            answer = _maybe_call_state_answer(client, game, pseudo_brain, player_message, config) or {
+                "answer_summary": "",
+                "facts": [],
+            }
+            narration = _format_state_answer_text(answer)
+            return game, narration, None, None, None
     if progress_callback:
         progress_callback("brain")
 

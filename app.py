@@ -2239,6 +2239,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
     s = session or S()
     game=s.get("game")
     if not game or not text.strip(): return
+    scene_count_before = game.scene_count
     # Double-send guard: prevent concurrent processing
     if s.get("processing", False):
         ui.notify(t("game.still_processing", L()), type="warning", position="top")
@@ -2332,7 +2333,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
                     render_sidebar_status(game, session=s)
             except Exception as e:
                 log(f"[Sidebar] Status refresh failed: {e}", level="warning")
-        if not _is_correction and game.scene_count > 1:
+        if not _is_correction and game.scene_count > scene_count_before:
             s["messages"].append({"scene_marker":t("game.scene_marker", L(), n=game.scene_count, location=game.current_location)})
         roll_data=None
         if roll:
