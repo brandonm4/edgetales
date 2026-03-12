@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from engine import (
     EngineConfig,
@@ -9,6 +10,7 @@ from engine import (
     _upsert_established_facts,
     _is_pure_system_query_turn,
     _move_narration_contract,
+    _normalize_single_pass_turn,
     _normalize_strict_scene_resolution,
     RollResult,
     _sanitize_metadata_for_strict_mode,
@@ -16,6 +18,9 @@ from engine import (
     build_no_roll_action_prompt,
     build_dialog_prompt,
     get_narrator_system,
+    process_correction,
+    process_momentum_burn,
+    process_turn,
 )
 
 
@@ -131,6 +136,46 @@ class StrictModeGuardrailTests(unittest.TestCase):
         self.assertEqual(normalized["deceased_npcs"], [])
         self.assertEqual(len(normalized["new_npcs"]), 1)
 
+    def test_single_pass_turn_normalizes_branch_payloads(self):
+        normalized = _normalize_single_pass_turn({
+            "move": "gather_information",
+            "stat": "wits",
+            "approach": "careful scan",
+            "target_npc": None,
+            "dialog_only": False,
+            "requires_roll": False,
+            "player_intent": "Run a diagnostic",
+            "position": "controlled",
+            "effect": "standard",
+            "dramatic_question": "What still works?",
+            "location_change": None,
+            "time_progression": "none",
+            "no_roll_resolution": {
+                "narration": "You read the system output.",
+                "scene_context": "Diagnostics stabilize the picture.",
+                "location_update": None,
+                "time_update": None,
+                "memory_updates": [],
+                "new_npcs": [
+                    {"name": "A", "description": "first npc entry", "disposition": "neutral"},
+                    {"name": "B", "description": "second npc entry", "disposition": "neutral"},
+                ],
+                "established_facts": [
+                    {"subject": "BRND", "category": "scan", "value": "complete", "confidence": "high", "source": "x", "scene_established": 1},
+                    {"subject": "BRND", "category": "power", "value": "stable", "confidence": "high", "source": "x", "scene_established": 1},
+                    {"subject": "BRND", "category": "sensor", "value": "online", "confidence": "high", "source": "x", "scene_established": 1},
+                    {"subject": "BRND", "category": "repair", "value": "active", "confidence": "high", "source": "x", "scene_established": 1},
+                    {"subject": "BRND", "category": "extra", "value": "drop me", "confidence": "high", "source": "x", "scene_established": 1},
+                ],
+            },
+            "strong_hit_resolution": None,
+            "weak_hit_resolution": None,
+            "miss_resolution": None,
+        })
+        self.assertEqual(normalized["move"], "gather_information")
+        self.assertEqual(len(normalized["no_roll_resolution"]["new_npcs"]), 1)
+        self.assertEqual(len(normalized["no_roll_resolution"]["established_facts"]), 4)
+
     def test_no_roll_prompt_marks_routine_resolution(self):
         game = GameState(
             player_name="BRND",
@@ -167,7 +212,7 @@ class StrictModeGuardrailTests(unittest.TestCase):
             ],
         })
         self.assertIn("You have no active external repair drones on standby.", text)
-        self.assertIn("- Two maintenance drones remain inside the hull.", text)
+        self.assertNotIn("Two maintenance drones remain inside the hull.", text)
 
     def test_established_facts_upsert_and_relevance(self):
         game = GameState(established_facts=[
@@ -212,6 +257,148 @@ class StrictModeGuardrailTests(unittest.TestCase):
         ], scene_count=7, source="scene_resolution")
         self.assertEqual(len(facts), 1)
         self.assertEqual(facts[0]["category"], "repair_activity")
+
+    def test_process_turn_uses_brain_plus_fixed_narration_in_strict_mode(self):
+        game = GameState(
+            player_name="BRND",
+            character_concept="AI core",
+            current_location="Core",
+            current_scene_context="The ship listens in silence.",
+            scene_count=1,
+        )
+        with patch("engine.call_brain", return_value={
+            "type": "action",
+            "move": "gather_information",
+            "stat": "wits",
+            "approach": "careful scan",
+            "target_npc": None,
+            "dialog_only": False,
+            "requires_roll": False,
+            "player_intent": "Run a diagnostic",
+            "world_addition": None,
+            "position": "controlled",
+            "effect": "standard",
+            "dramatic_question": "What systems remain online?",
+            "location_change": None,
+            "time_progression": "none",
+        }), patch("engine.call_single_pass_scene_rewrite", return_value={
+            "narration": "A clean diagnostic scrolls across your awareness: passive sensors are steady and repair drones still work the inner hull.",
+            "scene_context": "Diagnostics confirm stable passive sensors and active internal repairs.",
+            "location_update": None,
+            "time_update": None,
+            "memory_updates": [],
+            "new_npcs": [],
+            "established_facts": [],
+        }), patch("engine._maybe_call_state_answer", return_value={"answer_summary": "Sensors are steady.", "facts": []}):
+            updated, narration, roll, burn_info, director_ctx = process_turn(
+                client=None,
+                game=game,
+                player_message="I run a diagnostic on the ship.",
+                config=EngineConfig(strict_mode=True),
+            )
+        self.assertIn("diagnostic", narration.lower())
+        self.assertIsNone(roll)
+        self.assertIsNone(burn_info)
+        self.assertIsNone(director_ctx)
+        self.assertEqual(updated.scene_count, 2)
+
+    def test_process_correction_uses_single_pass_rewrite_in_strict_mode(self):
+        game = GameState(
+            player_name="BRND",
+            character_concept="AI core",
+            current_location="Warship Core",
+            current_scene_context="The ship listens in silence.",
+            scene_count=2,
+        )
+        game.last_turn_snapshot = {
+            "player_input": "I run a diagnostic.",
+            "brain": {"move": "gather_information", "stat": "wits", "requires_roll": False, "dialog_only": False, "player_intent": "Run a diagnostic", "position": "controlled", "effect": "standard", "dramatic_question": "", "target_npc": None},
+            "roll": None,
+            "narration": "Old narration",
+            "health": game.health,
+            "spirit": game.spirit,
+            "supply": game.supply,
+            "momentum": game.momentum,
+            "max_momentum": game.max_momentum,
+            "scene_count": 1,
+            "chaos_factor": game.chaos_factor,
+            "crisis_mode": game.crisis_mode,
+            "game_over": game.game_over,
+            "epilogue_shown": game.epilogue_shown,
+            "epilogue_dismissed": game.epilogue_dismissed,
+            "current_location": game.current_location,
+            "current_scene_context": game.current_scene_context,
+            "time_of_day": game.time_of_day,
+            "location_history": list(game.location_history),
+            "director_guidance": game.director_guidance,
+            "npcs": [],
+            "clocks": [],
+            "scene_intensity_history": list(game.scene_intensity_history),
+        }
+        with patch("engine.call_correction_brain", return_value={
+            "correction_source": "state_error",
+            "corrected_input": "",
+            "reroll_needed": False,
+            "corrected_stat": "none",
+            "narrator_guidance": "Answer as a diagnostic, not as an attack.",
+            "director_useful": False,
+            "state_ops": [],
+        }), patch("engine.call_single_pass_scene_rewrite", return_value={
+            "narration": "A revised diagnostic answer scrolls into view.",
+            "scene_context": "The diagnostic remains purely informational.",
+            "location_update": None,
+            "time_update": None,
+            "memory_updates": [],
+            "new_npcs": [],
+            "established_facts": [],
+        }):
+            updated, narration, director_ctx = process_correction(
+                client=None, game=game, correction_text="## that was just a diagnostic", config=EngineConfig(strict_mode=True)
+            )
+        self.assertIn("diagnostic", narration.lower())
+        self.assertIsNone(director_ctx)
+        self.assertEqual(updated.current_location, "Warship Core")
+
+    def test_process_momentum_burn_uses_single_pass_rewrite_in_strict_mode(self):
+        game = GameState(
+            player_name="BRND",
+            character_concept="AI core",
+            current_location="Warship Core",
+            current_scene_context="Threats gather outside the hull.",
+            scene_count=2,
+        )
+        old_roll = RollResult(1, 2, 7, 8, "iron", 2, 5, "WEAK_HIT", "strike", False)
+        brain = {"move": "strike", "stat": "iron", "player_intent": "Fire the weapon", "position": "risky", "effect": "standard", "requires_roll": True}
+        pre_snapshot = {
+            "health": game.health, "spirit": game.spirit, "supply": game.supply,
+            "momentum": game.momentum, "max_momentum": game.max_momentum,
+            "chaos_factor": game.chaos_factor, "crisis_mode": game.crisis_mode,
+            "game_over": game.game_over, "epilogue_shown": game.epilogue_shown,
+            "epilogue_dismissed": game.epilogue_dismissed,
+            "current_location": game.current_location,
+            "current_scene_context": game.current_scene_context,
+            "time_of_day": game.time_of_day,
+            "location_history": list(game.location_history),
+            "director_guidance": game.director_guidance,
+            "npcs": [], "clocks": [], "scene_count": game.scene_count,
+            "scene_intensity_history": list(game.scene_intensity_history),
+        }
+        with patch("engine.call_single_pass_scene_rewrite", return_value={
+            "narration": "The upgraded strike lands cleanly and buys you breathing room.",
+            "scene_context": "The strike hits harder than expected.",
+            "location_update": None,
+            "time_update": None,
+            "memory_updates": [],
+            "new_npcs": [],
+            "established_facts": [],
+        }):
+            updated, narration = process_momentum_burn(
+                client=None, game=game, old_roll=old_roll, new_result="STRONG_HIT",
+                brain_data=brain, player_words="I fire the weapon.", config=EngineConfig(strict_mode=True),
+                pre_snapshot=pre_snapshot,
+            )
+        self.assertIn("upgraded strike", narration.lower())
+        self.assertEqual(updated.current_location, "Warship Core")
 
 
 if __name__ == "__main__":

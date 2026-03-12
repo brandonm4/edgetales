@@ -221,6 +221,152 @@ class ProxyIntegrationTests(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
 
+    def test_chatmock_backend_salvages_system_query_bullet_output(self):
+        _ChatMockHandler.requests = []
+        _ChatMockHandler.responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "<think>**Summarizing state facts with details**</think>\n- Ship systems are still coming online while internal repair drones keep patching damage.\n- External communications remain offline to reduce signature.\n- Passive sensors are steadier after repairs."
+                        }
+                    }
+                ]
+            }
+        ]
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _ChatMockHandler)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        upstream_port = upstream.server_address[1]
+        try:
+            backend = ChatMockBackend(ProxyConfig(
+                backend="chatmock",
+                upstream_base_url=f"http://127.0.0.1:{upstream_port}/v1",
+            ))
+            payload = {
+                "model": "claude-haiku-4-5-20251001",
+                "input": [{"role": "user", "content": "answer the system query"}],
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "system_query_resolution",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "answer_summary": {"type": "string"},
+                                "facts": {"type": "array", "items": {"type": "string"}},
+                                "resolved_from_profile": {"type": "boolean"},
+                                "established_facts": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "subject": {"type": "string"},
+                                            "category": {"type": "string"},
+                                            "value": {"type": "string"},
+                                            "confidence": {"type": "string"},
+                                            "source": {"type": "string"},
+                                            "scene_established": {"type": "integer"},
+                                        },
+                                        "required": ["subject", "category", "value", "confidence", "source", "scene_established"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                            },
+                            "required": ["answer_summary", "facts", "resolved_from_profile", "established_facts"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+            }
+            response = backend.create_response(payload)
+            data = json.loads(response["output_text"])
+            self.assertEqual(data["answer_summary"], "Ship systems are still coming online while internal repair drones keep patching damage.")
+            self.assertEqual(
+                data["facts"],
+                [
+                    "External communications remain offline to reduce signature.",
+                    "Passive sensors are steadier after repairs.",
+                ],
+            )
+            self.assertFalse(data["resolved_from_profile"])
+            self.assertEqual(data["established_facts"], [])
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_chatmock_backend_salvages_world_state_heading_bullets(self):
+        _ChatMockHandler.requests = []
+        _ChatMockHandler.responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "<think>**Summarizing structured state facts**</think>\n"
+                                "**Player State**\n"
+                                "- `Player condition`: health 5/5, spirit 5/5, supply 5/5, momentum 10/10.\n"
+                                "\n"
+                                "**Ship State**\n"
+                                "- `Ship location`: Warship Core; core repairs ongoing, capacitor reserve partially restored.\n"
+                                "- `Ship comms`: external receivers open, outbound tightbeam aimed at Veranda, awaiting Kesh reply.\n"
+                                "- `Signal trace`: ASHFALL source remains undetermined pending more telemetry."
+                            )
+                        }
+                    }
+                ]
+            }
+        ]
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), _ChatMockHandler)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        upstream_port = upstream.server_address[1]
+        try:
+            backend = ChatMockBackend(ProxyConfig(
+                backend="chatmock",
+                upstream_base_url=f"http://127.0.0.1:{upstream_port}/v1",
+            ))
+            payload = {
+                "model": "claude-haiku-4-5-20251001",
+                "input": [{"role": "user", "content": "answer the world state"}],
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "world_state_answer",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "answer_summary": {"type": "string"},
+                                "usable_power": {"type": "string", "enum": ["yes", "no", "uncertain"]},
+                                "targeting_possible": {"type": "string", "enum": ["yes", "no", "uncertain"]},
+                                "player_status": {"type": "string"},
+                                "ship_status": {"type": "string"},
+                                "facts": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["answer_summary", "usable_power", "targeting_possible", "player_status", "ship_status", "facts"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+            }
+            response = backend.create_response(payload)
+            data = json.loads(response["output_text"])
+            self.assertEqual(data["player_status"], "Player condition`: health 5/5, spirit 5/5, supply 5/5, momentum 10/10.")
+            self.assertEqual(data["ship_status"], "Ship location`: Warship Core; core repairs ongoing, capacitor reserve partially restored.")
+            self.assertEqual(
+                data["facts"],
+                [
+                    "Ship location`: Warship Core; core repairs ongoing, capacitor reserve partially restored.",
+                    "Ship comms`: external receivers open, outbound tightbeam aimed at Veranda, awaiting Kesh reply.",
+                    "Signal trace`: ASHFALL source remains undetermined pending more telemetry.",
+                ],
+            )
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

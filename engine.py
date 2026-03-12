@@ -620,6 +620,58 @@ STRICT_SCENE_RESOLUTION_SCHEMA = {
     "additionalProperties": False,
 }
 
+SINGLE_PASS_OUTCOME_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "narration": {"type": "string"},
+        "scene_context": {"type": "string"},
+        "location_update": {"type": ["string", "null"]},
+        "time_update": {"type": ["string", "null"]},
+        "memory_updates": copy.deepcopy(NARRATOR_METADATA_SCHEMA["properties"]["memory_updates"]),
+        "new_npcs": copy.deepcopy(NARRATOR_METADATA_SCHEMA["properties"]["new_npcs"]),
+        "established_facts": {"type": "array", "items": ESTABLISHED_FACT_SCHEMA},
+    },
+    "required": [
+        "narration",
+        "scene_context",
+        "location_update",
+        "time_update",
+        "memory_updates",
+        "new_npcs",
+        "established_facts",
+    ],
+    "additionalProperties": False,
+}
+
+SINGLE_PASS_TURN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "move": copy.deepcopy(BRAIN_OUTPUT_SCHEMA["properties"]["move"]),
+        "stat": copy.deepcopy(BRAIN_OUTPUT_SCHEMA["properties"]["stat"]),
+        "approach": {"type": "string"},
+        "target_npc": {"type": ["string", "null"]},
+        "dialog_only": {"type": "boolean"},
+        "requires_roll": {"type": "boolean"},
+        "player_intent": {"type": "string"},
+        "position": copy.deepcopy(BRAIN_OUTPUT_SCHEMA["properties"]["position"]),
+        "effect": copy.deepcopy(BRAIN_OUTPUT_SCHEMA["properties"]["effect"]),
+        "dramatic_question": {"type": "string"},
+        "location_change": {"type": ["string", "null"]},
+        "time_progression": copy.deepcopy(BRAIN_OUTPUT_SCHEMA["properties"]["time_progression"]),
+        "no_roll_resolution": copy.deepcopy(SINGLE_PASS_OUTCOME_SCHEMA),
+        "strong_hit_resolution": copy.deepcopy(SINGLE_PASS_OUTCOME_SCHEMA),
+        "weak_hit_resolution": copy.deepcopy(SINGLE_PASS_OUTCOME_SCHEMA),
+        "miss_resolution": copy.deepcopy(SINGLE_PASS_OUTCOME_SCHEMA),
+    },
+    "required": [
+        "move", "stat", "approach", "target_npc", "dialog_only", "requires_roll",
+        "player_intent", "position", "effect", "dramatic_question",
+        "location_change", "time_progression",
+        "no_roll_resolution", "strong_hit_resolution", "weak_hit_resolution", "miss_resolution",
+    ],
+    "additionalProperties": False,
+}
+
 # --- NPC name matching: title/honorific filter ---
 # Uses nameparser library (619 English titles) + German/French/Spanish/RPG additions.
 # Prevents false positive fuzzy matches like "Mrs. Chen" ↔ "Mrs. Kowalski".
@@ -2974,31 +3026,8 @@ def check_npc_agency(game: GameState) -> list[str]:
 # ===============================================================
 
 def _story_context_block(game: GameState) -> str:
-    """Build compact story direction block for prompts."""
-    if not game.story_blueprint or not game.story_blueprint.get("acts"):
-        return ""
-    act = get_current_act(game)
-    bp = game.story_blueprint
-    pending = get_pending_revelations(game)
-    rev_hint = ""
-    if pending:
-        rev_hint = f' revelation_ready="{pending[0]["content"][:80]}"'
-
-    ending_hint = ""
-    if bp.get("story_complete"):
-        endings = bp.get("possible_endings", [])
-        ending_hint = f'\n<story_ending>Story has EXCEEDED its planned arc (scene {game.scene_count}). Guide toward a satisfying conclusion in the next 1-2 scenes. Possible endings: {", ".join(e["type"] for e in endings)}. Let player actions determine which ending, but actively weave toward closure.</story_ending>'
-    elif act.get("approaching_end"):
-        endings = bp.get("possible_endings", [])
-        ending_hint = f'\n<story_ending>Story nearing conclusion. Possible endings: {", ".join(e["type"] for e in endings)}. Let player actions determine which.</story_ending>'
-
-    structure = bp.get("structure_type", "3act")
-    thematic = bp.get("thematic_thread", "")
-    thematic_attr = f' thematic_thread="{thematic}"' if thematic else ""
-    return f"""<story_arc structure="{structure}" act="{act['act_number']}/{act['total_acts']}" phase="{act['phase']}" progress="{act['progress']}" mood="{act.get('mood','')}"
- conflict="{bp.get('central_conflict','')}" act_goal="{act.get('goal','')}"{rev_hint}{thematic_attr}/>
-{ending_hint}
-"""
+    """Story-arc prompting is intentionally disabled."""
+    return ""
 
 
 
@@ -3112,7 +3141,6 @@ def call_brain(client: ModelGateway, game: GameState, player_message: str,
 - requires_roll = true only when the outcome is uncertain, risky, opposed, costly, or meaningfully consequential.
 - requires_roll = false for flavor actions, routine actions, low-stakes movement, automatic interactions, and harmless questions that should simply resolve in the fiction.
 - If the player is just speaking, inspecting, repositioning, testing something safe, or doing something that cannot meaningfully fail here, set requires_roll=false.
-- If <story_arc> is present, consider pacing: favor moves that advance the act goal
 - Assess POSITION based on fictional circumstances (not player skill):
   controlled = advantage/safety, risky = uncertain/standard, desperate = severe disadvantage/high stakes
 - Assess EFFECT based on potential impact:
@@ -3204,6 +3232,8 @@ def call_setup_brain(client: ModelGateway, creation_data: dict,
 - Do NOT put the player character's personal state, current damage, immediate tactical situation, or opening predicament into campaign_description.
 - character_description = WHO the character is in stable terms — identity, role, and enduring nature. 1 sentence. No backstory.
 - Do NOT put the opening predicament, temporary damage, current emergency, or first-scene tension into character_description.
+- starting_location = a short, stable place name only. It should describe WHERE the character is, not the condition of that place.
+- Do NOT put damage state, mood, repair progress, or temporary situation into starting_location. Those belong in opening_situation.
 - opening_situation = the temporary starting scenario, danger, or predicament at the beginning of play.
 - Do NOT put backstory details (past events, relationships, family) into character_description — the player's backstory is stored separately and will be provided to the narrator directly
 - Stats MUST total exactly {STAT_TARGET_SUM}, each 0-3, matched to archetype
@@ -3289,15 +3319,6 @@ def call_recap(client: ModelGateway, game: GameState,
         entry.get("narration", "")[:800]
         for entry in game.narration_history[-5:]
     )
-    # Story arc info: only act/phase, no central_conflict (that's director-level meta)
-    arc_info = ""
-    if game.story_blueprint and game.story_blueprint.get("acts"):
-        act = get_current_act(game)
-        structure = game.story_blueprint.get("structure_type", "3act")
-        arc_info = (f"\nstory_arc({structure}): "
-                    f"act={act['act_number']}/{act['total_acts']} "
-                    f"phase={act['phase']} progress={act['progress']}")
-
     campaign_info = ""
     if game.campaign_history:
         campaign_info = f"\ncampaign: chapter {game.chapter_number} of {len(game.campaign_history) + 1}"
@@ -3324,7 +3345,7 @@ def call_recap(client: ModelGateway, game: GameState,
                            f"genre:{game.setting_genre} tone:{game.setting_tone}\n"
                            f"world:{_campaign_world_text(game)}\n"
                            f"at:{game.current_location}\nlog:{log_text}\nnpcs:{npc_text}"
-                           f"{arc_info}{campaign_info}\nnow:{game.current_scene_context}\n"
+                           f"{campaign_info}\nnow:{game.current_scene_context}\n"
                            f"recent_scenes:\n{recent_narrations}"}],
             )
             return _response_text(response)
@@ -3743,7 +3764,6 @@ def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) 
 - 2-4 paragraphs
 - TEMPORAL CONSISTENCY: If <time> is provided, maintain that time period. Time only moves FORWARD (never backward). If you mention specific times, they must be later than any previously mentioned time. Do NOT invent specific clock times unless narratively important {E['dash']} prefer atmospheric time cues (moonlight, sunset glow, morning mist). CRITICAL: Each scene transition represents minutes to hours of in-world time, NOT days or years. Events from recent scenes just happened {E['dash']} signs don't weather, wounds are fresh, sent NPCs are still en route or just arrived. Never describe recent events or objects as aged, decayed, or long-past unless the player explicitly time-skips.
 - SPATIAL CONSISTENCY: The <location> tag shows where the player currently IS. If <prev_locations> is provided, the player has LEFT those places. NEVER place the player back at a previous location unless they explicitly travel there. If an NPC has a last_seen attribute showing a DIFFERENT location than the player's current <location>, that NPC is NOT physically present {E['dash']} they cannot be heard through walls, seen, or interact directly. They can only appear if they plausibly traveled to the player's location (and the narration should describe their arrival). NPCs without last_seen or with last_seen matching <location> ARE present and can interact normally.
-- If <story_arc> is present, steer scenes toward the act goal and mood
 - If revelation_ready is set, weave it into the scene naturally (through NPC dialog, discovered evidence, or environmental storytelling) {E['dash']} NEVER dump exposition
 - If <story_ending> is present, build toward a satisfying conclusion
 - If <director_guidance> is present, follow its narrative direction. It provides strategic story guidance — use it to inform the scene's direction, NPC behavior, and pacing, while maintaining your creative voice and atmospheric style.
@@ -3755,7 +3775,6 @@ def get_narrator_system(config: EngineConfig, game: Optional[GameState] = None) 
 - If <pacing> suggests "breather", shift to a quieter, reflective tone (campfire moment, quiet conversation, calm before the storm). Still advance the story, but lower intensity.
 - If <chaos_interrupt> is present, weave the specified disruption naturally into the scene. For type="dilemma", present the forced choice clearly so the player must decide next turn. For type="ticking_clock", establish the deadline or urgency so it shapes future actions. For type="positive_windfall", make it feel earned by the world, not a gift from nowhere.
 - If <dramatic_question> is present, the scene should address this question (resolve or deepen it)
-- If story_arc structure="kishotenketsu" and phase="ten_twist": focus on perspective SHIFT, not conflict escalation. Something seemingly unrelated recontextualizes everything.
 - PURE PROSE ONLY: Output ONLY narrative text. No JSON, no XML tags, no metadata, no code blocks, no markdown formatting (no *italics*, no **bold**, no # headings). Use typographic emphasis through word choice, sentence rhythm, and punctuation instead. Your entire response is visible to the player.
 </rules>
 <player_authorship>
@@ -4023,6 +4042,238 @@ def _normalize_strict_scene_resolution(data: dict) -> dict:
     return result
 
 
+def _normalize_single_pass_turn(data: dict) -> dict:
+    def _norm_resolution(value):
+        if not isinstance(value, dict):
+            value = {}
+        return _normalize_strict_scene_resolution(value)
+
+    return {
+        "move": data.get("move", "dialog") or "dialog",
+        "stat": data.get("stat", "none") or "none",
+        "approach": data.get("approach", "") or "",
+        "target_npc": data.get("target_npc"),
+        "dialog_only": bool(data.get("dialog_only", False)),
+        "requires_roll": bool(data.get("requires_roll", False)),
+        "player_intent": data.get("player_intent", "") or "",
+        "position": data.get("position", "risky") or "risky",
+        "effect": data.get("effect", "standard") or "standard",
+        "dramatic_question": data.get("dramatic_question", "") or "",
+        "location_change": data.get("location_change"),
+        "time_progression": data.get("time_progression", "none") or "none",
+        "no_roll_resolution": _norm_resolution(data.get("no_roll_resolution")),
+        "strong_hit_resolution": _norm_resolution(data.get("strong_hit_resolution")),
+        "weak_hit_resolution": _norm_resolution(data.get("weak_hit_resolution")),
+        "miss_resolution": _norm_resolution(data.get("miss_resolution")),
+    }
+
+
+def _npc_summary_for_single_pass(game: GameState) -> str:
+    active = []
+    background = []
+    for n in game.npcs:
+        line = f'- {n["name"]} (id:{n["id"]}) {n.get("disposition","neutral")} bond={n.get("bond",0)}/{n.get("bond_max",4)}'
+        if n.get("aliases"):
+            line += f' aliases:{",".join(n["aliases"])}'
+        if n.get("description"):
+            line += f' desc="{n["description"][:100]}"'
+        if n.get("status") == "active":
+            active.append(line)
+        elif n.get("status") == "background":
+            background.append(line)
+    summary = "\n".join(active) or "(none)"
+    if background:
+        summary += "\n(background known):\n" + "\n".join(background)
+    return summary
+
+
+def _resolution_mode_block() -> str:
+    return """<resolution_mode>
+- Decide the move, whether a roll is required, and the scene outcome in one response.
+- If requires_roll=false, fill no_roll_resolution and leave strong_hit_resolution, weak_hit_resolution, and miss_resolution as EMPTY outcomes with blank narration, blank scene_context, null updates, and empty arrays.
+- If requires_roll=true, fill all three roll outcome resolutions. Leave no_roll_resolution as an EMPTY outcome with blank narration, blank scene_context, null updates, and empty arrays.
+- Each resolution must contain only what becomes true in that branch. Do not blend branches together.
+- location_update must be a stable place name only, never a descriptive sentence about the place's condition.
+- Put all changing environmental state, repair progress, damage, pressure, or atmosphere into scene_context and narration, not into location_update.
+- If the player's turn includes both a physical/system action and quoted speech, do NOT collapse it into pure dialog. Resolve the action and include the spoken line within that action.
+- For dialog turns, do not let the response consist mostly of repeating what the player just said. After quoting the player's speech, spend most of the narration on the world's response, the recipient's reaction, or the concrete reason no immediate reply arrives.
+- Keep new_npcs rare. Prefer zero unless an arrival is clearly demanded by the fiction.
+- Keep narration concise, grounded, and player-facing.
+</resolution_mode>"""
+
+
+def call_single_pass_turn_resolution(client: ModelGateway, game: GameState, player_message: str,
+                                     config: Optional[EngineConfig] = None) -> dict:
+    _cfg = config or EngineConfig()
+    lang = get_narration_lang(_cfg)
+    npc_summary = _npc_summary_for_single_pass(game)
+    clock_summary = "\n".join(
+        f'- {c["name"]} ({c["clock_type"]}): {c["filled"]}/{c["segments"]}'
+        for c in game.clocks if c["filled"] < c["segments"]
+    ) or "(none)"
+    last_scenes = "\n".join(
+        f'Scene {s["scene"]}: {s.get("rich_summary") or s["summary"]}'
+        for s in game.session_log[-4:]
+    ) or "(start)"
+    relevant_facts = _relevant_established_facts(game, player_message)
+    facts_block = "\n".join(
+        f'- {f.get("subject")} | {f.get("category")} | {f.get("value")} | confidence={f.get("confidence")}'
+        for f in relevant_facts
+    ) or "(none)"
+
+    instructions = get_narrator_system(_cfg, game) + """
+<output_mode>
+- Return ONLY JSON matching the requested schema.
+- All narration fields are exact player-visible prose.
+- Do not include markdown fences, XML tags, or commentary outside JSON.
+</output_mode>"""
+
+    system = """<role>Single-pass RPG turn resolver.</role>
+""" + _kid_friendly_block(_cfg) + _content_boundaries_block(game) + """<rules>
+- Decide the move from the player's actual intent.
+- requires_roll = true only when the outcome is uncertain, risky, opposed, costly, or meaningfully consequential.
+- requires_roll = false for flavor actions, routine actions, safe checks, harmless questions, and actions that should simply resolve in the fiction.
+- dialog is ONLY for turns that are primarily speech with no meaningful system change, movement, or operational action attached.
+- If the player toggles systems, opens comms, moves, manipulates equipment, or changes the situation while speaking, choose a non-dialog move.
+- "quoted text" is spoken aloud.
+- |pipe text| is a system/OOC query and must not be treated as spoken dialog.
+- Preserve the player's actor, target, and purpose faithfully.
+- If the player asks a question, answer it plainly before flourish.
+- If health/spirit/supply are high, do not narrate the player as physically or emotionally collapsing.
+- Distinguish damage to the environment, ship, or situation from damage to the player.
+</rules>
+<moves>
+face_danger:edge|heart|iron|shadow|wits
+compel:heart|iron|shadow
+gather_information:wits
+secure_advantage:edge|heart|iron|shadow|wits
+clash:iron|edge
+strike:iron|edge
+endure_harm:iron
+endure_stress:heart
+make_connection:heart
+test_bond:heart
+resupply:wits
+world_shaping:wits|heart|shadow
+dialog:none
+</moves>
+""" + _resolution_mode_block()
+
+    prompt = f"""<campaign>{_campaign_world_text(game)}</campaign>
+<character>{_character_identity_text(game)}</character>
+<backstory>{getattr(game, 'backstory', '') or '(none)'}</backstory>
+<world_truths>{getattr(game, 'world_truths', '') or '(none)'}</world_truths>
+<state>
+loc:{game.current_location} | ctx:{game.current_scene_context}
+time:{game.time_of_day or 'unspecified'} | prev_locations:{', '.join(game.location_history[-3:]) or 'none'}
+{game.player_name} H{game.health} Sp{game.spirit} Su{game.supply} M{game.momentum}/{game.max_momentum} chaos:{game.chaos_factor} | E{game.edge} H{game.heart} I{game.iron} Sh{game.shadow} W{game.wits}
+</state>
+<npcs>
+{npc_summary}
+</npcs>
+<clocks>
+{clock_summary}
+</clocks>
+<established_facts>
+{facts_block}
+</established_facts>
+<recent_scenes>
+{last_scenes}
+</recent_scenes>
+{_brain_input_context(player_message)}
+Answer and resolve this turn in {lang}.
+"""
+
+    response = _api_create_with_retry(
+        client, max_retries=2,
+        model=NARRATOR_MODEL, max_output_tokens=3500,
+        instructions=instructions + "\n" + system,
+        input=[{"role": "user", "content": prompt}],
+        text=_json_schema_text_format("single_pass_turn", SINGLE_PASS_TURN_SCHEMA),
+    )
+    return _normalize_single_pass_turn(json.loads(_response_text(response)))
+
+
+def call_single_pass_scene_rewrite(client: ModelGateway, game: GameState, player_message: str,
+                                   brain: dict,
+                                   outcome_tag: str,
+                                   extra_guidance: str = "",
+                                   state_answer: Optional[dict] = None,
+                                   config: Optional[EngineConfig] = None) -> dict:
+    _cfg = config or EngineConfig()
+    lang = get_narration_lang(_cfg)
+    npc_summary = _npc_summary_for_single_pass(game)
+    clock_summary = "\n".join(
+        f'- {c["name"]} ({c["clock_type"]}): {c["filled"]}/{c["segments"]}'
+        for c in game.clocks if c["filled"] < c["segments"]
+    ) or "(none)"
+    relevant_facts = _relevant_established_facts(game, player_message)
+    facts_block = "\n".join(
+        f'- {f.get("subject")} | {f.get("category")} | {f.get("value")} | confidence={f.get("confidence")}'
+        for f in relevant_facts
+    ) or "(none)"
+    guidance_block = f"\n<extra_guidance>{extra_guidance}</extra_guidance>" if extra_guidance else ""
+    state_answer_block = ""
+    if state_answer:
+        facts = "\n".join(f"- {fact}" for fact in (state_answer.get("facts") or []))
+        state_answer_block = (
+            f"\n<state_answer>"
+            f"\nsummary:{state_answer.get('answer_summary', '')}"
+            f"\nfacts:\n{facts or '(none)'}"
+            f"\n</state_answer>"
+        )
+
+    instructions = get_narrator_system(_cfg, game) + """
+<output_mode>
+- Return ONLY JSON matching the requested schema.
+- The narration field is exact player-visible prose.
+- Do not include markdown fences, XML tags, or commentary outside JSON.
+</output_mode>"""
+
+    prompt = f"""<campaign>{_campaign_world_text(game)}</campaign>
+<character>{_character_identity_text(game)}</character>
+<backstory>{getattr(game, 'backstory', '') or '(none)'}</backstory>
+<world_truths>{getattr(game, 'world_truths', '') or '(none)'}</world_truths>
+<state>
+location:{game.current_location}
+scene_context:{game.current_scene_context}
+time:{game.time_of_day or 'unspecified'}
+{game.player_name} H{game.health} Sp{game.spirit} Su{game.supply} M{game.momentum}/{game.max_momentum} chaos:{game.chaos_factor}
+</state>
+<npcs>
+{npc_summary}
+</npcs>
+<clocks>
+{clock_summary}
+</clocks>
+<established_facts>
+{facts_block}
+</established_facts>
+{state_answer_block}
+<player_input>{player_message}</player_input>
+<resolved_move move="{brain.get('move','dialog')}" stat="{brain.get('stat','none')}" position="{brain.get('position','risky')}" effect="{brain.get('effect','standard')}" requires_roll="{str(bool(brain.get('requires_roll', False))).lower()}">
+intent:{brain.get('player_intent', player_message)}
+dramatic_question:{brain.get('dramatic_question', '')}
+target_npc:{brain.get('target_npc') or 'none'}
+</resolved_move>
+<outcome>{outcome_tag}</outcome>{guidance_block}
+Rewrite this scene outcome in {lang}.
+- Keep the move and outcome fixed.
+- Do not reinterpret the player's intent.
+- Keep location_update as a stable place label only if the character actually moved.
+- Put changing condition into scene_context and narration, not location_update.
+- Keep narration concise, grounded, and coherent.
+"""
+    response = _api_create_with_retry(
+        client, max_retries=2,
+        model=NARRATOR_MODEL, max_output_tokens=2200,
+        instructions=instructions,
+        input=[{"role": "user", "content": prompt}],
+        text=_json_schema_text_format("single_pass_scene_rewrite", SINGLE_PASS_OUTCOME_SCHEMA),
+    )
+    return _normalize_strict_scene_resolution(json.loads(_response_text(response)))
+
+
 def call_strict_scene_resolution(client: ModelGateway, game: GameState, prompt: str,
                                  brain: dict,
                                  state_answer: Optional[dict] = None,
@@ -4045,9 +4296,42 @@ def call_strict_scene_resolution(client: ModelGateway, game: GameState, prompt: 
 
 
 def _format_state_answer_text(answer: dict) -> str:
+    def _clean_fact_line(fact) -> str:
+        if isinstance(fact, dict):
+            value = fact.get("value")
+            if value in (None, ""):
+                return ""
+            category = str(fact.get("category") or "").strip().replace("_", " ")
+            if isinstance(value, bool):
+                rendered = "yes" if value else "no"
+            else:
+                rendered = str(value).strip()
+            if not category:
+                return rendered
+            label = category[:1].upper() + category[1:]
+            return f"{label}: {rendered}"
+        text = str(fact or "").strip()
+        if not text:
+            return ""
+        if "|" in text:
+            parts = [part.strip() for part in text.split("|")]
+            if len(parts) >= 3:
+                value = parts[2]
+                confidence = ""
+                for part in parts[3:]:
+                    if part.lower().startswith("confidence="):
+                        confidence = part.split("=", 1)[1].strip()
+                        break
+                if confidence:
+                    return f"{value} ({confidence} confidence)"
+                return value
+        return text
+
     summary = (answer.get("answer_summary") or "").strip()
-    facts = [f.strip() for f in (answer.get("facts") or []) if str(f).strip()]
+    facts = [_clean_fact_line(f) for f in (answer.get("facts") or []) if _clean_fact_line(f)]
     lines = [summary] if summary else []
+    if summary:
+        return "\n".join(lines).strip() or "(No clear system information is available.)"
     lines.extend(f"- {fact}" for fact in facts)
     return "\n".join(lines).strip() or "(No clear system information is available.)"
 
@@ -4133,6 +4417,8 @@ emotional_weight must be ONE of: neutral, curious, wary, angry, grateful, suspic
 disposition must be ONE of: neutral, friendly, distrustful, hostile, loyal.
 time_update must be ONE of: early_morning, morning, midday, afternoon, evening, late_evening, night, deep_night — or null if no time change.
 location_update: new location name if the character MOVED, null if they stayed.
+location_update must be a short, stable place label only (for example "Warship Core", "Docking Ring", "Bridge").
+Do NOT include condition, atmosphere, repair state, or temporary situation in location_update. Put changing state into scene_context instead.
 npc_renames: only for identity REVEALS (spy unmasked, alias discovered). NOT for surname additions.
 npc_details: for newly established facts (surname, role change). full_name if name extended, description if role/situation changed.
 new_npcs: ONLY for characters who are PHYSICALLY PRESENT in the scene AND actively interacting (speaking, acting, reacting). They must NOT already be in the known NPC list. NEVER include the player character. NEVER include:
@@ -4230,6 +4516,15 @@ def _run_scene_narration(client: ModelGateway, game: GameState, prompt: str,
     raw = call_narrator(client, prompt, game, _cfg)
     narration = parse_narrator_response(game, raw)
     metadata = call_narrator_metadata(client, narration, game, _cfg)
+    _apply_narrator_metadata(game, metadata, scene_present_ids=scene_present_ids)
+    return narration, metadata
+
+
+def _apply_single_pass_resolution(game: GameState, resolution: dict, scene_present_ids: set) -> tuple[str, dict]:
+    narration = parse_narrator_response(game, resolution.get("narration", ""))
+    metadata = _sanitize_metadata_for_strict_mode(game, resolution)
+    if metadata.get("established_facts"):
+        _upsert_established_facts(game, metadata["established_facts"])
     _apply_narrator_metadata(game, metadata, scene_present_ids=scene_present_ids)
     return narration, metadata
 
@@ -4511,33 +4806,6 @@ def build_director_prompt(game: GameState, latest_narration: str,
     reflection_section = "\n".join(reflection_blocks)
 
     # Story arc info
-    story_info = ""
-    transition_trigger = ""
-    if game.story_blueprint and game.story_blueprint.get("acts"):
-        act = get_current_act(game)
-        bp = game.story_blueprint
-        transition_trigger = act.get("transition_trigger", "")
-        thematic = bp.get("thematic_thread", "")
-        scene_range = act.get("scene_range", [1, 20])
-        past_range = game.scene_count > scene_range[1]
-        past_range_attr = ' PAST_RANGE="true"' if past_range else ""
-        story_info = (
-            f'\n<story_arc structure="{bp.get("structure_type", "3act")}" '
-            f'act="{act["act_number"]}/{act["total_acts"]}" phase="{act["phase"]}" '
-            f'progress="{act["progress"]}" '
-            f'current_scene="{game.scene_count}" scene_range="{scene_range[0]}-{scene_range[1]}"'
-            f'{past_range_attr} '
-            f'conflict="{bp.get("central_conflict", "")}"'
-        )
-        if thematic:
-            story_info += f' thematic_thread="{thematic}"'
-        story_info += '/>'
-        if transition_trigger:
-            story_info += (
-                f'\n<transition_trigger act="{act["act_number"]}">'
-                f'{transition_trigger}</transition_trigger>'
-            )
-
     # Active NPC overview (include descriptions and aliases so Director stays consistent)
     def _director_npc_line(n):
         aka = f' aka {", ".join(n["aliases"])}' if n.get("aliases") else ""
@@ -4561,7 +4829,6 @@ def build_director_prompt(game: GameState, latest_narration: str,
 <npcs>
 {npc_overview}
 </npcs>
-{story_info}
 {reflection_section}
 
 <task>
@@ -4582,11 +4849,8 @@ Field instructions:
   - about_npc: If this reflection is primarily about the NPC's feelings toward ANOTHER NPC (not the player), set to that NPC's npc_id. Example: Sophie reflects on her growing attraction to Bruce → about_npc="npc_2". null if the reflection is about the player or general.
   - agenda: NPC's hidden goal (max 8 words, only if needs_profile="true"), null otherwise
   - instinct: NPC's default behavior pattern (max 8 words, only if needs_profile="true"), null otherwise
-- arc_notes: Brief story arc progress observation
-- act_transition: Evaluate whether the current act's <transition_trigger> has been fulfilled by recent events. Set to true if:
-  (a) the narrative condition described in the trigger has clearly been met, OR
-  (b) the story has moved PAST the act's scene_range (PAST_RANGE="true") and the trigger's spirit has been approximately met.
-  Set to false only if the trigger condition is clearly unmet AND we are still within scene_range. The scene_range is a fallback — content-driven transitions via this flag produce better pacing.
+- arc_notes: Brief note on how the scene changes the broader situation
+- act_transition: always false
 
 If a <reflect> tag has a last_reflection attribute, write a NEW insight that builds on, deepens, or contradicts it. Do NOT repeat the same theme or emotional tone. If last_tone is present, evolve the emotion — show how the NPC's feelings have shifted, intensified, or transformed since then.
 </task>"""
@@ -6550,6 +6814,125 @@ def process_turn(client: ModelGateway, game: GameState,
     game.last_turn_snapshot = _build_turn_snapshot(game)
     game.last_turn_snapshot["player_input"] = player_message
 
+    _cfg = config or EngineConfig()
+    if _cfg.strict_mode:
+        try:
+            brain = call_brain(client, game, player_message, _cfg)
+            game.last_turn_snapshot["brain"] = dict(brain)
+            if progress_callback:
+                progress_callback("resolve")
+
+            tid = brain.get("target_npc")
+            if tid:
+                target = _find_npc(game, tid)
+                if target and target.get("status") == "background":
+                    _reactivate_npc(target, reason=f"targeted by player in scene {game.scene_count + 1}")
+
+            _apply_brain_location_time(game, brain)
+            activated_npcs, mentioned_npcs, npc_activation_debug = activate_npcs_for_prompt(game, brain, player_message)
+            _scene_present_ids = {n["id"] for n in activated_npcs}
+            pending_revs = get_pending_revelations(game)
+            chaos_interrupt = check_chaos_interrupt(game)
+            state_answer = _maybe_call_state_answer(client, game, brain, player_message, _cfg)
+
+            if brain.get("dialog_only") or brain.get("move") == "dialog" or not brain.get("requires_roll", True):
+                game.scene_count += 1
+                if progress_callback:
+                    progress_callback("narrate")
+                outcome_tag = "dialog" if brain.get("dialog_only") or brain.get("move") == "dialog" else "no_roll"
+                resolution = call_single_pass_scene_rewrite(
+                    client, game, player_message, brain, outcome_tag,
+                    state_answer=state_answer, config=_cfg,
+                )
+                narration, metadata = _apply_single_pass_resolution(game, resolution, _scene_present_ids)
+                if game.last_turn_snapshot is not None:
+                    game.last_turn_snapshot["narration"] = narration
+                if progress_callback:
+                    progress_callback("metadata")
+                if pending_revs:
+                    mark_revelation_used(game, pending_revs[0]["id"])
+                scene_type = "interrupt" if chaos_interrupt else "breather"
+                record_scene_intensity(game, scene_type)
+                prompt_summary = f"{'Dialog' if brain.get('dialog_only') or brain.get('move') == 'dialog' else 'No-roll'}: {brain.get('player_intent', player_message)[:80]}"
+                result_tag = outcome_tag
+                game.narration_history.append({
+                    "prompt_summary": prompt_summary,
+                    "narration": narration[:MAX_NARRATION_CHARS],
+                })
+                if len(game.narration_history) > MAX_NARRATION_HISTORY:
+                    game.narration_history = game.narration_history[-MAX_NARRATION_HISTORY:]
+                game.session_log.append({"scene": game.scene_count,
+                                         "summary": brain.get("player_intent", player_message),
+                                         "move": brain.get("move", "dialog"),
+                                         "result": result_tag, "consequences": [], "clock_events": [],
+                                         "dramatic_question": brain.get("dramatic_question", ""),
+                                         "chaos_interrupt": chaos_interrupt,
+                                         "npc_activation": npc_activation_debug})
+                if len(game.session_log) > MAX_SESSION_LOG:
+                    game.session_log = game.session_log[-MAX_SESSION_LOG:]
+                _check_story_completion(game)
+                return game, narration, None, None, None
+
+            game.scene_count += 1
+            stat_name = brain.get("stat", "wits")
+            roll = roll_action(stat_name, game.get_stat(stat_name), brain.get("move", "face_danger"))
+            if roll.match:
+                log(f"[Turn] MATCH! Both challenge dice show {roll.c1} — {roll.result}")
+            if game.last_turn_snapshot is not None:
+                game.last_turn_snapshot["roll"] = roll
+            burn_info = None
+            if roll.result in ("MISS", "WEAK_HIT") and game.momentum > 0:
+                potential_burn = can_burn_momentum(game, roll)
+                if potential_burn:
+                    burn_info = {
+                        "roll": roll,
+                        "new_result": potential_burn,
+                        "cost": game.momentum,
+                        "brain": dict(brain),
+                        "player_words": player_message,
+                        "chaos_interrupt": chaos_interrupt,
+                        "pre_snapshot": game.last_turn_snapshot,
+                    }
+            consequences, clock_events = apply_consequences(game, roll, brain)
+            if progress_callback:
+                progress_callback("narrate")
+            resolution = call_single_pass_scene_rewrite(
+                client, game, player_message, brain, roll.result,
+                state_answer=state_answer, config=_cfg,
+            )
+            narration, metadata = _apply_single_pass_resolution(game, resolution, _scene_present_ids)
+            if game.last_turn_snapshot is not None:
+                game.last_turn_snapshot["narration"] = narration
+            if progress_callback:
+                progress_callback("metadata")
+            update_chaos_factor(game, roll.result)
+            scene_type = "interrupt" if chaos_interrupt else "action"
+            record_scene_intensity(game, scene_type)
+            if pending_revs:
+                mark_revelation_used(game, pending_revs[0]["id"])
+            game.narration_history.append({
+                "prompt_summary": f"Action ({roll.result}): {brain.get('player_intent', player_message)[:80]}",
+                "narration": narration[:MAX_NARRATION_CHARS],
+            })
+            if len(game.narration_history) > MAX_NARRATION_HISTORY:
+                game.narration_history = game.narration_history[-MAX_NARRATION_HISTORY:]
+            game.session_log.append({"scene": game.scene_count,
+                                     "summary": brain.get("player_intent", player_message),
+                                     "move": brain.get("move", "face_danger"),
+                                     "result": roll.result, "consequences": consequences,
+                                     "clock_events": clock_events,
+                                     "position": brain.get("position", "risky"),
+                                     "effect": brain.get("effect", "standard"),
+                                     "dramatic_question": brain.get("dramatic_question", ""),
+                                     "chaos_interrupt": chaos_interrupt,
+                                     "npc_activation": npc_activation_debug})
+            if len(game.session_log) > MAX_SESSION_LOG:
+                game.session_log = game.session_log[-MAX_SESSION_LOG:]
+            _check_story_completion(game)
+            return game, narration, roll, burn_info, None
+        except Exception as e:
+            log(f"[Turn] Single-pass strict path failed, falling back ({type(e).__name__}: {e})", level="warning")
+
     brain = call_brain(client, game, player_message, config)
     game.last_turn_snapshot["brain"] = dict(brain)
     if progress_callback:
@@ -6777,15 +7160,9 @@ def _try_call_director(client: ModelGateway, game: GameState,
 
 
 def _check_story_completion(game: GameState):
-    """Check if the story has reached its natural end point."""
-    if not game.story_blueprint or not game.story_blueprint.get("acts"):
-        return
-    acts = game.story_blueprint["acts"]
-    final_act = acts[-1]
-    final_end = final_act.get("scene_range", [14, 20])[1]
-    # If past the final scene range, signal story complete
-    if game.scene_count >= final_end:
-        game.story_blueprint["story_complete"] = True
+    """Story-completion gating is disabled; play continues until the player stops."""
+    if game.story_blueprint:
+        game.story_blueprint["story_complete"] = False
 
 
 
@@ -7109,6 +7486,21 @@ def process_correction(client: ModelGateway, game: GameState,
 
     _cfg = config or EngineConfig()
 
+    def _single_pass_correction_rewrite(_player_input: str, _brain: dict, _roll: Optional[RollResult]):
+        if _roll:
+            outcome_tag = _roll.result
+        elif _brain.get("dialog_only") or _brain.get("move") == "dialog":
+            outcome_tag = "dialog"
+        else:
+            outcome_tag = "no_roll"
+        rewritten = call_single_pass_scene_rewrite(
+            client, game, _player_input, _brain, outcome_tag,
+            extra_guidance=analysis["narrator_guidance"],
+            config=_cfg,
+        )
+        _scene_present_ids = {n["id"] for n in activated_npcs}
+        return _apply_single_pass_resolution(game, rewritten, _scene_present_ids)
+
     # Step 1: Analyse the correction
     if progress_callback:
         progress_callback("brain")
@@ -7189,20 +7581,25 @@ def process_correction(client: ModelGateway, game: GameState,
                                                      activated_npcs=activated_npcs,
                                                      mentioned_npcs=mentioned_npcs, config=_cfg)
 
-    # Step 3: Narrator rewrite — inject correction context
-    correction_tag = (
-        f"\n<correction_context>{analysis['narrator_guidance']}</correction_context>"
-        f"\n<correction_instruction>Rewrite the scene incorporating the correction above. "
-        f"Same events and outcome — only adjust what the correction requires.</correction_instruction>"
-    )
-    prompt = prompt + correction_tag
-
-    _scene_present_ids = {n["id"] for n in activated_npcs}
     if progress_callback:
         progress_callback("narrate")
-    narration, metadata = _run_scene_narration(
-        client, game, prompt, brain, state_answer, _scene_present_ids, _cfg
-    )
+    if _cfg.strict_mode:
+        narration, metadata = _single_pass_correction_rewrite(
+            corrected_input if source == "input_misread" else snap.get("player_input", ""),
+            brain, roll,
+        )
+    else:
+        # Step 3: Narrator rewrite — inject correction context
+        correction_tag = (
+            f"\n<correction_context>{analysis['narrator_guidance']}</correction_context>"
+            f"\n<correction_instruction>Rewrite the scene incorporating the correction above. "
+            f"Same events and outcome — only adjust what the correction requires.</correction_instruction>"
+        )
+        prompt = prompt + correction_tag
+        _scene_present_ids = {n["id"] for n in activated_npcs}
+        narration, metadata = _run_scene_narration(
+            client, game, prompt, brain, state_answer, _scene_present_ids, _cfg
+        )
 
     # Update snapshot with rewritten narration so a follow-up ## works correctly
     if game.last_turn_snapshot is not None:
@@ -7394,9 +7791,18 @@ def process_momentum_burn(client: ModelGateway, game: GameState,
                                 config=config)
     prompt = prompt.replace('<task>', '<momentum_burn>Character digs deep, turns the tide.</momentum_burn>\n<task>')
     _scene_present_ids = {n["id"] for n in activated_npcs}
-    narration, metadata = _run_scene_narration(
-        client, game, prompt, brain_data, state_answer, _scene_present_ids, config
-    )
+    _cfg = config or EngineConfig()
+    if _cfg.strict_mode:
+        rewritten = call_single_pass_scene_rewrite(
+            client, game, player_words, brain_data, new_result,
+            extra_guidance="Momentum burn upgraded the outcome. Keep the same action and scene, but rewrite it to reflect the improved result.",
+            config=_cfg,
+        )
+        narration, metadata = _apply_single_pass_resolution(game, rewritten, _scene_present_ids)
+    else:
+        narration, metadata = _run_scene_narration(
+            client, game, prompt, brain_data, state_answer, _scene_present_ids, config
+        )
 
     # Update chaos after burn (new result counts)
     update_chaos_factor(game, new_result)

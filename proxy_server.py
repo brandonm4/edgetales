@@ -114,6 +114,99 @@ def _extract_json_text(text: str) -> str:
     return text.strip()
 
 
+def _schema_required_names(schema: dict) -> set[str]:
+    required = schema.get("required")
+    if isinstance(required, list):
+        return {name for name in required if isinstance(name, str)}
+    return set()
+
+
+def _coerce_text_to_schema(text: str, schema: Optional[dict]):
+    if not isinstance(schema, dict):
+        return None
+    cleaned = _extract_json_text(text)
+    if not cleaned:
+        return None
+
+    def _normalized_lines(raw_text: str) -> list[str]:
+        lines = []
+        for raw_line in raw_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            line = re.sub(r"^[-*]\s*", "", line)
+            line = re.sub(r"^#+\s*", "", line)
+            line = line.strip()
+            if not line:
+                continue
+            markdown_label = re.fullmatch(r"[*_`~#\s]*(?:state facts|status|player state|ship state|facts)[*_`~#\s:]*", line, re.IGNORECASE)
+            if markdown_label:
+                continue
+            line = re.sub(r"^[*_`~]+", "", line)
+            line = re.sub(r"[*_`~]+$", "", line)
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                lines.append(line)
+        return lines
+
+    required = _schema_required_names(schema)
+    if required == {"answer_summary", "facts", "resolved_from_profile", "established_facts"}:
+        lines = _normalized_lines(cleaned)
+        if not lines:
+            return None
+        summary = lines[0]
+        facts = lines[1:] if len(lines) > 1 else []
+        return {
+            "answer_summary": summary,
+            "facts": facts,
+            "resolved_from_profile": False,
+            "established_facts": [],
+        }
+    if required == {"answer_summary", "usable_power", "targeting_possible", "player_status", "ship_status", "facts"}:
+        lines = _normalized_lines(cleaned)
+        if not lines:
+            return None
+        summary = lines[0]
+        facts = lines[1:] if len(lines) > 1 else []
+
+        lowered = cleaned.lower()
+        usable_power = "uncertain"
+        if re.search(r"\b(no|none|offline|dead|unpowered)\b", lowered):
+            usable_power = "no"
+        elif re.search(r"\b(yes|available|online|powered|restored)\b", lowered):
+            usable_power = "yes"
+
+        targeting_possible = "uncertain"
+        if re.search(r"\b(cannot target|unable to target|not possible|no targeting)\b", lowered):
+            targeting_possible = "no"
+        elif re.search(r"\b(can target|targeting possible|aim|lock|aligned)\b", lowered):
+            targeting_possible = "yes"
+
+        player_status = ""
+        ship_status = ""
+        for fact in [summary] + facts:
+            fact_lower = fact.lower()
+            if not player_status and re.search(r"\b(player|self|brnd|health|spirit|supply|momentum)\b", fact_lower):
+                player_status = fact
+                continue
+            if not ship_status and re.search(r"\b(ship|core|repairs|systems|comms|sensors|ashfall|drone)\b", fact_lower):
+                ship_status = fact
+        if not player_status:
+            player_status = "Current player condition is not clearly changed."
+        if not ship_status:
+            ship_status = summary
+
+        return {
+            "answer_summary": summary,
+            "usable_power": usable_power,
+            "targeting_possible": targeting_possible,
+            "player_status": player_status,
+            "ship_status": ship_status,
+            "facts": facts,
+        }
+    return None
+
+
 def _schema_types(schema: dict) -> list[str]:
     schema_type = schema.get("type")
     if isinstance(schema_type, list):
@@ -405,7 +498,12 @@ class ChatMockBackend(ProxyBackend):
             last_content = content
             try:
                 json_text = _extract_chatmock_schema_result(data)
-                parsed = json.loads(json_text)
+                try:
+                    parsed = json.loads(json_text)
+                except json.JSONDecodeError:
+                    parsed = _coerce_text_to_schema(content, schema)
+                    if parsed is None:
+                        raise
                 pruned = _prune_to_schema(parsed, schema)
                 if pruned != parsed:
                     dropped = sorted(set(parsed.keys()) - set(pruned.keys())) if isinstance(parsed, dict) and isinstance(pruned, dict) else []

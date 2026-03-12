@@ -13,6 +13,185 @@
 
 EdgeTales is a self-hosted, AI-driven solo tabletop RPG engine. Type what your character does - the engine parses your intent, rolls the dice, and an AI narrator responds with atmospheric prose. Use voice input and text-to-speech, and run it on your home server, Raspberry Pi, or laptop.
 
+This repository was forked from [edgetales/edgetales](https://github.com/edgetales/edgetales). If you want the original baseline project and its upstream history, use that repository as the reference point. This README focuses on how this fork now differs conceptually.
+
+## 🔀 Fork Context
+
+Upstream project:
+- [edgetales/edgetales](https://github.com/edgetales/edgetales)
+
+This fork has moved away from the original "Claude-first solo RPG app" assumption. The main work here has been making the engine function with a local OpenAI-compatible proxy backed by ChatMock, while also reshaping the narrative pipeline so mechanics stay authoritative and narration behaves more like a grounded ChatGPT-style storyteller.
+
+## 🛠️ What Changed In This Fork
+
+The original project assumed a more direct Claude-oriented model stack and a heavier multi-agent interpretation pipeline. Conceptually, this fork has changed several major things.
+
+### 1. Model access is now provider-agnostic
+
+The repo no longer assumes one direct vendor path. It now supports:
+- direct OpenAI-compatible endpoints
+- a bundled local proxy
+- side-by-side ChatMock usage
+
+That means the app can target a local bridge that speaks an OpenAI-style API instead of requiring the original upstream model setup. The project is now oriented around "OpenAI-compatible responses" as the transport boundary rather than one hardwired provider integration.
+
+### 2. Local ChatMock support is a first-class integration target
+
+The biggest practical goal of this fork has been: make EdgeTales run against a local ChatMock server authenticated through a ChatGPT/Codex-style login flow, rather than a normal paid API key workflow.
+
+Conceptually, that required:
+- treating ChatMock as a real backend, not just a mock server
+- translating EdgeTales requests into ChatMock-compatible chat completion calls
+- making local, empty-key usage viable in the app config
+
+This is why the repo now has a much stronger "local bridge" identity than upstream.
+
+### 3. The proxy is no longer just a passthrough
+
+The local proxy grew into an adaptation layer, not just a tunnel.
+
+It now exists to:
+- expose an OpenAI-compatible `/v1/responses` surface to the app
+- translate that into ChatMock `/chat/completions`
+- enforce JSON structure
+- prune harmless extra fields
+- retry malformed structured outputs
+- salvage partially formatted responses when ChatMock answers in bullets or prose instead of strict JSON
+
+This was necessary because ChatMock is good enough to be useful, but not obedient enough to trust without guardrails.
+
+### 4. The app can now run the proxy in-process
+
+Instead of forcing a separate proxy terminal, `app.py` can now start the local proxy itself. That reduces operational friction and makes the app feel more like one self-contained service:
+
+- ChatMock runs separately
+- EdgeTales app + proxy run together
+
+This was a practical usability change, but it also changed the repo's architecture: the UI app now owns a small piece of backend supervision.
+
+### 5. Logging and failure attribution were overhauled
+
+One of the biggest problems in the original flow was ambiguity: when something failed, it was hard to tell whether the issue came from the app, the engine, the proxy, or ChatMock.
+
+This fork added much more explicit logging so we can now distinguish:
+- app-side failures
+- proxy request ids
+- schema validation failures
+- upstream ChatMock issues
+- retry and salvage behavior
+
+That made the system debuggable enough to keep iterating on it.
+
+### 6. Setup and story identity were split more cleanly
+
+The upstream setup model mixed too many ideas together. In practice that caused the opening predicament to bleed into every later prompt. This fork separated those concepts more intentionally:
+
+- `campaign_description`: the broad world and campaign premise
+- `character_description`: the stable identity of the player character
+- `opening_situation`: the starting scenario or immediate predicament
+
+That split matters because a starting crisis should not become a permanent character identity, and a setting premise should not constantly restate the opening scene.
+
+### 7. World canon and prose style are becoming save-level author controls
+
+This fork added the idea that not all prompt constraints belong in code. Some belong in the save itself.
+
+Two conceptual buckets now matter:
+- `world_truths`: hard universe/canon rules
+- save-level narration/style guidance: prose constraints specific to this campaign
+
+That shift is important. It means campaign-specific voice constraints like "do not use melodramatic language" belong to the save, not to a global engine hardcode.
+
+### 8. "Facts" became a real persistent layer
+
+The original engine leaned heavily on prose and metadata reinterpretation. This fork introduced a more durable `established_facts` concept so information can be:
+- inferred from story context when first needed
+- stored after being established
+- reused consistently later
+
+This is especially important for system/state questions. Instead of re-guessing every time, the engine can now:
+1. check what is already known
+2. infer minimally if needed
+3. persist that answer as an established fact
+
+That is a better fit for narrative play than trying to hardcode every possible subsystem up front.
+
+### 9. System queries are being separated from scene advancement
+
+The fork now treats pure `|system query|` style input differently from normal action turns.
+
+Conceptually, that means:
+- not every player input should trigger a roll
+- not every player input should advance the story
+- some inputs are just requests for factual clarification
+
+That distinction matters a lot. A diagnostic question or status check should not automatically become a new dramatic beat.
+
+### 10. State coherence is being enforced more explicitly
+
+Several fixes in this fork were about separating stable state from descriptive flourish:
+- location should be a stable place label, not a whole atmospheric sentence
+- scene context should carry changing local conditions
+- character identity should not silently absorb temporary damage states
+- durable outcomes should become facts, not just pretty prose
+
+That has been one of the main themes of the fork: push more truth into structured state, and reduce how much the narration is allowed to improvise reality.
+
+### 11. The old story-arc steering was deliberately reduced
+
+The original project had stronger built-in act/arc guidance and completion logic. In practice, that became intrusive and often too literal for this fork's current backend.
+
+So this fork deliberately reduced or removed:
+- visible act tracking in the sidebar
+- act-based prompt steering
+- end-of-story "wrap it up?" nudging
+
+The goal was to stop the engine from imposing a too-obvious dramatic template on play.
+
+### 12. The biggest architectural shift: mechanics-first, narration-second
+
+This is the most important conceptual change in the repo.
+
+The old architecture leaned more heavily on layered AI interpretation:
+- a brain step
+- a narrator step
+- metadata extraction
+- a director step
+
+That can work with a very obedient model, but with ChatMock it often drifted into weird, overly stylized, or mechanically inconsistent prose.
+
+So this fork has been moving toward a stricter split:
+- the engine decides mechanics, rolls, and durable state changes
+- the narrator receives the resolved outcome
+- the narrator's job is to express that outcome well, not decide it
+
+That is the design goal now:
+- ChatGPT-style prose
+- engine-owned fairness and uncertainty
+- persistent save-state continuity
+
+### 13. Save editing and turn control are stronger than upstream
+
+This fork also added more practical "repair the story without losing the campaign" tooling:
+- per-message edit/delete/redo controls
+- rewind checkpoints
+- correction flow improvements
+- save file cleanup and migration for newer concepts like facts and separated setup fields
+
+That work reflects a different philosophy from upstream: AI output will be imperfect, so the user needs strong tools to fix and continue rather than restart.
+
+### 14. The project is now much more experimental than upstream
+
+The fork is no longer just a minor customization of the original app. It has become an active experiment in a different balance:
+- less provider lock-in
+- more local/self-hosted model routing
+- more save-level author control
+- more stateful canon
+- less multi-layer AI improvisation
+- more mechanics-authoritative narration
+
+In other words, upstream is still the original solo RPG engine. This fork is increasingly a variant of EdgeTales tuned for local proxy use, ChatMock compatibility, and tighter control over how narrative prose relates to game state.
+
 ---
 
 ## 🧭 Who is this for?

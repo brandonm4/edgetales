@@ -132,7 +132,7 @@ from engine import (
     save_game, load_game, list_saves, list_saves_with_info, delete_save, export_story_pdf,
     save_chapter_archive, load_chapter_archive, list_chapter_archives, delete_chapter_archives,
     capture_turn_checkpoint, restore_game_state,
-    get_current_act, setup_file_logging,
+    setup_file_logging,
     call_setup_brain, start_new_game, start_new_chapter,
     process_turn, process_momentum_burn, process_correction, call_recap,
     run_deferred_director, generate_epilogue,
@@ -142,7 +142,7 @@ from i18n import (
     get_stat_labels, get_move_labels, get_result_labels,
     get_disposition_labels, get_position_labels, get_effect_labels,
     get_time_labels, get_dice_display_options, get_no_voice_sample_label,
-    get_whisper_models, get_story_phase_labels,
+    get_whisper_models,
     get_genres, get_tones, get_archetypes,
     get_genre_label, get_tone_label, get_archetype_label,
     translate_consequence,
@@ -494,8 +494,18 @@ def _saved_message_count(messages: list, upto: Optional[int] = None) -> int:
 def _seed_initial_checkpoint_if_missing(game: Optional[GameState], messages: list) -> None:
     if not game or getattr(game, "turn_checkpoints", None):
         return
-    if game.scene_count <= 1 and messages:
+    if messages:
         capture_turn_checkpoint(game, messages)
+
+
+def _ensure_rewind_checkpoint(game: Optional[GameState], messages: list) -> None:
+    if not game:
+        return
+    current_count = _saved_message_count(messages)
+    checkpoints = getattr(game, "turn_checkpoints", None) or []
+    if any(cp.get("message_count", -1) == current_count for cp in checkpoints):
+        return
+    capture_turn_checkpoint(game, messages)
 
 
 def _restore_to_message_boundary(game: GameState, messages: list, keep_upto: int) -> bool:
@@ -635,7 +645,7 @@ async def _redo_message_from(index: int, session: Optional[dict] = None) -> None
     s["message_edit_value"] = ""
     if s.get("_sidebar_refresh"):
         s["_sidebar_refresh"](game)
-    _refresh_chat_view()
+    _refresh_chat_view(s)
     await process_player_input(
         messages[user_index].get("content", ""),
         s.get("_chat_container"),
@@ -1138,29 +1148,6 @@ def render_sidebar_status(game: GameState, session=None) -> None:
             p = _c_filled / _c_segs * 100
             ui.label(f"{em} {c['name']}: {_c_filled}/{_c_segs}").classes("text-xs")
             ui.html(f'<div class="track-bar" aria-hidden="true"><div class="track-fill progress" style="width:{p:.0f}%"></div></div>').classes("w-full")
-    # Story arc
-    if game.story_blueprint and game.story_blueprint.get("acts"):
-        bp = game.story_blueprint
-        act = get_current_act(game)
-        st_type = bp.get("structure_type","3act")
-        ui.separator()
-        si = E['cherry'] if st_type=="kishotenketsu" else E['book']
-        sl_arc = "Kish\u014dtenketsu" if st_type=="kishotenketsu" else t("sidebar.3act", lang)
-        ch_l = f" {E['dash']} {t('sidebar.chapter', lang)} {game.chapter_number}" if game.chapter_number > 1 else ""
-        ui.label(f"{si} {sl_arc}{ch_l}").classes("text-sm font-semibold")
-        act_l = t("sidebar.act", lang)
-        pl = get_story_phase_labels(lang)
-        for i,a in enumerate(bp["acts"]):
-            an = i+1; sr = a.get("scene_range",[1,20]); phase = pl.get(a["phase"],a["phase"])
-            if an < act["act_number"]: ui.label(f"{act_l} {an} {E['check']}").classes("text-xs text-gray-500")
-            elif an == act["act_number"]:
-                p = max(0,min(100,(game.scene_count-sr[0])/max(1,sr[1]-sr[0])*100))
-                _act_aria = t("aria.story_progress", lang, n=an)
-                ui.label(f"{E['play']} {act_l} {an} {E['dash']} {phase}").classes("text-xs font-bold")
-                ui.html(f'<div class="track-bar" role="progressbar" aria-valuenow="{int(p)}" aria-valuemin="0" aria-valuemax="100" aria-label="{_act_aria}"><div class="track-fill progress" style="width:{p:.0f}%"></div></div>').classes("w-full")
-            else: ui.label(f"{act_l} {an}").classes("text-xs text-gray-500")
-        if bp.get("story_complete"):
-            ui.label(f"{E['star']} {t('sidebar.story_complete', lang)}").classes("text-xs text-amber-400 font-bold mt-1")
     # NPCs
     active_npcs = [n for n in game.npcs if n.get("status")=="active" and n.get("introduced",True)]
     background_npcs = [n for n in game.npcs if n.get("status")=="background" and n.get("introduced",True)]
@@ -2248,6 +2235,7 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
     _set_turn_status("brain", "Preparing request", s)
     turn_gen = s.get("_turn_gen", 0)  # Capture generation to detect save-switch during processing
     config=get_engine_config(s);username=s["current_user"]
+    _ensure_rewind_checkpoint(game, s.get("messages", []))
     # On retry, the message is already in s["messages"] and rendered — don't duplicate
     if not is_retry:
         _is_corr_input = text.startswith("##")
@@ -2426,10 +2414,8 @@ async def process_player_input(text: str, chat_container, sidebar_container=None
             # For corrections msg_col is None (full re-render) — TTS still works, no container needed
             tts_container = msg_col if not _is_correction else None
             await do_tts(narration, tts_container)
-            # Reload if game state now requires special UI (epilogue offer, game over)
-            # These cards only render on page load, so a reload is needed to show them.
-            bp = game.story_blueprint or {}
-            if game.game_over or (bp.get("story_complete") and not game.epilogue_dismissed and not game.epilogue_shown):
+            # Reload only for game-over UI.
+            if game.game_over:
                 ui.navigate.reload()
     except openai.AuthenticationError:
         try: spinner.delete()
@@ -2588,60 +2574,14 @@ def _make_chapter_action(game, chapter_msg_key: str):
 
 
 def render_epilogue() -> bool:
-    """Render epilogue offer or post-epilogue options.
-
-    Returns True if footer should be hidden (epilogue done, waiting for player choice).
-    Returns False if just showing the offer card (input stays active) or nothing to show.
-    """
-    s=S();game=s.get("game");lang=L()
-    if not game or game.game_over:
-        return False
-    bp = game.story_blueprint or {}
-
-    # --- Post-epilogue: chapter complete, choose next step ---
-    if game.epilogue_shown:
-        with ui.card().classes("w-full p-4").style("background: rgba(217,119,6,0.1); border: 1px solid rgba(217,119,6,0.4)"):
-            ui.markdown(f"{E['star']} **{t('epilogue.done_title', lang)}**")
-            ui.label(t("epilogue.done_text", lang)).classes("text-sm mt-1")
-            with ui.row().classes("gap-4 mt-4"):
-                new_ch, full_new = _make_chapter_action(game, "epilogue.chapter_msg")
-                ui.button(f"{E['refresh']} {t('epilogue.new_chapter', lang)}", on_click=new_ch, color="primary")
-                ui.button(f"{E['trash']} {t('epilogue.restart', lang)}", on_click=full_new)
-        return True  # Hide footer — story is done
-
-    # --- Epilogue offer: story complete but epilogue not yet generated ---
-    if bp.get("story_complete") and not game.epilogue_dismissed:
-        with ui.card().classes("w-full p-4").style("background: rgba(217,119,6,0.08); border: 1px solid rgba(217,119,6,0.3)"):
-            ui.markdown(f"{E['star']} **{t('epilogue.offer_title', lang)}**")
-            ui.label(t("epilogue.offer_text", lang)).classes("text-sm mt-1")
-            btn_row = ui.row().classes("gap-4 mt-4")
-            with btn_row:
-                async def gen_epilogue():
-                    btn_row.clear()
-                    with btn_row:
-                        ui.spinner(size="sm")
-                        ui.label(t("epilogue.generating", lang)).classes("text-sm")
-                    try:
-                        config=get_engine_config();username=s["current_user"]
-                        client=get_model_gateway(s["api_key"])
-                        g, epilogue_text = await asyncio.to_thread(generate_epilogue, client, game, config)
-                        s["game"] = g
-                        s["messages"].append({"scene_marker": f"{E['star']} {t('epilogue.marker', lang)}"})
-                        s["messages"].append({"role":"assistant","content": epilogue_text})
-                        save_game(g, username, s["messages"], s.get("active_save","autosave"))
-                        if s.get("tts_enabled", False): s["pending_tts"] = epilogue_text
-                        ui.navigate.reload()
-                    except Exception as e:
-                        btn_row.clear()
-                        with btn_row:
-                            ui.button(f"{E['star']} {t('epilogue.generate', lang)}", on_click=gen_epilogue, color="primary")
-                            def dismiss(): game.epilogue_dismissed=True; save_game(game,s["current_user"],s["messages"],s.get("active_save","autosave")); ui.navigate.reload()
-                            ui.button(t("epilogue.continue", lang), on_click=dismiss).props("flat")
-                        ui.notify(t("game.error", lang, error=e), type="negative")
-                ui.button(f"{E['star']} {t('epilogue.generate', lang)}", on_click=gen_epilogue, color="primary")
-                def dismiss(): game.epilogue_dismissed=True; save_game(game,s["current_user"],s["messages"],s.get("active_save","autosave")); ui.navigate.reload()
-                ui.button(t("epilogue.continue", lang), on_click=dismiss).props("flat")
-    return False  # Keep footer active — player can still type
+    """Story-completion epilogue UI is disabled."""
+    s=S();game=s.get("game")
+    if game:
+        game.epilogue_shown = False
+        game.epilogue_dismissed = False
+        if game.story_blueprint:
+            game.story_blueprint["story_complete"] = False
+    return False
 
 
 def render_game_over() -> bool:
